@@ -1123,21 +1123,21 @@ async def test_hygiene_policy_rejections_cool_down_without_rewrite(
     session_key = "agent:main:telegram:dm:12345"
     runner._session_state(session_key).persistent.hygiene_failure_streak = 1
     recorded = []
-    real_record = gateway_run._record_hygiene_cooldown
+    real_record = gateway_run._record_hygiene_failure
 
-    def record(gateway, session_id, seconds, reason=None):
+    def record(gateway, key, session_id, seconds, reason=None):
         recorded.append((session_id, seconds, reason))
-        return real_record(gateway, session_id, seconds, reason)
+        return real_record(gateway, key, session_id, seconds, reason)
 
-    monkeypatch.setattr(gateway_run, "_record_hygiene_cooldown", record)
+    monkeypatch.setattr(gateway_run, "_record_hygiene_failure", record)
     caplog.set_level("INFO", logger="gateway.run")
     assert await runner._handle_message(event) == "ok"
     runner.session_store.rewrite_transcript.assert_not_called()
     assert RejectedAgent.calls == 1
-    assert recorded == [(sid, 900.0, outcome.removeprefix("rejected_"))]
+    assert recorded == [(sid, 300.0, outcome.removeprefix("rejected_"))]
     assert runner._session_state(
         session_key
-    ).persistent.hygiene_failure_streak == 2
+    ).persistent.hygiene_failure_streak == 1
     text = caplog.text
     assert "Session hygiene: compressed" not in text
     assert "no session_db" not in text

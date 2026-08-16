@@ -24,6 +24,7 @@ from gateway.run import (
     _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS,
     _hygiene_cooldown_for_failure,
     _record_hygiene_cooldown,
+    _record_hygiene_failure,
     _reset_hygiene_failure_streak,
     hygiene_compaction_recovered,
 )
@@ -372,3 +373,55 @@ class TestRecordedCooldownEscalates:
         assert waits[0] < waits[1] < waits[2]
         for wait, mult in zip(waits, _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS):
             assert wait == pytest.approx(BASE * mult, abs=5.0)
+
+
+def test_durable_ladder_survives_restart_caps_and_resets(tmp_path):
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    db.create_session("sid", "gateway")
+    first = db.record_hygiene_failure("sid", BASE, "one")
+    assert first["streak"] == 1
+    db.close()
+
+    db = SessionDB(db_path=path)
+    assert db.record_hygiene_failure("sid", BASE, "two")["streak"] == 2
+    for _ in range(10):
+        last = db.record_hygiene_failure("sid", BASE, "cap")
+    assert last["streak"] == 3
+    assert last["cooldown_until"] <= __import__("time").time() + 3601
+    db.reset_hygiene_failure_streak("sid")
+    assert db.get_hygiene_failure_streak("sid") == 0
+    with pytest.raises(ValueError):
+        db.record_hygiene_failure("", BASE)
+    with pytest.raises(LookupError):
+        db.record_hygiene_failure("missing", BASE)
+    db.close()
+
+
+def test_existing_database_reconciles_hygiene_column(tmp_path):
+    from hermes_state import SessionDB
+
+    path = tmp_path / "old.db"
+    db = SessionDB(db_path=path)
+    db._conn.execute("ALTER TABLE sessions DROP COLUMN hygiene_failure_streak")
+    db._conn.commit()
+    db.close()
+    reopened = SessionDB(db_path=path)
+    columns = {row[1] for row in reopened._conn.execute("PRAGMA table_info(sessions)")}
+    assert "hygiene_failure_streak" in columns
+    reopened.close()
+
+
+def test_durable_reset_failure_retains_hot_safety_state(caplog):
+    class BrokenDB:
+        def reset_hygiene_failure_streak(self, _sid):
+            raise RuntimeError("disk unavailable")
+
+    runner = _Runner()
+    runner._session_db = BrokenDB()
+    runner._session_state(KEY).persistent.hygiene_failure_streak = 2
+    _reset_hygiene_failure_streak(runner, KEY, "sid")
+    assert runner._session_state(KEY).persistent.hygiene_failure_streak == 2
+    assert "retaining local safety state" in caplog.text

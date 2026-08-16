@@ -2066,6 +2066,15 @@ ACTIVE_TASK_CONTRACT_BRIDGE_AFTER = (
     "[HERMES_ACTIVE_TASK_CONTRACT_BRIDGE:after] "
     "I will continue the active task under that contract."
 )
+AUTONOMOUS_COMPLETION_BRIDGE_USER = (
+    "[HERMES_AUTONOMOUS_COMPLETION_BRIDGE:user] A Hermes runtime completion follows."
+)
+AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT = (
+    "[HERMES_AUTONOMOUS_COMPLETION_BRIDGE:assistant] I will process that runtime completion."
+)
+AUTONOMOUS_COMPLETION_BRIDGE_PRELUDE = (
+    "[HERMES_AUTONOMOUS_COMPLETION_BRIDGE:prelude] Runtime delivery boundary."
+)
 _ACTIVE_TASK_CONTRACT_BRIDGE_CONTENTS = frozenset({
     ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
     ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
@@ -2079,6 +2088,25 @@ def _is_active_task_contract_bridge(message: Any) -> bool:
         and message.get("role") == "assistant"
         and message.get("content") in _ACTIVE_TASK_CONTRACT_BRIDGE_CONTENTS
     )
+
+
+def append_autonomous_completion_provenance(messages: list) -> None:
+    """Append the durable role-alternating prefix for a runtime completion."""
+    from agent.message_metadata import append_message
+
+    if messages and messages[-1].get("role") != "assistant":
+        append_message(messages, {
+            "role": "assistant", "content": AUTONOMOUS_COMPLETION_BRIDGE_PRELUDE,
+            "_autonomous_completion_bridge": True,
+        })
+    append_message(messages, {
+        "role": "user", "content": AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        "_autonomous_completion_bridge": True,
+    })
+    append_message(messages, {
+        "role": "assistant", "content": AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        "_autonomous_completion_bridge": True,
+    })
 
 
 def _strip_stale_todo_snapshot(content: Any) -> Any:

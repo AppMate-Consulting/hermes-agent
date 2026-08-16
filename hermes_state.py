@@ -5907,7 +5907,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> Dict[str, Any]:
         """Atomically advance the durable hygiene rung and its deadline."""
         if not session_id:
-            return 1
+            raise ValueError("session_id is required")
 
         def _do(conn):
             row = conn.execute(
@@ -5915,7 +5915,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             ).fetchone()
             if row is None:
-                return 1
+                raise LookupError(f"unknown session: {session_id}")
             current = row[0] if not isinstance(row, sqlite3.Row) else row["hygiene_failure_streak"]
             streak = min(3, max(0, int(current or 0)) + 1)
             multiplier = (1, 3, 9)[streak - 1]

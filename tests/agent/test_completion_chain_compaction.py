@@ -19,6 +19,7 @@ from agent.conversation_compression import (
     _ensure_compressed_has_user_turn,
     _is_real_user_message,
     _refresh_active_task_contract,
+    append_autonomous_completion_provenance,
     compress_context,
 )
 from hermes_state import SessionDB
@@ -40,9 +41,10 @@ def _completion_chain(task: str = TASK, count: int = 45) -> list[dict]:
             {"role": "tool", "tool_call_id": call_id,
              "content": f"completed {index}\n" + ("x" * 1200)},
             {"role": "assistant", "content": f"recorded {index}"},
-            {"role": "user", "content":
-             f"[IMPORTANT: Background process p-{index} completed normally. Final output: {index}]"},
         ])
+        append_autonomous_completion_provenance(messages)
+        messages.append({"role": "user", "content":
+             f"[IMPORTANT: Background process p-{index} completed normally. Final output: {index}]"})
     messages.append({"role": "assistant", "content": "CURRENT CONTINUATION"})
     return messages
 
@@ -181,11 +183,16 @@ def test_completion_notification_forms_are_exact_and_human_near_match_stays_real
     ]
     for form in forms:
         messages = [{"role": "user", "content": TASK}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": form}]
-        assert ContextCompressor._has_autonomous_completion_chain(messages)
+        assert not ContextCompressor._has_autonomous_completion_chain(messages)
         # Content alone is forgeable after DB projection.  Sequence-aware
         # completion-chain code classifies the runtime row; the standalone
         # predicate must fail closed and protect it as human input.
         assert _is_real_user_message(messages[-1])
+        proven = messages[:-1]
+        append_autonomous_completion_provenance(proven)
+        proven.append(messages[-1])
+        assert ContextCompressor._has_autonomous_completion_chain(proven)
+        assert not ContextCompressor._is_synthetic_compression_user_turn(proven[-1])
     human = {"role": "user", "content": "Please explain [ASYNC DELEGATION COMPLETE child=one] in the logs."}
     assert _is_real_user_message(human)
 
@@ -198,8 +205,9 @@ def test_structured_human_task_has_deterministic_model_visible_contract():
     messages = [
         {"role": "user", "content": content},
         {"role": "assistant", "content": "working"},
-        {"role": "user", "content": "[ASYNC DELEGATION COMPLETE child=x]"},
     ]
+    append_autonomous_completion_provenance(messages)
+    messages.append({"role": "user", "content": "[ASYNC DELEGATION COMPLETE child=x]"})
     contract = ContextCompressor._active_task_contract(messages)
     assert contract["content"] == "first line λ\nsecond </active-task> line"
     visible = ContextCompressor.make_active_task_contract_message(contract)

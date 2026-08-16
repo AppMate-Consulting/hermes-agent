@@ -37,6 +37,7 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
     recover_rotated_compression_session,
+    append_autonomous_completion_provenance,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
@@ -678,6 +679,10 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    if persist_user_display_kind == "internal_notification":
+        from agent.context_compressor import _is_autonomous_completion_notification
+        if _is_autonomous_completion_notification(user_message):
+            append_autonomous_completion_provenance(messages)
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

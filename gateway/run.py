@@ -206,17 +206,24 @@ def _reset_hygiene_failure_streak(
     Peeks rather than get-or-creates: writing a 0 that is already 0 must not
     materialise a ``_sessions`` entry (those are never evicted).
     """
+    session_db = getattr(gateway, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    resetter = getattr(session_db, "reset_hygiene_failure_streak", None)
+    if session_id and callable(resetter):
+        try:
+            resetter(session_id)
+        except Exception as exc:
+            logger.warning(
+                "durable hygiene failure streak reset failed for %s; "
+                "retaining local safety state: %s", session_id, exc,
+            )
+            return
     try:
         state = gateway._peek_session_state(session_key)
         if state is not None:
             state.persistent.hygiene_failure_streak = 0
-        session_db = getattr(gateway, "_session_db", None)
-        session_db = getattr(session_db, "_db", session_db)
-        resetter = getattr(session_db, "reset_hygiene_failure_streak", None)
-        if session_id and callable(resetter):
-            resetter(session_id)
     except Exception as exc:
-        logger.debug("hygiene failure streak reset failed: %s", exc)
+        logger.warning("process hygiene failure streak reset failed: %s", exc)
 
 
 def hygiene_compaction_recovered(
@@ -312,7 +319,10 @@ def _record_hygiene_failure(
             ).persistent.hygiene_failure_streak = int(result["streak"])
             return
         except Exception as exc:
-            logger.debug("durable hygiene failure recording failed: %s", exc)
+            logger.warning(
+                "durable hygiene failure recording failed; advancing "
+                "process-only safety state: %s", exc,
+            )
     _record_hygiene_cooldown(
         gateway, session_id,
         _hygiene_cooldown_for_failure(

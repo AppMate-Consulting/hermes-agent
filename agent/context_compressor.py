@@ -4639,7 +4639,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _EMPTY_TOOL_RESPONSE_NUDGE,
             _LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
-        } or _is_autonomous_completion_notification(text) or text.startswith(
+        } or text.startswith(
             TODO_INJECTION_HEADER + "\n"
         ) or text.startswith(
             _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX
@@ -4814,20 +4814,28 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _active_task_contract(cls, messages: List[Dict[str, Any]]) -> Optional[dict]:
         """Return the latest real human task, including across compactions."""
-        from agent.conversation_compression import _is_real_user_message
+        from agent.conversation_compression import (
+            ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+            AUTONOMOUS_COMPLETION_BRIDGE_USER,
+            _is_real_user_message,
+        )
 
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
+            projected = (
+                index > 0
+                and isinstance(messages[index - 1], dict)
+                and messages[index - 1].get("role") == "assistant"
+                and messages[index - 1].get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+            )
+            contract = cls.parse_active_task_contract(message, allow_projected=projected)
+            if contract is not None:
+                return contract
+            if message.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER:
+                continue
             if message.get("role") == "user" and _is_real_user_message(message):
                 raw_content = message.get("content")
-                if (
-                    _is_autonomous_completion_notification(
-                        _content_text_for_contains(raw_content).strip()
-                    )
-                    and index > 0
-                    and isinstance(messages[index - 1], dict)
-                    and messages[index - 1].get("role") == "assistant"
-                ):
+                if cls._completion_has_durable_provenance(messages, index):
                     continue
                 # Structured media/file/unknown parts cannot be represented by
                 # this bounded text contract without loss.  Returning no
@@ -4844,24 +4852,31 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "content": content,
                         "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                     }
-        for index in range(len(messages) - 1, -1, -1):
-            message = messages[index]
-            # DB projection removes underscore metadata.  Provenance then
-            # requires the exact Hermes-authored assistant bridge immediately
-            # before the contract; a user cannot forge that as one user row.
-            projected = (
-                index > 0
-                and isinstance(messages[index - 1], dict)
-                and messages[index - 1].get("role") == "assistant"
-                and messages[index - 1].get("content")
-                == "[HERMES_ACTIVE_TASK_CONTRACT_BRIDGE:before] The authoritative active-task contract follows."
-            )
-            contract = cls.parse_active_task_contract(
-                message, allow_projected=projected
-            )
-            if contract is not None:
-                return contract
         return None
+
+    @classmethod
+    def _completion_has_durable_provenance(
+        cls, messages: List[Dict[str, Any]], index: int
+    ) -> bool:
+        from agent.conversation_compression import (
+            AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+            AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        )
+        if index < 2 or not all(
+            isinstance(messages[i], dict) for i in (index - 2, index - 1, index)
+        ):
+            return False
+        completion = messages[index]
+        return (
+            completion.get("role") == "user"
+            and _is_autonomous_completion_notification(
+                _content_text_for_contains(completion.get("content")).strip()
+            )
+            and messages[index - 2].get("role") == "user"
+            and messages[index - 2].get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER
+            and messages[index - 1].get("role") == "assistant"
+            and messages[index - 1].get("content") == AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT
+        )
 
     @classmethod
     def parse_active_task_contract(
@@ -4921,19 +4936,25 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _has_autonomous_completion_chain(cls, messages: List[Dict[str, Any]]) -> bool:
         """Return whether process completions continue the current human task."""
-        from agent.conversation_compression import _is_real_user_message
+        from agent.conversation_compression import (
+            AUTONOMOUS_COMPLETION_BRIDGE_USER,
+            _is_real_user_message,
+        )
 
         latest_real = -1
         for idx, message in enumerate(messages):
-            if message.get("role") == "user" and _is_real_user_message(message):
+            if message.get("role") != "user":
+                continue
+            if message.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER:
+                continue
+            if cls._completion_has_durable_provenance(messages, idx):
+                continue
+            if _is_real_user_message(message):
                 latest_real = idx
         start = latest_real + 1 if latest_real >= 0 else 0
         return (latest_real >= 0 or cls._active_task_contract(messages) is not None) and any(
-            cls._is_synthetic_compression_user_turn(message)
-            and _is_autonomous_completion_notification(
-                _content_text_for_contains(message.get("content"))
-            )
-            for message in messages[start:]
+            cls._completion_has_durable_provenance(messages, idx)
+            for idx in range(start, len(messages))
         )
 
     @classmethod
@@ -5752,8 +5773,29 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Ensure the most recent user message is always in the tail so the
         # active task is never lost to compression (fixes #10896).
-        if not self._has_autonomous_completion_chain(messages):
+        if (
+            not self._has_autonomous_completion_chain(messages)
+            or self._active_task_contract(messages) is None
+        ):
             cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+            # A proven completion chain may follow a multipart task that the
+            # bounded text contract cannot encode.  Protect that exact row,
+            # not merely the newer synthetic completion user row.
+            if self._has_autonomous_completion_chain(messages):
+                for task_idx in range(len(messages) - 1, head_end, -1):
+                    task = messages[task_idx]
+                    if task.get("role") != "user":
+                        continue
+                    if self._completion_has_durable_provenance(messages, task_idx):
+                        continue
+                    raw = task.get("content")
+                    if isinstance(raw, list) and any(
+                        not isinstance(part, dict) or part.get("type") != "text"
+                        for part in raw
+                    ):
+                        cut_idx = min(cut_idx, task_idx)
+                        cut_idx = self._align_boundary_backward(messages, cut_idx)
+                        break
 
         # Ensure the most recent assistant message is always in the tail
         # so the previously-visible reply isn't silently rolled into the

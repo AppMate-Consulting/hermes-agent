@@ -4619,6 +4619,14 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _SyntheticCompletionInput:
+    """Queue sentinel proving a completion originated in Hermes runtime."""
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -12054,7 +12062,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            self._pending_input.put(_SyntheticCompletionInput(synthetic_message))
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -15078,7 +15086,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self, message, images: list = None, voice_input: bool = False,
+        synthetic_completion: bool = False,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -15439,6 +15450,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
+                        persist_user_display_kind=(
+                            "internal_notification" if synthetic_completion else None
+                        ),
                         moa_config=_moa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
@@ -18821,6 +18835,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
                     if is_voice_input:
                         user_input = user_input.text
+                    is_synthetic_completion = isinstance(
+                        user_input, _SyntheticCompletionInput
+                    )
+                    if is_synthetic_completion:
+                        user_input = user_input.text
 
                     if not user_input:
                         continue
@@ -18936,7 +18955,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input, images=submit_images or None,
+                            voice_input=is_voice_input,
+                            synthetic_completion=is_synthetic_completion,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

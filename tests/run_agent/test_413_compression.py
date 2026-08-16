@@ -81,6 +81,15 @@ def _make_413_error(*, use_status_code=True, message="Request entity too large")
     return err
 
 
+def _materially_compressible_history() -> list[dict]:
+    """History whose deterministic summary clears the 9,600-token floor."""
+    return [
+        {"role": "user", "content": "old question " + ("x" * 60_000)},
+        {"role": "assistant", "content": "old answer " + ("y" * 60_000)},
+        {"role": "user", "content": "hello"},
+    ]
+
+
 @pytest.fixture()
 def agent():
     with (
@@ -608,7 +617,7 @@ class TestPreflightCompression:
             patch("run_agent.estimate_request_tokens_rough", return_value=42),
         ):
             compressed, new_system_prompt = agent._compress_context(
-                [{"role": "user", "content": "hello"}],
+                _materially_compressible_history(),
                 "system prompt",
                 approx_tokens=1234,
             )
@@ -646,7 +655,8 @@ class TestPreflightCompression:
         assert compressed is messages
         assert prompt == "You are helpful."
         assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
-        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        assert "skipped" in events[-1][1].lower()
+        assert "no changes committed" in events[-1][1].lower()
 
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
@@ -671,7 +681,7 @@ class TestPreflightCompression:
             patch.object(agent, "_build_system_prompt") as build_prompt,
         ):
             _, new_system_prompt = agent._compress_context(
-                [{"role": "user", "content": "hello"}],
+                _materially_compressible_history(),
                 "system prompt",
                 approx_tokens=1234,
             )
@@ -707,13 +717,39 @@ class TestPreflightCompression:
             patch.object(agent, "_build_system_prompt", return_value="rebuilt without memory") as build_prompt,
         ):
             _, new_system_prompt = agent._compress_context(
-                [{"role": "user", "content": "hello"}],
+                _materially_compressible_history(),
                 "system prompt",
                 approx_tokens=1234,
             )
 
         assert new_system_prompt == "rebuilt without memory"
         build_prompt.assert_called_once_with("system prompt")
+
+        # The same rebuild remains speculative when admission rejects a tiny
+        # transcript: rollback must preserve the previously cached prompt.
+        old_prompt = "system prompt\n\nMEMORY (your personal notes)\nold fact"
+        agent._cached_system_prompt = old_prompt
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                return_value=[{
+                    "role": "user",
+                    "content": f"{SUMMARY_PREFIX}\nPrevious conversation",
+                }],
+            ),
+            patch.object(
+                agent, "_build_system_prompt", return_value="must roll back"
+            ),
+        ):
+            rejected, rejected_prompt = agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+        assert rejected == [{"role": "user", "content": "hello"}]
+        assert rejected_prompt == old_prompt
+        assert agent._cached_system_prompt == old_prompt
 
 
 

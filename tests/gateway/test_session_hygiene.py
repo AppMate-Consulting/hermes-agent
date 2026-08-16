@@ -495,6 +495,10 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     # The DB-backed cooldown check calls this before compressing; a bare
     # MagicMock return would be truthy and skip compression entirely.
     fake_db.get_compression_failure_cooldown.return_value = None
+    fake_db.record_hygiene_failure.return_value = {
+        "streak": 1,
+        "cooldown_until": time.time() + 120,
+    }
 
     class SlowCompressAgent:
         last_instance = None
@@ -614,10 +618,9 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert runner._run_agent.await_count == 1
     # Cooldown must be persisted to the state DB (survives restart, #74136),
     # not stashed in an in-memory dict.
-    assert fake_db.record_compression_failure_cooldown.called
-    _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
-    assert _cd_args[0] == "sess-timeout"
-    assert _cd_args[1] > time.time()
+    fake_db.record_hygiene_failure.assert_called_once_with(
+        "sess-timeout", 120.0, "timeout"
+    )
     timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
     assert len(timeout_warnings) == 1
     fake_db.archive_and_compact.assert_not_called()
@@ -769,7 +772,10 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     monkeypatch.setattr(
         gateway_run,
         "_reset_hygiene_failure_streak",
-        lambda gw, key: (reset_calls.append(key), _real_reset(gw, key))[1],
+        lambda gw, key, session_id: (
+            reset_calls.append((key, session_id)),
+            _real_reset(gw, key, session_id),
+        )[1],
     )
 
     result = await runner._handle_message(event)

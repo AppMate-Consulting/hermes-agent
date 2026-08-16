@@ -315,10 +315,13 @@ class TestInPlaceAntiGrowthGuard:
             messages = _materially_compressible_messages()
             before_rows = db.get_messages(sid, include_inactive=True)
 
+            estimates = []
+
             def _request_estimate(candidate, *, system_prompt="", tools=None):
                 # Message-only sizing shrinks dramatically, but the exact
-                # request overhead leaves only 3K reclaim (< the 4K floor).
-                return 100_000 if candidate is messages else 97_000
+                # request overhead leaves only 3K reclaim (< the 9.6K floor).
+                estimates.append(copy.deepcopy(candidate))
+                return (100_000, 97_000)[len(estimates) - 1]
 
             with patch(
                 "agent.conversation_compression.estimate_request_tokens_rough",
@@ -377,11 +380,10 @@ class TestInPlaceAntiGrowthGuard:
             started = {name: spy.start() for name, spy in spies.items()}
             agent._flush_messages_to_session_db = MagicMock()
             try:
+                estimates = iter((100_000, request_out))
                 with patch(
                     "agent.conversation_compression.estimate_request_tokens_rough",
-                    side_effect=lambda candidate, **kwargs: (
-                        100_000 if candidate is messages else request_out
-                    ),
+                    side_effect=lambda candidate, **kwargs: next(estimates),
                 ):
                     returned, _ = compress_context(
                         agent, messages, approx_tokens=100_000,
@@ -461,17 +463,19 @@ class TestInPlaceAntiGrowthGuard:
             agent._cached_system_prompt_static = None
             agent._build_system_prompt = MagicMock(return_value="EXACT BUILT PROMPT")
             seen = []
+            estimates = iter((100_000, 80_000))
 
             def estimate(candidate, *, system_prompt, tools=None):
-                seen.append((candidate is messages, system_prompt, tools))
-                return 100_000 if candidate is messages else 97_000
+                seen.append((candidate, system_prompt, tools))
+                return next(estimates)
 
             with patch(
                 "agent.conversation_compression.estimate_request_tokens_rough",
                 side_effect=estimate,
             ):
                 compress_context(agent, messages, "sys", approx_tokens=100_000)
-            assert seen[0][0] is True
+            assert seen[0][0] is not messages
+            assert seen[0][0] == messages
             assert seen[0][1] == "EXACT BUILT PROMPT"
             assert seen[0][1] != ""
             assert seen[0][2] is seen[1][2]
@@ -533,7 +537,14 @@ class TestInPlaceAntiGrowthGuard:
                     agent, messages, "sys", approx_tokens=100_000
                 )
 
-            assert estimates[0] == original
+            if outcome == "rejected_no_progress":
+                assert len(estimates) == 0
+            else:
+                assert len(estimates) == 2
+                assert estimates[0] == original
+                assert estimates[1] == [{
+                    "role": "user", "content": "mutated candidate"
+                }]
             assert returned is messages
             assert messages == original
             assert prompt == cached
@@ -597,11 +608,10 @@ class TestInPlaceAntiGrowthGuard:
             static = "static\x00prefix\U0001f680"
             agent._cached_system_prompt = cached
             agent._cached_system_prompt_static = static
+            estimates = iter((100_000, 100_000))
             with patch(
                 "agent.conversation_compression.estimate_request_tokens_rough",
-                side_effect=lambda candidate, **kwargs: (
-                    100_000 if candidate is messages else 100_000
-                ),
+                side_effect=lambda candidate, **kwargs: next(estimates),
             ):
                 returned, prompt = compress_context(
                     agent, messages, "sys", approx_tokens=100_000
@@ -621,11 +631,10 @@ class TestInPlaceAntiGrowthGuard:
             _seed(db, sid, "manual")
             agent = _make_agent(db, sid, in_place=True)
             messages = _materially_compressible_messages()
+            estimates = iter((100_000, 80_000))
             with patch(
                 "agent.conversation_compression.estimate_request_tokens_rough",
-                side_effect=lambda candidate, **kwargs: (
-                    100_000 if candidate is messages else 97_000
-                ),
+                side_effect=lambda candidate, **kwargs: next(estimates),
             ):
                 compress_context(
                     agent, messages, "sys", force=True, approx_tokens=100_000

@@ -5782,7 +5782,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # bounded text contract cannot encode.  Protect that exact row,
             # not merely the newer synthetic completion user row.
             if self._has_autonomous_completion_chain(messages):
-                for task_idx in range(len(messages) - 1, head_end, -1):
+                for task_idx in range(len(messages) - 1, head_end - 1, -1):
                     task = messages[task_idx]
                     if task.get("role") != "user":
                         continue

@@ -414,8 +414,10 @@ def test_legacy_rotation_inherits_rung_then_recovery_resets_only_child(tmp_path)
         db.record_hygiene_failure("parent", BASE, "first")
         db.record_hygiene_failure("parent", BASE, "second")
         db.publish_compression_child(
-            "parent", "child", "gateway",
-            [{"role": "user", "content": "summary"}],
+            parent_session_id="parent",
+            child_session_id="child",
+            source="gateway",
+            messages=[{"role": "user", "content": "summary"}],
             require_compression_lease=False,
         )
         assert db.get_hygiene_failure_streak("parent") == 2

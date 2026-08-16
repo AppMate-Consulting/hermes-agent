@@ -2295,10 +2295,40 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
     from agent.context_compressor import ContextCompressor
 
     contract = ContextCompressor._active_task_contract(original_messages)
+    # SessionDB deliberately strips underscore metadata.  A projected
+    # contract is therefore authoritative only as a sequence: the exact
+    # Hermes-authored ``before`` bridge immediately followed by a contract
+    # whose visible payload passes the same shape/hash validation.  Remove
+    # that pair (and its optional exact ``after`` bridge) together.  In
+    # particular, never discard standalone user text merely because it looks
+    # like a contract, nor a standalone exact bridge string.
+    stale_indexes: set[int] = set()
+    for index, message in enumerate(compressed):
+        internal_contract = _is_active_task_contract_message(message)
+        projected_contract = (
+            index > 0
+            and _is_active_task_contract_bridge(compressed[index - 1])
+            and compressed[index - 1].get("content")
+            == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+            and ContextCompressor.parse_active_task_contract(
+                message, allow_projected=True
+            ) is not None
+        )
+        if not internal_contract and not projected_contract:
+            continue
+        stale_indexes.add(index)
+        if projected_contract:
+            stale_indexes.add(index - 1)
+        if (
+            index + 1 < len(compressed)
+            and _is_active_task_contract_bridge(compressed[index + 1])
+            and compressed[index + 1].get("content")
+            == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
+        ):
+            stale_indexes.add(index + 1)
     compressed[:] = [
-        message for message in compressed
-        if not _is_active_task_contract_message(message)
-        and not _is_active_task_contract_bridge(message)
+        message for index, message in enumerate(compressed)
+        if index not in stale_indexes
     ]
     if contract is None or not ContextCompressor._has_autonomous_completion_chain(
         original_messages

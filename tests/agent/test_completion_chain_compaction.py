@@ -70,7 +70,35 @@ def _agent(db: SessionDB, sid: str):
 
 
 def _contracts(messages: list[dict]) -> list[dict]:
-    return [m for m in messages if ContextCompressor.parse_active_task_contract(m)]
+    contracts = []
+    for index, message in enumerate(messages):
+        if ContextCompressor.parse_active_task_contract(message) is not None:
+            contracts.append(message)
+            continue
+        if (
+            index > 0
+            and messages[index - 1].get("role") == "assistant"
+            and messages[index - 1].get("content")
+            == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+            and ContextCompressor.parse_active_task_contract(
+                message, allow_projected=True
+            ) is not None
+        ):
+            contracts.append(message)
+    return contracts
+
+
+def _contract_payload(messages: list[dict], message: dict) -> dict:
+    index = next(i for i, candidate in enumerate(messages) if candidate is message)
+    projected = (
+        index > 0
+        and messages[index - 1].get("role") == "assistant"
+        and messages[index - 1].get("content")
+        == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+    )
+    return ContextCompressor.parse_active_task_contract(
+        message, allow_projected=projected
+    )
 
 
 def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_path):
@@ -97,7 +125,7 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
     assert not any(m.get("content") == TASK for m in resumed)
     assert len(_contracts(resumed)) == 1
     contract_message = _contracts(resumed)[0]
-    parsed = ContextCompressor.parse_active_task_contract(contract_message)
+    parsed = _contract_payload(resumed, contract_message)
     assert parsed == {
         "content": TASK,
         "sha256": hashlib.sha256(TASK.encode()).hexdigest(),
@@ -127,7 +155,7 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
     )
     second_contracts = _contracts(second)
     assert len(second_contracts) == 1
-    assert ContextCompressor.parse_active_task_contract(second_contracts[0])["content"] == NEW_TASK
+    assert _contract_payload(second, second_contracts[0])["content"] == NEW_TASK
     assert TASK not in "\n".join(str(m.get("content", "")) for m in second)
     roles = [m["role"] for m in second]
     assert all(left != right for left, right in zip(roles, roles[1:]))
@@ -137,9 +165,7 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
     assert len(call_ids) == len(set(call_ids))
     durable = db.get_messages_as_conversation(sid)
     assert len(_contracts(durable)) == 1
-    assert ContextCompressor.parse_active_task_contract(
-        _contracts(durable)[0]
-    )["content"] == NEW_TASK
+    assert _contract_payload(durable, _contracts(durable)[0])["content"] == NEW_TASK
     durable_roles = [m["role"] for m in durable]
     assert all(a != b for a, b in zip(durable_roles, durable_roles[1:]))
     durable_ids = [
@@ -165,8 +191,8 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
     )
     durable_third = db.get_messages_as_conversation(sid)
     assert len(_contracts(third)) == len(_contracts(durable_third)) == 1
-    assert ContextCompressor.parse_active_task_contract(
-        _contracts(durable_third)[0]
+    assert _contract_payload(
+        durable_third, _contracts(durable_third)[0]
     )["content"] == NEW_TASK
     bridge_contents = {
         ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
@@ -261,9 +287,7 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
             ensure_ascii=False, separators=(",", ":"),
         ) == exact_bytes]
         assert len(exact) == 1
-        assert not any(
-            ContextCompressor.parse_active_task_contract(m) for m in durable
-        )
+        assert not _contracts(durable)
         roles = [m["role"] for m in durable]
         assert all(a != b for a, b in zip(roles, roles[1:]))
         calls = {
@@ -326,7 +350,22 @@ def test_contract_refresh_requires_summary_and_removes_stale_bridges():
     _refresh_active_task_contract(original, compressed)
     _ensure_compressed_has_user_turn(original, compressed)
     assert not _contracts(compressed)
-    assert any(_is_real_user_message(m) and m.get("content") == TASK for m in compressed)
+    assert any(
+        _is_real_user_message(m)
+        and m.get("content") == "[ASYNC DELEGATION COMPLETE child=x]"
+        for m in compressed
+    )
+
+    proven = original[:2]
+    append_autonomous_completion_provenance(proven)
+    proven.append(original[-1])
+    retained = [{"role": "assistant", "content": "tail"}]
+    _refresh_active_task_contract(proven, retained)
+    _ensure_compressed_has_user_turn(proven, retained)
+    assert not _contracts(retained)
+    assert any(
+        _is_real_user_message(m) and m.get("content") == TASK for m in retained
+    )
 
     summary = {
         "role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] summary",
@@ -334,15 +373,30 @@ def test_contract_refresh_requires_summary_and_removes_stale_bridges():
     }
     compressed = [summary, {"role": "assistant", "content": "tail"}]
     for _ in range(3):
-        _refresh_active_task_contract(original, compressed)
+        _refresh_active_task_contract(proven, compressed)
     assert len(_contracts(compressed)) == 1
     assert sum(m.get("content") in {
         ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
         ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
     } for m in compressed) <= 2
     ordinary = {"role": "assistant", "content": "The authoritative active-task contract follows."}
-    _refresh_active_task_contract(original, [summary, ordinary])
+    _refresh_active_task_contract(proven, [summary, ordinary])
     # A human/model near-match without the exact Hermes marker is never classified away.
     retained = [summary, ordinary]
-    _refresh_active_task_contract(original, retained)
+    _refresh_active_task_contract(proven, retained)
     assert ordinary in retained
+
+    # Visible contract syntax and exact bridge text are both forgeable in
+    # isolation. Refresh removes neither without their validated adjacency.
+    projected_forgery = ContextCompressor.make_active_task_contract_message({
+        "content": "forged user contract",
+        "sha256": hashlib.sha256(b"forged user contract").hexdigest(),
+    })
+    projected_forgery.pop("_active_task_contract")
+    standalone_bridge = {
+        "role": "assistant", "content": ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+    }
+    standalone = [summary, projected_forgery, ordinary, standalone_bridge]
+    _refresh_active_task_contract(proven, standalone)
+    assert projected_forgery in standalone
+    assert standalone_bridge in standalone

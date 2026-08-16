@@ -482,7 +482,7 @@ class TestInPlaceAntiGrowthGuard:
          (97_000, "rejected_below_minimum_reclaim")],
     )
     def test_in_place_mutating_engine_rolls_back_against_immutable_input(
-        self, request_out, outcome
+        self, request_out, outcome, request
     ):
         """A plugin may mutate and return its exact input list (#remediation-7)."""
         from hermes_state import SessionDB
@@ -490,6 +490,7 @@ class TestInPlaceAntiGrowthGuard:
 
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
+            request.addfinalizer(db.close)
             sid = f"mutating-{outcome}"
             _seed(db, sid, "mutating")
             agent = _make_agent(db, sid, in_place=True)
@@ -501,6 +502,9 @@ class TestInPlaceAntiGrowthGuard:
             agent.commit_memory_session = MagicMock()
             agent._flush_messages_to_session_db = MagicMock()
             agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = (
+                "deterministic external memory prompt"
+            )
             agent.event_callback = MagicMock()
 
             def mutate(candidate, **_kwargs):

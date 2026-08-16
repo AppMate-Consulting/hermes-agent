@@ -380,10 +380,28 @@ def test_durable_ladder_survives_restart_caps_and_resets(tmp_path):
 
     path = tmp_path / "state.db"
     db = SessionDB(db_path=path)
-    db.create_session("sid", "gateway")
-    first = db.record_hygiene_failure("sid", BASE, "one")
-    assert first["streak"] == 1
-    db.close()
+    try:
+        db.create_session("sid", "gateway")
+        first = db.record_hygiene_failure("sid", BASE, "one")
+        assert first["streak"] == 1
+    finally:
+        db.close()
+
+    db = SessionDB(db_path=path)
+    try:
+        assert db.record_hygiene_failure("sid", BASE, "two")["streak"] == 2
+        for _ in range(10):
+            last = db.record_hygiene_failure("sid", BASE, "cap")
+        assert last["streak"] == 3
+        assert last["cooldown_until"] <= __import__("time").time() + 3601
+        db.reset_hygiene_failure_streak("sid")
+        assert db.get_hygiene_failure_streak("sid") == 0
+        with pytest.raises(ValueError):
+            db.record_hygiene_failure("", BASE)
+        with pytest.raises(LookupError):
+            db.record_hygiene_failure("missing", BASE)
+    finally:
+        db.close()
 
 
 def test_legacy_rotation_inherits_rung_then_recovery_resets_only_child(tmp_path):
@@ -391,41 +409,55 @@ def test_legacy_rotation_inherits_rung_then_recovery_resets_only_child(tmp_path)
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "rotation.db")
-    db.create_session("parent", "gateway")
-    db.record_hygiene_failure("parent", BASE, "first")
-    db.record_hygiene_failure("parent", BASE, "second")
-    db.publish_compression_child(
-        "parent", "child", "gateway",
-        [{"role": "user", "content": "summary"}],
-        require_compression_lease=False,
-    )
-    assert db.get_hygiene_failure_streak("parent") == 2
-    assert db.get_hygiene_failure_streak("child") == 2
+    try:
+        db.create_session("parent", "gateway")
+        db.record_hygiene_failure("parent", BASE, "first")
+        db.record_hygiene_failure("parent", BASE, "second")
+        db.publish_compression_child(
+            "parent", "child", "gateway",
+            [{"role": "user", "content": "summary"}],
+            require_compression_lease=False,
+        )
+        assert db.get_hygiene_failure_streak("parent") == 2
+        assert db.get_hygiene_failure_streak("child") == 2
 
-    runner = _Runner()
-    runner._session_db = db
-    runner._session_state(KEY).persistent.hygiene_failure_streak = 2
-    # This is called by the production hygiene path only after
-    # hygiene_compaction_recovered() proves material reduction.
-    _reset_hygiene_failure_streak(runner, KEY, "child")
-    assert db.get_hygiene_failure_streak("child") == 0
-    assert db.get_hygiene_failure_streak("parent") == 2
-    assert runner._session_state(KEY).persistent.hygiene_failure_streak == 0
-    db.close()
+        runner = _Runner()
+        runner._session_db = db
+        runner._session_state(KEY).persistent.hygiene_failure_streak = 2
 
-    db = SessionDB(db_path=path)
-    assert db.record_hygiene_failure("sid", BASE, "two")["streak"] == 2
-    for _ in range(10):
-        last = db.record_hygiene_failure("sid", BASE, "cap")
-    assert last["streak"] == 3
-    assert last["cooldown_until"] <= __import__("time").time() + 3601
-    db.reset_hygiene_failure_streak("sid")
-    assert db.get_hygiene_failure_streak("sid") == 0
-    with pytest.raises(ValueError):
-        db.record_hygiene_failure("", BASE)
-    with pytest.raises(LookupError):
-        db.record_hygiene_failure("missing", BASE)
-    db.close()
+        rejected = hygiene_compaction_recovered(
+            aborted=False,
+            rotated=True,
+            in_place=False,
+            msg_count=220,
+            new_count=220,
+            approx_tokens=50_000,
+            new_tokens=49_900,
+        )
+        if rejected:
+            _reset_hygiene_failure_streak(runner, KEY, "child")
+        assert rejected is False
+        assert db.get_hygiene_failure_streak("parent") == 2
+        assert db.get_hygiene_failure_streak("child") == 2
+        assert runner._session_state(KEY).persistent.hygiene_failure_streak == 2
+
+        recovered = hygiene_compaction_recovered(
+            aborted=False,
+            rotated=True,
+            in_place=False,
+            msg_count=220,
+            new_count=100,
+            approx_tokens=50_000,
+            new_tokens=30_000,
+        )
+        if recovered:
+            _reset_hygiene_failure_streak(runner, KEY, "child")
+        assert recovered is True
+        assert db.get_hygiene_failure_streak("parent") == 2
+        assert db.get_hygiene_failure_streak("child") == 0
+        assert runner._session_state(KEY).persistent.hygiene_failure_streak == 0
+    finally:
+        db.close()
 
 
 def test_existing_database_reconciles_hygiene_column(tmp_path):
@@ -433,13 +465,19 @@ def test_existing_database_reconciles_hygiene_column(tmp_path):
 
     path = tmp_path / "old.db"
     db = SessionDB(db_path=path)
-    db._conn.execute("ALTER TABLE sessions DROP COLUMN hygiene_failure_streak")
-    db._conn.commit()
-    db.close()
+    try:
+        db._conn.execute("ALTER TABLE sessions DROP COLUMN hygiene_failure_streak")
+        db._conn.commit()
+    finally:
+        db.close()
     reopened = SessionDB(db_path=path)
-    columns = {row[1] for row in reopened._conn.execute("PRAGMA table_info(sessions)")}
-    assert "hygiene_failure_streak" in columns
-    reopened.close()
+    try:
+        columns = {
+            row[1] for row in reopened._conn.execute("PRAGMA table_info(sessions)")
+        }
+        assert "hygiene_failure_streak" in columns
+    finally:
+        reopened.close()
 
 
 def test_durable_reset_failure_retains_hot_safety_state(caplog):

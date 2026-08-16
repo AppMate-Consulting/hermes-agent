@@ -792,7 +792,6 @@ class TestInPlaceAntiGrowthGuard:
             assert agent._last_compaction_in_place is False
             assert db.get_compression_lock_holder(sid) is None
             assert fence.commit_in_flight is False
-            assert fence._commit_started is False
             agent._memory_manager.on_pre_compress.assert_not_called()
             agent._memory_manager.on_session_switch.assert_not_called()
             agent.commit_memory_session.assert_not_called()

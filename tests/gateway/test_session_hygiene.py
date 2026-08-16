@@ -1246,3 +1246,122 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert runner2._run_agent.await_count == 1
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_hygiene_rejection_ladder_advances_after_expiry_and_restart(
+    monkeypatch, tmp_path
+):
+    """Each rung is earned by a real post-deadline hygiene rejection."""
+    from hermes_state import SessionDB
+
+    path = tmp_path / "ladder-restart.db"
+    sid = "ladder-restart"
+
+    class RejectingAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = False
+            self._last_compression_outcome = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(), _last_compress_aborted=False,
+                _last_summary_error=None, _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            self._last_compression_outcome = "rejected_no_progress"
+            return messages, ""
+
+    deadlines = []
+    for expected_streak, multiplier in ((1, 1), (2, 3), (3, 9)):
+        db = SessionDB(db_path=path)
+        if expected_streak == 1:
+            db.create_session(sid, "telegram")
+        else:
+            # The preceding deadline has genuinely elapsed before this new
+            # process observes the session.
+            db._conn.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = 0 WHERE id = ?",
+                (sid,),
+            )
+            db._conn.commit()
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, RejectingAgent, db, sid
+        )
+        before = time.time()
+        assert await runner._handle_message(event) == "ok"
+        state = db.get_compression_failure_cooldown(sid)
+        assert db.get_hygiene_failure_streak(sid) == expected_streak
+        assert state["cooldown_until"] - before == pytest.approx(
+            min(300 * multiplier, 3600), abs=5
+        )
+        deadlines.append(state["cooldown_until"])
+        db.close()
+    assert deadlines[0] < deadlines[1] < deadlines[2]
+
+
+@pytest.mark.asyncio
+async def test_hygiene_host_cancellation_wins_over_late_worker_outcome(
+    monkeypatch, tmp_path, caplog
+):
+    """Cancel the real gateway host task while its executor worker is detached."""
+    from agent.conversation_compression import _publish_compression_outcome
+    from hermes_state import SessionDB
+
+    sid = "cancel-race"
+    db = SessionDB(db_path=tmp_path / "cancel-race.db")
+    db.create_session(sid, "telegram")
+    started = threading.Event()
+    release = threading.Event()
+
+    class WaitingAgent:
+        instance = None
+
+        def __init__(self, **kwargs):
+            type(self).instance = self
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = False
+            self._last_compression_outcome = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(), _last_compress_aborted=False,
+                _last_summary_error=None, _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            started.set()
+            assert release.wait(10)
+            _publish_compression_outcome(self, "committed_materially_shrunk")
+            return messages[:-2], ""
+
+    runner, _adapter, event = _make_cooldown_runner(
+        monkeypatch, tmp_path, WaitingAgent, db, sid
+    )
+    archive = MagicMock(wraps=db.archive_and_compact)
+    monkeypatch.setattr(db, "archive_and_compact", archive)
+    try:
+        task = asyncio.create_task(runner._handle_message(event))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        agent = WaitingAgent.instance
+        assert agent._last_compression_outcome == "cancelled_host"
+        release.set()
+        for _ in range(100):
+            if agent.close.called:
+                break
+            await asyncio.sleep(0.01)
+        assert agent._last_compression_outcome == "cancelled_host"
+        archive.assert_not_called()
+        runner.session_store.rewrite_transcript.assert_not_called()
+        assert agent.close.called
+        assert "Session hygiene: compressed" not in caplog.text
+    finally:
+        release.set()
+        db.close()

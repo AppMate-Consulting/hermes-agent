@@ -385,6 +385,34 @@ def test_durable_ladder_survives_restart_caps_and_resets(tmp_path):
     assert first["streak"] == 1
     db.close()
 
+
+def test_legacy_rotation_inherits_rung_then_recovery_resets_only_child(tmp_path):
+    """A rotation cannot erase history until the active child proves recovery."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "rotation.db")
+    db.create_session("parent", "gateway")
+    db.record_hygiene_failure("parent", BASE, "first")
+    db.record_hygiene_failure("parent", BASE, "second")
+    db.publish_compression_child(
+        "parent", "child", "gateway",
+        [{"role": "user", "content": "summary"}],
+        require_compression_lease=False,
+    )
+    assert db.get_hygiene_failure_streak("parent") == 2
+    assert db.get_hygiene_failure_streak("child") == 2
+
+    runner = _Runner()
+    runner._session_db = db
+    runner._session_state(KEY).persistent.hygiene_failure_streak = 2
+    # This is called by the production hygiene path only after
+    # hygiene_compaction_recovered() proves material reduction.
+    _reset_hygiene_failure_streak(runner, KEY, "child")
+    assert db.get_hygiene_failure_streak("child") == 0
+    assert db.get_hygiene_failure_streak("parent") == 2
+    assert runner._session_state(KEY).persistent.hygiene_failure_streak == 0
+    db.close()
+
     db = SessionDB(db_path=path)
     assert db.record_hygiene_failure("sid", BASE, "two")["streak"] == 2
     for _ in range(10):

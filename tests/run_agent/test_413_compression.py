@@ -147,6 +147,62 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
     assert isinstance(persisted_messages[-1]["timestamp"], float)
 
 
+@pytest.mark.parametrize(
+    "notification",
+    [
+        "[IMPORTANT: Background process p completed normally.]",
+        "[ASYNC DELEGATION COMPLETE child=one]",
+        "[ASYNC DELEGATION BATCH COMPLETE children=two]",
+    ],
+)
+def test_production_turn_builder_injects_completion_provenance(agent, notification):
+    """Bind provenance to AIAgent's public turn-building seam, not its helper."""
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
+    from agent.context_compressor import ContextCompressor
+
+    agent.compression_enabled = False
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+    history = [
+        {"role": "user", "content": "real task"},
+        {"role": "assistant", "content": "ordinary response"},
+    ]
+    result = agent.run_conversation(
+        notification,
+        conversation_history=history,
+        persist_user_display_kind="internal_notification",
+    )
+    messages = result["messages"]
+    assert [m.get("content") for m in messages[2:5]] == [
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        notification,
+    ]
+    assert [m.get("role") for m in messages[2:5]] == ["user", "assistant", "user"]
+    assert ContextCompressor._has_autonomous_completion_chain(messages[:-1])
+
+
+def test_production_turn_builder_does_not_retype_genuine_user_wrapper(agent):
+    from agent.context_compressor import ContextCompressor
+
+    wrapper = "[ASYNC DELEGATION COMPLETE child=human-written]"
+    agent.compression_enabled = False
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+    result = agent.run_conversation(
+        wrapper,
+        conversation_history=[
+            {"role": "user", "content": "real task"},
+            {"role": "assistant", "content": "ordinary response"},
+        ],
+    )
+    messages = result["messages"]
+    wrapper_row = next(m for m in messages if m.get("content") == wrapper)
+    assert wrapper_row.get("display_kind") is None
+    assert not ContextCompressor._has_autonomous_completion_chain(messages[:-1])
+
+
 class TestHTTP413Compression:
     """413 errors should trigger compression, not abort as generic 4xx."""
 
@@ -448,6 +504,81 @@ class TestPreflightCompression:
         assert _compaction_terminal_status("committed_in_memory") == (
             "✓ Context compaction complete — in-memory context updated."
         )
+
+    @pytest.mark.parametrize(
+        ("mode", "outcome"),
+        [
+            ("native", "skipped_codex_native_ownership"),
+            ("off", "skipped_codex_off_ownership"),
+        ],
+    )
+    def test_codex_public_entry_reports_automatic_ownership_skip(
+        self, agent, mode, outcome
+    ):
+        messages = [{"role": "user", "content": "unchanged"}]
+        agent.api_mode = "codex_app_server"
+        agent.codex_app_server_auto_compaction = mode
+        with patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ):
+            returned, _ = agent._compress_context(messages, "system")
+        assert returned is messages
+        assert agent._last_compression_outcome == outcome
+        assert "skipped" in _compaction_terminal_status(outcome).lower()
+
+    def test_codex_public_entry_requires_an_active_thread(self, agent):
+        messages = [{"role": "user", "content": "unchanged"}]
+        agent.api_mode = "codex_app_server"
+        agent.codex_app_server_auto_compaction = "hermes"
+        agent._codex_session = None
+        with patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ):
+            returned, _ = agent._compress_context(messages, "system")
+        assert returned is messages
+        assert agent._last_compression_outcome == "skipped_codex_no_active_thread"
+
+    @pytest.mark.parametrize(
+        ("result", "outcome"),
+        [
+            (SimpleNamespace(interrupted=False, error=None, should_retire=False,
+                             thread_id="thread", turn_id="turn"),
+             "committed_provider_managed"),
+            (SimpleNamespace(interrupted=True, error=None, should_retire=False),
+             "summary_failure"),
+            (SimpleNamespace(interrupted=False, error="provider failed",
+                             should_retire=False), "summary_failure"),
+        ],
+    )
+    def test_codex_public_entry_outcome_matches_provider_result(
+        self, agent, result, outcome
+    ):
+        messages = [{"role": "user", "content": "local mirror"}]
+        original = list(messages)
+        agent.api_mode = "codex_app_server"
+        agent.codex_app_server_auto_compaction = "hermes"
+        agent._codex_session = SimpleNamespace(
+            compact_thread=MagicMock(return_value=result), close=MagicMock()
+        )
+        events = []
+        agent.status_callback = lambda event, message: events.append((event, message))
+        with patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ), patch("agent.codex_runtime._record_codex_app_server_compaction"), patch(
+            "agent.codex_runtime._record_codex_app_server_usage"
+        ):
+            returned, _ = agent._compress_context(messages, "system")
+        assert returned is messages
+        assert messages == original
+        assert agent._last_compression_outcome == outcome
+        assert events[-1] == ("compacted", _compaction_terminal_status(outcome))
+        if outcome == "committed_provider_managed":
+            assert "provider-managed" in events[-1][1]
+        else:
+            assert "complete — changes committed" not in events[-1][1]
 
     def test_compress_context_emits_lifecycle_status_before_work(self, agent):
         """Direct context compression should tell gateway users why the turn paused."""

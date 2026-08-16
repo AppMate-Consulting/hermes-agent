@@ -10,6 +10,7 @@ exactly as before.
 """
 
 import os
+import copy
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -474,6 +475,109 @@ class TestInPlaceAntiGrowthGuard:
             assert seen[0][1] == "EXACT BUILT PROMPT"
             assert seen[0][1] != ""
             assert seen[0][2] is seen[1][2]
+
+    @pytest.mark.parametrize(
+        ("request_out", "outcome"),
+        [(100_000, "rejected_no_progress"), (101_000, "rejected_would_grow"),
+         (97_000, "rejected_below_minimum_reclaim")],
+    )
+    def test_in_place_mutating_engine_rolls_back_against_immutable_input(
+        self, request_out, outcome
+    ):
+        """A plugin may mutate and return its exact input list (#remediation-7)."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = f"mutating-{outcome}"
+            _seed(db, sid, "mutating")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            original = copy.deepcopy(messages)
+            cached, static = "old prompt\x00", "old static\U0001f680"
+            agent._cached_system_prompt = cached
+            agent._cached_system_prompt_static = static
+            agent.commit_memory_session = MagicMock()
+            agent._flush_messages_to_session_db = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent.event_callback = MagicMock()
+
+            def mutate(candidate, **_kwargs):
+                candidate[:] = (
+                    copy.deepcopy(original) if outcome == "rejected_no_progress"
+                    else [{"role": "user", "content": "mutated candidate"}]
+                )
+                return candidate
+
+            agent.context_compressor.compress = mutate
+            estimates = []
+
+            def estimate(candidate, **_kwargs):
+                estimates.append(copy.deepcopy(candidate))
+                return 100_000 if len(estimates) == 1 else request_out
+
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=estimate,
+            ), patch.object(db, "archive_and_compact") as archive, patch.object(
+                db, "publish_compression_child"
+            ) as publish, patch.object(db, "end_session") as end, patch.object(
+                db, "create_session"
+            ) as create:
+                returned, prompt = compress_context(
+                    agent, messages, "sys", approx_tokens=100_000
+                )
+
+            assert estimates[0] == original
+            assert returned is messages
+            assert messages == original
+            assert prompt == cached
+            assert agent._cached_system_prompt == cached
+            assert agent._cached_system_prompt_static == static
+            assert agent._last_compression_outcome == outcome
+            agent.commit_memory_session.assert_not_called()
+            agent._flush_messages_to_session_db.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.event_callback.assert_not_called()
+            for side_effect in (archive, publish, end, create):
+                side_effect.assert_not_called()
+
+    def test_uncached_exact_noop_removes_prompt_cache_attributes(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "uncached-noop"
+            _seed(db, sid, "uncached")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._build_system_prompt = MagicMock(return_value="logical built prompt")
+            agent.context_compressor.compress = lambda current, **_kwargs: current
+            agent.commit_memory_session = MagicMock()
+            agent._flush_messages_to_session_db = MagicMock()
+            agent.event_callback = MagicMock()
+
+            with patch.object(db, "archive_and_compact") as archive, patch.object(
+                db, "publish_compression_child"
+            ) as publish:
+                returned, prompt = compress_context(
+                    agent, messages, "base prompt", approx_tokens=100_000
+                )
+
+            assert returned is messages
+            assert prompt == "logical built prompt"
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent._last_compression_outcome == "rejected_no_progress"
+            agent.commit_memory_session.assert_not_called()
+            agent._flush_messages_to_session_db.assert_not_called()
+            agent.event_callback.assert_not_called()
+            archive.assert_not_called()
+            publish.assert_not_called()
 
     def test_rejection_restores_both_prompt_cache_tiers_byte_for_byte(self):
         from hermes_state import SessionDB

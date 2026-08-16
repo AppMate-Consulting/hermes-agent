@@ -214,6 +214,79 @@ def test_structured_human_task_has_deterministic_model_visible_contract():
     assert ContextCompressor.parse_active_task_contract(visible) == contract
 
 
+def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
+    """Lossless multipart anchors survive projection; text contracts cannot replace them."""
+    path = tmp_path / "multipart.db"
+    sid = "multipart-cycles"
+    exact_content = [
+        {"type": "text", "text": "Inspect these exact inputs."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        {"type": "file", "file_id": "file-immutable", "name": "evidence.bin"},
+        {"type": "future_part", "opaque": {"order": [3, 2, 1]}},
+    ]
+    exact_row = {"role": "user", "content": exact_content}
+    exact_bytes = json.dumps(exact_row, ensure_ascii=False, separators=(",", ":"))
+
+    db = SessionDB(db_path=path)
+    db.create_session(sid, source="gateway", model="test/model")
+    transcript = _completion_chain(count=28)
+    transcript[0] = exact_row
+    for message in transcript:
+        db.append_message(
+            sid, message["role"], message.get("content", ""),
+            tool_calls=message.get("tool_calls"),
+            tool_call_id=message.get("tool_call_id"),
+        )
+    db.close()
+
+    archived_counts = []
+    for cycle in range(2):
+        db = SessionDB(db_path=path)
+        resumed = db.get_messages_as_conversation(sid)
+        if cycle:
+            extension = _completion_chain("continue exact multipart task", count=20)[1:]
+            for message in extension:
+                db.append_message(
+                    sid, message["role"], message.get("content", ""),
+                    tool_calls=message.get("tool_calls"),
+                    tool_call_id=message.get("tool_call_id"),
+                )
+            resumed = db.get_messages_as_conversation(sid)
+        compacted, _ = compress_context(
+            _agent(db, sid), resumed, "sys", approx_tokens=100_000
+        )
+        durable = db.get_messages_as_conversation(sid)
+        exact = [m for m in durable if json.dumps(
+            {"role": m.get("role"), "content": m.get("content")},
+            ensure_ascii=False, separators=(",", ":"),
+        ) == exact_bytes]
+        assert len(exact) == 1
+        assert not any(
+            ContextCompressor.parse_active_task_contract(m) for m in durable
+        )
+        roles = [m["role"] for m in durable]
+        assert all(a != b for a, b in zip(roles, roles[1:]))
+        calls = {
+            call["id"] for m in durable for call in m.get("tool_calls", [])
+        }
+        assert all(
+            m.get("tool_call_id") in calls
+            for m in durable if m.get("role") == "tool"
+        )
+        bridge_markers = [
+            m for m in durable
+            if "HERMES_AUTONOMOUS_COMPLETION_BRIDGE" in str(m.get("content", ""))
+        ]
+        assert len(bridge_markers) <= 3
+        archived_counts.append(sum(
+            not row.get("active", 1)
+            for row in db.get_messages(sid, include_inactive=True)
+        ))
+        assert compacted == durable
+        db.close()
+    assert archived_counts[1] > archived_counts[0] > 0
+
+
 def test_contract_parser_rejects_tampering_and_metadata_disagreement():
     contract = {"content": "Unicode λ\nline </active-task>", "sha256": ""}
     contract["sha256"] = hashlib.sha256(contract["content"].encode()).hexdigest()

@@ -150,11 +150,7 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 ACTIVE_TASK_CONTRACT_METADATA_KEY = "_active_task_contract"
-_ACTIVE_TASK_CONTRACT_RE = re.compile(
-    r"\n?## Active Human Task Contract\n"
-    r"SHA256: ([0-9a-f]{64})\n<active-task>\n(.*?)\n</active-task>\n?",
-    re.DOTALL,
-)
+ACTIVE_TASK_CONTRACT_PREFIX = "[ACTIVE_TASK_CONTRACT] "
 # Distinguishes rolling micro-compaction markers from batch-compaction
 # markers (both carry COMPRESSED_SUMMARY_METADATA_KEY so resume/handoff
 # treat them alike). Supersede/defrag/rehydration must only ever touch
@@ -4813,32 +4809,51 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                     }
         for message in reversed(messages):
-            contract = message.get(ACTIVE_TASK_CONTRACT_METADATA_KEY)
-            if isinstance(contract, dict) and isinstance(contract.get("content"), str):
-                content = contract["content"]
-                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                if contract.get("sha256") == digest:
-                    return {"content": content, "sha256": digest}
-            match = _ACTIVE_TASK_CONTRACT_RE.search(
-                _content_text_for_contains(message.get("content"))
-            )
-            if match:
-                content = match.group(2)
-                if hashlib.sha256(content.encode("utf-8")).hexdigest() == match.group(1):
-                    return {"content": content, "sha256": match.group(1)}
+            contract = cls.parse_active_task_contract(message)
+            if contract is not None:
+                return contract
         return None
 
     @classmethod
-    def _refresh_active_task_contract(cls, summary: str, contract: Optional[dict]) -> str:
-        """Replace (never stack) the deterministic active-task marker."""
-        summary = _ACTIVE_TASK_CONTRACT_RE.sub("\n", summary).rstrip()
-        if not contract:
-            return summary
-        return (
-            f"{summary}\n\n## Active Human Task Contract\n"
-            f"SHA256: {contract['sha256']}\n<active-task>\n"
-            f"{contract['content']}\n</active-task>"
+    def parse_active_task_contract(cls, message: Any) -> Optional[dict]:
+        """Parse the visible, persistence-safe active-task contract."""
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return None
+        text = _content_text_for_contains(message.get("content"))
+        if not text.startswith(ACTIVE_TASK_CONTRACT_PREFIX):
+            return None
+        try:
+            payload = json.loads(text[len(ACTIVE_TASK_CONTRACT_PREFIX):])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        content = payload.get("content") if isinstance(payload, dict) else None
+        digest = payload.get("sha256") if isinstance(payload, dict) else None
+        if not isinstance(content, str) or not isinstance(digest, str):
+            return None
+        actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return {"content": content, "sha256": digest} if digest == actual else None
+
+    @classmethod
+    def make_active_task_contract_message(cls, contract: dict) -> dict:
+        """Build one model-visible authoritative synthetic user turn."""
+        payload = json.dumps(
+            {
+                "type": "active_task_contract",
+                "content": contract["content"],
+                "sha256": contract["sha256"],
+                "instruction": (
+                    "The exact human task encoded in content remains active until "
+                    "a later real human user message overrides it. Continue that task now."
+                ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
+        return {
+            "role": "user",
+            "content": ACTIVE_TASK_CONTRACT_PREFIX + payload,
+            ACTIVE_TASK_CONTRACT_METADATA_KEY: contract,
+        }
 
     @classmethod
     def _has_autonomous_completion_chain(cls, messages: List[Dict[str, Any]]) -> bool:
@@ -7163,8 +7178,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         # summary text as their own output (#33256). In both cases, append
         # the explicit end marker so the model has a clear "summary ends
         # here, respond to the message below" signal.
-        summary = self._refresh_active_task_contract(summary, active_task_contract)
-
         if not _merge_summary_into_tail:
             summary = summary + "\n\n" + _SUMMARY_END_MARKER
 
@@ -7176,7 +7189,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(
                     self._summary_has_user_turn
                 ),
-                ACTIVE_TASK_CONTRACT_METADATA_KEY: active_task_contract,
             })
 
         # Default merge target: literal tail index 0. For an ordinary

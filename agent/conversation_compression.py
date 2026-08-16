@@ -1969,7 +1969,15 @@ def _is_real_user_message(message: Any) -> bool:
         return False
     from agent.context_compressor import ContextCompressor
 
+    if ContextCompressor.parse_active_task_contract(message) is not None:
+        return False
     return not ContextCompressor._is_synthetic_compression_user_turn(message)
+
+
+def _is_active_task_contract_message(message: Any) -> bool:
+    from agent.context_compressor import ContextCompressor
+
+    return ContextCompressor.parse_active_task_contract(message) is not None
 
 
 def _strip_stale_todo_snapshot(content: Any) -> Any:
@@ -2125,7 +2133,10 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
 
 def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> None:
     """Preserve human intent, not merely a synthetic user-role placeholder."""
-    if any(_is_real_user_message(message) for message in compressed):
+    if any(
+        _is_real_user_message(message) or _is_active_task_contract_message(message)
+        for message in compressed
+    ):
         return
     from agent.context_compressor import (
         COMPRESSION_CONTINUATION_USER_CONTENT,
@@ -2148,6 +2159,50 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
             "content": COMPRESSION_CONTINUATION_USER_CONTENT,
         },
     )
+
+
+def _refresh_active_task_contract(original_messages: list, compressed: list) -> None:
+    """Install exactly one authoritative contract after the reference summary."""
+    from agent.context_compressor import ContextCompressor
+
+    contract = ContextCompressor._active_task_contract(original_messages)
+    compressed[:] = [
+        message for message in compressed
+        if not _is_active_task_contract_message(message)
+    ]
+    if contract is None or not ContextCompressor._has_autonomous_completion_chain(
+        original_messages
+    ):
+        return
+    summary_index = next(
+        (
+            index for index, message in enumerate(compressed)
+            if ContextCompressor._is_context_summary_message(message)
+        ),
+        -1,
+    )
+    insert_at = summary_index + 1
+    # A contract is deliberately its own user turn. Add bounded assistant
+    # bridges only where a strict role template would otherwise see user/user.
+    if insert_at > 0 and compressed[insert_at - 1].get("role") == "user":
+        compressed.insert(insert_at, {
+            "role": "assistant",
+            "content": "The authoritative active-task contract follows.",
+            "_active_task_contract_bridge": True,
+        })
+        insert_at += 1
+    compressed.insert(
+        insert_at, ContextCompressor.make_active_task_contract_message(contract)
+    )
+    if (
+        insert_at + 1 < len(compressed)
+        and compressed[insert_at + 1].get("role") == "user"
+    ):
+        compressed.insert(insert_at + 1, {
+            "role": "assistant",
+            "content": "I will continue the active task under that contract.",
+            "_active_task_contract_bridge": True,
+        })
 
 
 _PENDING_CONTEXT_ENGINE_NOTIFICATION = (
@@ -2242,6 +2297,7 @@ def compress_context(
     force: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    rejection_cooldown_seconds: Optional[float] = 60.0,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2334,6 +2390,7 @@ def compress_context(
                 existing_prompt = getattr(agent, "_cached_system_prompt", None)
                 if not existing_prompt:
                     existing_prompt = agent._build_system_prompt(system_message)
+                agent._last_compression_outcome = "cancelled_commit_fence"
                 return messages, existing_prompt
         try:
             return _compress_context_via_codex_app_server(
@@ -2552,6 +2609,7 @@ def compress_context(
                         split_status="aborted",
                         failure_class="commit_fence_cancelled",
                     )
+                    agent._last_compression_outcome = "cancelled_commit_fence"
                     _complete_compaction_lifecycle()
                     return messages, _existing_sp
             try:
@@ -2623,6 +2681,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class="lock_contended",
             )
+            agent._last_compression_outcome = "skipped_lock_contention"
             _complete_compaction_lifecycle()
             return messages, _existing_sp
     _lock_released = False
@@ -2697,6 +2756,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class="commit_fence_cancelled",
             )
+            agent._last_compression_outcome = "cancelled_commit_fence"
             _release_lock()
             return messages, _existing_sp
 
@@ -2720,6 +2780,7 @@ def compress_context(
                 type(_session_err).__name__,
                 _session_err,
             )
+            agent._last_compression_outcome = "skipped_session_state_unavailable"
             _release_lock()
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
@@ -2739,12 +2800,14 @@ def compress_context(
                     _lock_sid,
                     agent.session_id,
                 )
+                agent._last_compression_outcome = "adopted_concurrent_compaction"
                 return recovered_messages, _existing_sp
             logger.warning(
                 "compression skipped: session=%s was already rotated by "
                 "another compression path, but no unique live child could be adopted",
                 _lock_sid,
             )
+            agent._last_compression_outcome = "skipped_already_compacted"
             return messages, _existing_sp
 
     # Snapshot the authoritative durable cooldown only after this attempt owns
@@ -2761,6 +2824,7 @@ def compress_context(
         # failed. Proceeding with force=True could clear an unknown newer row
         # before cancellation has enough information to restore it. This is a
         # persistence-safety abort, not automatic breaker gating.
+        agent._last_compression_outcome = "persistence_guard_read_failure"
         _release_lock()
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
@@ -2783,6 +2847,7 @@ def compress_context(
             None,
         )
         if callable(blocked) and blocked(compressor):
+            agent._last_compression_outcome = "skipped_cooldown"
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
@@ -3051,6 +3116,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class=f"rollback:{type(_rollback_exc).__name__}",
             )
+            agent._last_compression_outcome = "rollback_failure"
             raise
         if (
             messages_before_compression is not None
@@ -3068,6 +3134,7 @@ def compress_context(
             split_status="aborted",
             failure_class="explicit_interrupt",
         )
+        agent._last_compression_outcome = "cancelled_explicit_interrupt"
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
             _existing_sp = agent._build_system_prompt(system_message)
@@ -3086,6 +3153,9 @@ def compress_context(
             commit_status="aborted",
             split_status="aborted",
             failure_class=f"exception:{type(_compress_exc).__name__}",
+        )
+        agent._last_compression_outcome = (
+            f"compression_exception_{type(_compress_exc).__name__}"
         )
         raise
     finally:
@@ -3163,14 +3233,14 @@ def compress_context(
                 failure_class="no_progress",
             )
             agent._last_compression_outcome = "rejected_no_progress"
-            if not force:
+            if not force and rejection_cooldown_seconds is not None:
                 _record_rejection = getattr(
                     agent.context_compressor,
                     "_record_compression_failure_cooldown",
                     None,
                 )
                 if callable(_record_rejection):
-                    _record_rejection(60.0, "no_progress")
+                    _record_rejection(rejection_cooldown_seconds, "no_progress")
             _release_lock()
             return messages, _existing_sp
 
@@ -3190,6 +3260,7 @@ def compress_context(
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
+            agent._last_compression_outcome = "rejected_empty_transcript"
             _release_lock()
             return messages, _existing_sp
 
@@ -3213,6 +3284,7 @@ def compress_context(
                     agent.session_id or "none",
                 )
                 agent._last_compaction_in_place = False
+                agent._last_compression_outcome = "cancelled_commit_fence"
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
                     _existing_sp = agent._build_system_prompt(system_message)
@@ -3312,6 +3384,7 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
+        _refresh_active_task_contract(messages, compressed)
         _ensure_compressed_has_user_turn(messages, compressed)
 
         cached_system_prompt = agent._cached_system_prompt
@@ -3376,15 +3449,25 @@ def compress_context(
                 # transcript stays untouched and durable.
                 _rough_in = estimate_messages_tokens_rough(messages)
                 _rough_out = estimate_messages_tokens_rough(compressed)
+                _request_in = estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=_system_prompt_before_compression or "",
+                    tools=agent.tools or None,
+                )
+                _request_out = estimate_request_tokens_rough(
+                    compressed,
+                    system_prompt=new_system_prompt or "",
+                    tools=agent.tools or None,
+                )
                 _threshold = int(
                     getattr(agent.context_compressor, "threshold_tokens", 0) or 0
                 )
                 _minimum_reclaim = max(4_096, int(_threshold * 0.05))
-                _reclaimed = _rough_in - _rough_out
+                _reclaimed = _request_in - _request_out
                 _rejection = None
-                if _rough_out > _rough_in:
+                if _request_out > _request_in:
                     _rejection = "would_grow"
-                elif _rough_out == _rough_in:
+                elif _request_out == _request_in:
                     _rejection = "no_progress"
                 elif _reclaimed < _minimum_reclaim:
                     _rejection = "below_minimum_reclaim"
@@ -3395,8 +3478,8 @@ def compress_context(
                         "~%s); keeping the original transcript unchanged",
                         _rejection,
                         agent.session_id or "none",
-                        f"{_rough_in:,}",
-                        f"{_rough_out:,}",
+                        f"{_request_in:,}",
+                        f"{_request_out:,}",
                         f"{_minimum_reclaim:,}",
                     )
                     try:
@@ -3421,14 +3504,14 @@ def compress_context(
                         failure_class=_rejection,
                     )
                     agent._last_compression_outcome = f"rejected_{_rejection}"
-                    if not force:
+                    if not force and rejection_cooldown_seconds is not None:
                         _record_rejection = getattr(
                             agent.context_compressor,
                             "_record_compression_failure_cooldown",
                             None,
                         )
                         if callable(_record_rejection):
-                            _record_rejection(60.0, _rejection)
+                            _record_rejection(rejection_cooldown_seconds, _rejection)
                     _release_lock()
                     return messages, _existing_sp
 
@@ -3691,7 +3774,7 @@ def compress_context(
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
         if not agent._session_db:
-            agent._last_compression_outcome = "persistence_failure"
+            agent._last_compression_outcome = "committed_in_memory"
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`

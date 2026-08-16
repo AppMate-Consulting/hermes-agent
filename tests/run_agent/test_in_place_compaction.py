@@ -301,6 +301,67 @@ class TestInPlaceAntiGrowthGuard:
             assert agent.session_id == sid
             assert db.get_session(sid)["end_reason"] is None
 
+    def test_request_overhead_can_make_message_shrink_marginal(self):
+        """Admission uses comparable full requests, never message-only size."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_request_estimator"
+            _seed(db, sid, "request")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            before_rows = db.get_messages(sid, include_inactive=True)
+
+            def _request_estimate(candidate, *, system_prompt="", tools=None):
+                # Message-only sizing shrinks dramatically, but the exact
+                # request overhead leaves only 3K reclaim (< the 4K floor).
+                return 100_000 if candidate is messages else 97_000
+
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=_request_estimate,
+            ):
+                returned, _ = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            assert returned is messages
+            assert agent._last_compression_outcome == "rejected_below_minimum_reclaim"
+            cooldown = db.get_compression_failure_cooldown(sid)
+            assert cooldown is not None
+            assert cooldown["error"] == "below_minimum_reclaim"
+            assert len(cooldown["error"]) < 256
+            fresh = _make_agent(db, sid, in_place=True)
+            fresh.context_compressor.bind_session_state(db, sid)
+            assert fresh.context_compressor.get_active_compression_failure_cooldown()
+            after_rows = db.get_messages(sid, include_inactive=True)
+            assert [(r["id"], r["active"]) for r in after_rows] == [
+                (r["id"], r["active"]) for r in before_rows
+            ]
+
+    def test_manual_rejection_does_not_write_automatic_cooldown(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_manual_reject"
+            _seed(db, sid, "manual")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=lambda candidate, **kwargs: (
+                    100_000 if candidate is messages else 97_000
+                ),
+            ):
+                compress_context(
+                    agent, messages, "sys", force=True, approx_tokens=100_000
+                )
+            assert db.get_compression_failure_cooldown(sid) is None
+
     def test_in_place_still_commits_shrinking_compression(self):
         """The guard must not block legitimate compressions — a result SMALLER
         than the input still commits in place (regression net for #83339)."""

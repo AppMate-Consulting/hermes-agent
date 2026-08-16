@@ -7850,6 +7850,7 @@ class AIAgent:
         force: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
+        rejection_cooldown_seconds: float | None = 60.0,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
@@ -7917,6 +7918,7 @@ class AIAgent:
                         defer_context_engine_notification
                     ),
                     commit_fence=fence,
+                    rejection_cooldown_seconds=rejection_cooldown_seconds,
                 )
 
             # Callers that already own a progress-aware wait (gateway session

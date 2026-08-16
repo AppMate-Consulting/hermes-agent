@@ -18944,6 +18944,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                             commit_fence=_hyg_commit_fence,
+                                            rejection_cooldown_seconds=None,
                                         ),
                                     )
                                     try:

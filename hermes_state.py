@@ -5572,7 +5572,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
+                          thread_id, display_name, origin_json, profile_name,
+                          hygiene_failure_streak
                    FROM sessions WHERE id = ?""",
                 (parent_session_id,),
             ).fetchone()
@@ -5590,8 +5591,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    system_prompt_hash,
                    parent_session_id, cwd, git_branch, git_repo_root,
                    profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   thread_id, display_name, origin_json,
+                   hygiene_failure_streak, started_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
@@ -5615,6 +5617,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     parent["thread_id"],
                     parent["display_name"],
                     parent["origin_json"],
+                    parent["hygiene_failure_streak"],
                     time.time(),
                 ),
             )
@@ -5897,6 +5900,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "record_compression_failure_cooldown(%s) failed: %s",
                 session_id, exc,
             )
+
+    def record_hygiene_failure(
+        self, session_id: str, base_cooldown_seconds: float,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Atomically advance the durable hygiene rung and its deadline."""
+        if not session_id:
+            return 1
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT hygiene_failure_streak FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return 1
+            current = row[0] if not isinstance(row, sqlite3.Row) else row["hygiene_failure_streak"]
+            streak = min(3, max(0, int(current or 0)) + 1)
+            multiplier = (1, 3, 9)[streak - 1]
+            cooldown_until = time.time() + min(
+                max(0.0, float(base_cooldown_seconds)) * multiplier, 3600.0
+            )
+            conn.execute(
+                "UPDATE sessions SET hygiene_failure_streak = ?, "
+                "compression_failure_cooldown_until = ?, "
+                "compression_failure_error = ? WHERE id = ?",
+                (streak, cooldown_until, error, session_id),
+            )
+            return {"streak": streak, "cooldown_until": cooldown_until}
+
+        return dict(self._execute_write(_do))
+
+    def get_hygiene_failure_streak(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT hygiene_failure_streak FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return 0
+        value = row[0] if not isinstance(row, sqlite3.Row) else row["hygiene_failure_streak"]
+        return min(3, max(0, int(value or 0)))
+
+    def reset_hygiene_failure_streak(self, session_id: str) -> None:
+        if session_id:
+            self._execute_write(lambda conn: conn.execute(
+                "UPDATE sessions SET hygiene_failure_streak = 0 WHERE id = ?",
+                (session_id,),
+            ))
 
     def get_compression_failure_cooldown(
         self,

@@ -4816,22 +4816,57 @@ This compaction should PRIORITISE preserving all information related to the focu
         """Return the latest real human task, including across compactions."""
         from agent.conversation_compression import _is_real_user_message
 
-        for message in reversed(messages):
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
             if message.get("role") == "user" and _is_real_user_message(message):
-                content = _content_text_for_contains(message.get("content"))
+                raw_content = message.get("content")
+                if (
+                    _is_autonomous_completion_notification(
+                        _content_text_for_contains(raw_content).strip()
+                    )
+                    and index > 0
+                    and isinstance(messages[index - 1], dict)
+                    and messages[index - 1].get("role") == "assistant"
+                ):
+                    continue
+                # Structured media/file/unknown parts cannot be represented by
+                # this bounded text contract without loss.  Returning no
+                # contract makes the boundary retain the exact human row as
+                # its protected anchor instead.
+                if isinstance(raw_content, list) and any(
+                    not isinstance(part, dict) or part.get("type") != "text"
+                    for part in raw_content
+                ):
+                    return None
+                content = _content_text_for_contains(raw_content)
                 if content:
                     return {
                         "content": content,
                         "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                     }
-        for message in reversed(messages):
-            contract = cls.parse_active_task_contract(message)
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            # DB projection removes underscore metadata.  Provenance then
+            # requires the exact Hermes-authored assistant bridge immediately
+            # before the contract; a user cannot forge that as one user row.
+            projected = (
+                index > 0
+                and isinstance(messages[index - 1], dict)
+                and messages[index - 1].get("role") == "assistant"
+                and messages[index - 1].get("content")
+                == "[HERMES_ACTIVE_TASK_CONTRACT_BRIDGE:before] The authoritative active-task contract follows."
+            )
+            contract = cls.parse_active_task_contract(
+                message, allow_projected=projected
+            )
             if contract is not None:
                 return contract
         return None
 
     @classmethod
-    def parse_active_task_contract(cls, message: Any) -> Optional[dict]:
+    def parse_active_task_contract(
+        cls, message: Any, *, allow_projected: bool = False
+    ) -> Optional[dict]:
         """Parse the visible, persistence-safe active-task contract."""
         if not isinstance(message, dict) or message.get("role") != "user":
             return None
@@ -4857,6 +4892,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
         contract = {"content": content, "sha256": digest}
         metadata = message.get(ACTIVE_TASK_CONTRACT_METADATA_KEY)
+        if metadata is None and not allow_projected:
+            return None
         if metadata is not None and metadata != contract:
             return None
         return contract if digest == actual else None

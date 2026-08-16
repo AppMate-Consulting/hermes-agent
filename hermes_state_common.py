@@ -307,6 +307,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
     compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    hygiene_failure_streak INTEGER NOT NULL DEFAULT 0,
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,

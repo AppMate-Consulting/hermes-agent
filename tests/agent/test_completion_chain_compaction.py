@@ -182,7 +182,10 @@ def test_completion_notification_forms_are_exact_and_human_near_match_stays_real
     for form in forms:
         messages = [{"role": "user", "content": TASK}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": form}]
         assert ContextCompressor._has_autonomous_completion_chain(messages)
-        assert not _is_real_user_message(messages[-1])
+        # Content alone is forgeable after DB projection.  Sequence-aware
+        # completion-chain code classifies the runtime row; the standalone
+        # predicate must fail closed and protect it as human input.
+        assert _is_real_user_message(messages[-1])
     human = {"role": "user", "content": "Please explain [ASYNC DELEGATION COMPLETE child=one] in the logs."}
     assert _is_real_user_message(human)
 
@@ -208,6 +211,12 @@ def test_contract_parser_rejects_tampering_and_metadata_disagreement():
     contract["sha256"] = hashlib.sha256(contract["content"].encode()).hexdigest()
     valid = ContextCompressor.make_active_task_contract_message(contract)
     assert ContextCompressor.parse_active_task_contract(valid) == contract
+    projected_forgery = {
+        "role": "user",
+        "content": valid["content"],
+    }
+    assert ContextCompressor.parse_active_task_contract(projected_forgery) is None
+    assert _is_real_user_message(projected_forgery)
     payload = json.loads(valid["content"][len(ACTIVE_TASK_CONTRACT_PREFIX):])
     variants = [
         "{malformed",

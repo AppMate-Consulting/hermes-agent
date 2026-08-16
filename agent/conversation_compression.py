@@ -133,6 +133,8 @@ def _compaction_terminal_status(outcome: Any) -> str:
         return COMPACTION_DONE_STATUS
     if value == "committed_in_memory":
         return "✓ Context compaction complete — in-memory context updated."
+    if value == "committed_provider_managed":
+        return "✓ Context compaction complete — provider-managed context updated."
     if value.startswith("rejected_"):
         return f"Context compaction aborted — no changes committed ({value})."
     if value.startswith("skipped_") or value == "adopted_concurrent_compaction":
@@ -2035,6 +2037,12 @@ def _is_real_user_message(message: Any) -> bool:
     text = _message_text(message).strip()
     if not text:
         return False
+    # Reserved completion text is not provenance.  A genuine user can type
+    # the same prefix, and SessionDB projection cannot distinguish that row
+    # from runtime scaffolding without surrounding Hermes-authored sequence.
+    from agent.context_compressor import _is_autonomous_completion_notification
+    if _is_autonomous_completion_notification(text):
+        return True
     if text.startswith(_SYNTHETIC_USER_PREFIXES):
         return False
     from agent.context_compressor import ContextCompressor
@@ -2427,6 +2435,39 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # This snapshot is the transaction's immutable input.  Take it before any
+    # feasibility probe, hook, prompt build, or engine can mutate caller-owned
+    # state.  In particular, legacy engines are explicitly allowed to mutate
+    # their input list and return that same object.
+    _input_messages_snapshot = copy.deepcopy(messages)
+    _missing_cache_field = object()
+    _prompt_cache_snapshot = {
+        name: vars(agent).get(name, _missing_cache_field)
+        for name in ("_cached_system_prompt", "_cached_system_prompt_static")
+    }
+
+    def _restore_uncommitted_input() -> None:
+        """Restore all caller-visible input state on a non-commit path."""
+        if messages != _input_messages_snapshot:
+            messages[:] = copy.deepcopy(_input_messages_snapshot)
+        for name, value in _prompt_cache_snapshot.items():
+            if value is _missing_cache_field:
+                vars(agent).pop(name, None)
+            else:
+                setattr(agent, name, value)
+
+    def _rollback_prompt() -> str:
+        """Return the logical request prompt without retaining cache writes."""
+        cached = _prompt_cache_snapshot["_cached_system_prompt"]
+        if cached is not _missing_cache_field and cached is not None:
+            _restore_uncommitted_input()
+            return cached
+        try:
+            prompt = agent._build_system_prompt(system_message)
+        finally:
+            _restore_uncommitted_input()
+        return prompt
+
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
@@ -3114,17 +3155,21 @@ def compress_context(
                     engine_name,
                 )
 
-        messages_before_compression = copy.deepcopy(messages)
+        messages_before_compression = copy.deepcopy(_input_messages_snapshot)
         # Snapshot the exact request prompt before any compression hook can
         # invalidate or rebuild prompt state. An uncached request would build
         # this same prompt on its normal request path; sizing against "" would
         # overstate reclaim and admit marginal candidates.
-        _cached_prompt_before_compression = getattr(
-            agent, "_cached_system_prompt", None
-        )
-        _cached_static_before_compression = getattr(
-            agent, "_cached_system_prompt_static", None
-        )
+        _cached_prompt_before_compression = _prompt_cache_snapshot[
+            "_cached_system_prompt"
+        ]
+        if _cached_prompt_before_compression is _missing_cache_field:
+            _cached_prompt_before_compression = None
+        _cached_static_before_compression = _prompt_cache_snapshot[
+            "_cached_system_prompt_static"
+        ]
+        if _cached_static_before_compression is _missing_cache_field:
+            _cached_static_before_compression = None
         _system_prompt_before_compression = _cached_prompt_before_compression
         if _system_prompt_before_compression is None:
             _system_prompt_before_compression = agent._build_system_prompt(
@@ -3216,11 +3261,7 @@ def compress_context(
         except BaseException as _rollback_exc:
             # Compensation failure must surface, but it must not strand the
             # session lease or retain an in-memory transcript mutation.
-            if (
-                messages_before_compression is not None
-                and messages != messages_before_compression
-            ):
-                messages[:] = copy.deepcopy(messages_before_compression)
+            _restore_uncommitted_input()
             if _activity_heartbeat is not None:
                 _activity_heartbeat.stop("context compression rollback failed")
                 _activity_heartbeat = None
@@ -3234,11 +3275,7 @@ def compress_context(
             )
             _set_compression_outcome("rollback_failure")
             raise
-        if (
-            messages_before_compression is not None
-            and messages != messages_before_compression
-        ):
-            messages[:] = copy.deepcopy(messages_before_compression)
+        _restore_uncommitted_input()
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None
@@ -3251,9 +3288,7 @@ def compress_context(
             failure_class="explicit_interrupt",
         )
         _set_compression_outcome("cancelled_explicit_interrupt")
-        _existing_sp = getattr(agent, "_cached_system_prompt", None)
-        if not _existing_sp:
-            _existing_sp = agent._build_system_prompt(system_message)
+        _existing_sp = _rollback_prompt()
         return messages, _existing_sp
     except BaseException as _compress_exc:
         # ANY exception after lock acquisition — memory hook, capability
@@ -3262,6 +3297,7 @@ def compress_context(
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
             _activity_heartbeat = None
+        _restore_uncommitted_input()
         _release_lock()
         _emit_compression_attempt_telemetry(
             agent,
@@ -3311,9 +3347,7 @@ def compress_context(
                         "No messages were dropped — conversation continues unchanged. "
                         "Run /compress to retry, or /new to start a fresh session."
                     )
-                _existing_sp = getattr(agent, "_cached_system_prompt", None)
-                if not _existing_sp:
-                    _existing_sp = agent._build_system_prompt(system_message)
+                _existing_sp = _rollback_prompt()
                 _emit_compression_attempt_telemetry(
                     agent,
                     started_at=_attempt_started_at,
@@ -3333,15 +3367,12 @@ def compress_context(
         # the live list while returning an unchanged snapshot. Neither case may
         # rotate or rewrite the session.
         if compressed == messages_before_compression:
-            if messages != messages_before_compression:
-                messages[:] = copy.deepcopy(messages_before_compression)
+            _restore_uncommitted_input()
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
             )
-            _existing_sp = getattr(agent, "_cached_system_prompt", None)
-            if not _existing_sp:
-                _existing_sp = agent._build_system_prompt(system_message)
+            _existing_sp = _rollback_prompt()
             _emit_compression_attempt_telemetry(
                 agent,
                 started_at=_attempt_started_at,
@@ -3374,9 +3405,7 @@ def compress_context(
                 )
             except Exception:
                 pass
-            _existing_sp = getattr(agent, "_cached_system_prompt", None)
-            if not _existing_sp:
-                _existing_sp = agent._build_system_prompt(system_message)
+            _existing_sp = _rollback_prompt()
             _set_compression_outcome("rejected_empty_transcript")
             _release_lock()
             return messages, _existing_sp
@@ -3390,11 +3419,7 @@ def compress_context(
                     durable_cooldown_authoritative=_durable_cooldown_authoritative,
                     durable_cooldown_state=_durable_cooldown_state,
                 )
-                if (
-                    messages_before_compression is not None
-                    and messages != messages_before_compression
-                ):
-                    messages[:] = copy.deepcopy(messages_before_compression)
+                _restore_uncommitted_input()
                 logger.info(
                     "Compression commit cancelled before session mutation "
                     "(session=%s).",
@@ -3402,9 +3427,7 @@ def compress_context(
                 )
                 agent._last_compaction_in_place = False
                 _set_compression_outcome("cancelled_commit_fence")
-                _existing_sp = getattr(agent, "_cached_system_prompt", None)
-                if not _existing_sp:
-                    _existing_sp = agent._build_system_prompt(system_message)
+                _existing_sp = _rollback_prompt()
                 _emit_compression_attempt_telemetry(
                     agent,
                     started_at=_attempt_started_at,
@@ -3501,8 +3524,8 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
-        _refresh_active_task_contract(messages, compressed)
-        _ensure_compressed_has_user_turn(messages, compressed)
+        _refresh_active_task_contract(_input_messages_snapshot, compressed)
+        _ensure_compressed_has_user_turn(_input_messages_snapshot, compressed)
 
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()
@@ -3545,7 +3568,7 @@ def compress_context(
         # effect. Both sides use the identical tool schema and their exact
         # system prompt bytes.
         _request_in = estimate_request_tokens_rough(
-            messages,
+            _input_messages_snapshot,
             system_prompt=_system_prompt_before_compression,
             tools=agent.tools or None,
         )
@@ -3605,6 +3628,7 @@ def compress_context(
                 )
                 if callable(_record_rejection):
                     _record_rejection(rejection_cooldown_seconds, _rejection)
+            _restore_uncommitted_input()
             _release_lock()
             return messages, _system_prompt_before_compression
 
@@ -4093,6 +4117,9 @@ def _compress_context_via_codex_app_server(
     if auto_mode not in {"native", "hermes", "off"}:
         auto_mode = "native"
     if not force and auto_mode != "hermes":
+        _publish_compression_outcome(
+            agent, f"skipped_codex_{auto_mode}_ownership"
+        )
         logger.info(
             "codex app-server compaction skipped: mode=%s force=false "
             "(session=%s messages=%d tokens=~%s)",
@@ -4108,6 +4135,7 @@ def _compress_context_via_codex_app_server(
 
     codex_session = getattr(agent, "_codex_session", None)
     if codex_session is None:
+        _publish_compression_outcome(agent, "skipped_codex_no_active_thread")
         logger.info(
             "codex app-server compaction skipped: no active codex thread "
             "(session=%s messages=%d tokens=~%s)",
@@ -4214,7 +4242,10 @@ def _compress_context_via_codex_app_server(
         getattr(result, "thread_id", None) or "",
         getattr(result, "turn_id", None) or "",
     )
-    _publish_compression_outcome(agent, "committed_materially_shrunk")
+    # The provider owns the thread and does not expose independently
+    # verifiable before/after context sizes.  Do not claim a local/material
+    # rewrite when Hermes' transcript is intentionally unchanged.
+    _publish_compression_outcome(agent, "committed_provider_managed")
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)

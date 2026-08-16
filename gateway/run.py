@@ -198,7 +198,9 @@ def _hygiene_cooldown_for_failure(
     return min(base_cooldown_seconds * multiplier, _HYGIENE_COOLDOWN_MAX_SECONDS)
 
 
-def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
+def _reset_hygiene_failure_streak(
+    gateway, session_key: str, session_id: Optional[str] = None
+) -> None:
     """Clear the hygiene failure streak after a compression that reduced context.
 
     Peeks rather than get-or-creates: writing a 0 that is already 0 must not
@@ -208,6 +210,11 @@ def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
         state = gateway._peek_session_state(session_key)
         if state is not None:
             state.persistent.hygiene_failure_streak = 0
+        session_db = getattr(gateway, "_session_db", None)
+        session_db = getattr(session_db, "_db", session_db)
+        resetter = getattr(session_db, "reset_hygiene_failure_streak", None)
+        if session_id and callable(resetter):
+            resetter(session_id)
     except Exception as exc:
         logger.debug("hygiene failure streak reset failed: %s", exc)
 
@@ -287,6 +294,32 @@ def _record_hygiene_cooldown(
         recorder(session_id, _time.time() + cooldown_seconds, error)
     except Exception as exc:
         logger.debug("session hygiene cooldown persist failed: %s", exc)
+
+
+def _record_hygiene_failure(
+    gateway, session_key: str, session_id: str,
+    base_cooldown_seconds: float, error: Optional[str] = None,
+) -> None:
+    """Advance the durable rung and deadline in one SessionDB transaction."""
+    session_db = getattr(gateway, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    recorder = getattr(session_db, "record_hygiene_failure", None)
+    if callable(recorder):
+        try:
+            result = recorder(session_id, base_cooldown_seconds, error)
+            gateway._session_state(
+                session_key
+            ).persistent.hygiene_failure_streak = int(result["streak"])
+            return
+        except Exception as exc:
+            logger.debug("durable hygiene failure recording failed: %s", exc)
+    _record_hygiene_cooldown(
+        gateway, session_id,
+        _hygiene_cooldown_for_failure(
+            gateway, session_key, base_cooldown_seconds
+        ),
+        error,
+    )
 
 
 def _status_template_to_regex(template: str) -> str:
@@ -19037,12 +19070,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _hyg_cleanup_deferred = True
                                             if _hyg_failure_cooldown_seconds >= 0:
-                                                _record_hygiene_cooldown(
-                                                    self, session_entry.session_id,
-                                                    _hygiene_cooldown_for_failure(
-                                                        self, session_key,
-                                                        _hyg_failure_cooldown_seconds,
-                                                    ),
+                                                _record_hygiene_failure(
+                                                    self, session_key,
+                                                    session_entry.session_id,
+                                                    _hyg_failure_cooldown_seconds,
                                                     "session hygiene compression "
                                                     "timed out with no output from "
                                                     "the summary model",
@@ -19099,7 +19130,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _werr,
                                                 )
                                             raise
-                                    except BaseException:
+                                    except BaseException as _hyg_wrapper_exc:
                                         # #76354 F2: non-timeout unwind while the
                                         # detached hygiene worker may still run —
                                         # KeyboardInterrupt, task cancellation, or
@@ -19108,6 +19139,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # durable lease via the holder-qualified
                                         # hook) BEFORE the host unwinds so the
                                         # worker can never commit later.
+                                        from agent.conversation_compression import (
+                                            _publish_compression_outcome,
+                                        )
+                                        if isinstance(
+                                            _hyg_wrapper_exc,
+                                            (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                                        ):
+                                            _outer_outcome = "cancelled_host"
+                                        else:
+                                            _outer_outcome = (
+                                                "wrapper_exception_"
+                                                f"{type(_hyg_wrapper_exc).__name__}"
+                                            )
+                                        _publish_compression_outcome(
+                                            _hyg_agent,
+                                            _outer_outcome,
+                                            outer_terminal=True,
+                                        )
                                         _hyg_commit_fence.revoke_commit_admission()
                                         if not _hyg_cleanup_deferred:
                                             self._defer_agent_cleanup_until_future_done(
@@ -19274,13 +19323,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         "rejected_below_minimum_reclaim",
                                     }
                                     if _hyg_rejected and _hyg_failure_cooldown_seconds >= 0:
-                                        _record_hygiene_cooldown(
-                                            self,
+                                        _record_hygiene_failure(
+                                            self, session_key,
                                             session_entry.session_id,
-                                            _hygiene_cooldown_for_failure(
-                                                self, session_key,
-                                                _hyg_failure_cooldown_seconds,
-                                            ),
+                                            _hyg_failure_cooldown_seconds,
                                             _hyg_outcome.removeprefix("rejected_"),
                                         )
                                     if not _hyg_aborted:
@@ -19302,16 +19348,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             new_tokens=_new_tokens,
                                         ):
                                             _reset_hygiene_failure_streak(
-                                                self, session_key
+                                                self, session_key,
+                                                _hyg_new_sid,
                                             )
                                     if _hyg_aborted:
                                         if _hyg_failure_cooldown_seconds >= 0:
-                                            _record_hygiene_cooldown(
-                                                self, session_entry.session_id,
-                                                _hygiene_cooldown_for_failure(
-                                                    self, session_key,
-                                                    _hyg_failure_cooldown_seconds,
-                                                ),
+                                            _record_hygiene_failure(
+                                                self, session_key,
+                                                session_entry.session_id,
+                                                _hyg_failure_cooldown_seconds,
                                                 getattr(
                                                     _comp, "_last_summary_error", None
                                                 ),

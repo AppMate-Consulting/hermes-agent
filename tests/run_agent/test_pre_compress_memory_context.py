@@ -282,3 +282,85 @@ def test_rejected_candidate_never_reaches_memory_observer(monkeypatch, out_token
 
     assert returned is original
     assert calls == []
+
+
+def test_stateful_in_place_boundary_orders_durable_publish_before_memory(monkeypatch, tmp_path):
+    """The atomic DB boundary is authoritative before any observer is invoked."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "ordered-memory-boundary"
+    db.create_session(sid, "cli", model="test/model")
+    db.append_message(sid, "user", "durable original")
+    calls = []
+    observer = _BoundaryObserver(calls)
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "small candidate"}]
+    _configure_engine_state(compressor)
+    agent = _make_agent(observer, compressor)
+    agent._session_db = db
+    agent.session_id = sid
+    agent.compression_in_place = True
+    compressor.on_session_start.side_effect = lambda *_args, **kwargs: calls.append(
+        ("boundary_callback", kwargs)
+    )
+    original = _messages()
+    real_publish = db.archive_and_compact
+
+    def publish(*args, **kwargs):
+        result = real_publish(*args, **kwargs)
+        calls.append(("atomic_db_publication", copy.deepcopy(db.get_messages_as_conversation(sid))))
+        return result
+
+    agent.commit_memory_session = lambda messages: calls.append(
+        ("commit_memory_session", copy.deepcopy(messages))
+    )
+    monkeypatch.setattr(db, "archive_and_compact", publish)
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+
+    returned, _ = agent._compress_context(original, "sys", approx_tokens=100_000, force=True)
+
+    assert returned is not original
+    assert [item[0] for item in calls] == [
+        "atomic_db_publication", "on_pre_compress", "commit_memory_session",
+        "boundary_callback", "on_session_switch",
+    ]
+    assert calls[1][1] == _messages()
+    assert calls[2][1] == _messages()
+    assert len([item for item in calls if item[0] == "on_pre_compress"]) == 1
+    assert len([item for item in calls if item[0] == "commit_memory_session"]) == 1
+
+
+def test_post_commit_memory_exception_keeps_compacted_db_and_committed_outcome(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "memory-exception-after-commit"
+    db.create_session(sid, "cli", model="test/model")
+    db.append_message(sid, "user", "durable original")
+    calls = []
+    observer = _BoundaryObserver(calls)
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "durable compacted"}]
+    _configure_engine_state(compressor)
+    agent = _make_agent(observer, compressor)
+    agent._session_db = db
+    agent.session_id = sid
+    agent.compression_in_place = True
+    agent.commit_memory_session = lambda _messages: (_ for _ in ()).throw(RuntimeError("observer failed"))
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+
+    returned, _ = agent._compress_context(_messages(), "sys", approx_tokens=100_000, force=True)
+
+    assert returned[0]["content"] == "durable compacted"
+    assert db.get_messages_as_conversation(sid)[0]["content"] == "durable compacted"
+    assert agent._last_compression_outcome == "committed_materially_shrunk"
+    assert calls[0][0] == "on_pre_compress"

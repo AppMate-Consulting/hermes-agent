@@ -13,6 +13,7 @@ import pytest
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 
 from agent.context_compressor import SUMMARY_PREFIX
@@ -212,6 +213,50 @@ def test_production_turn_builder_does_not_retype_genuine_user_wrapper(agent):
     wrapper_row = next(m for m in messages if m.get("content") == wrapper)
     assert wrapper_row.get("display_kind") == "internal_notification"
     assert not ContextCompressor._has_autonomous_completion_chain(messages[:-1])
+
+
+def test_explicit_completion_provenance_survives_sessiondb_replay(agent, tmp_path):
+    """A real turn builder and durable flush preserve explicit provenance only."""
+    from hermes_state import SessionDB
+    from agent.context_compressor import ContextCompressor
+
+    db = SessionDB(db_path=Path(tmp_path) / "state.db")
+    sid = "durable-completion-provenance"
+    db.create_session(sid, "tui", model="test/model")
+    agent._session_db = db
+    agent.session_id = sid
+    agent._session_db_created = True
+    agent.compression_enabled = False
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("completion handled"),
+        _mock_response("human wrapper handled"),
+    ]
+    history = [
+        {"role": "user", "content": "real task"},
+        {"role": "assistant", "content": "ordinary response"},
+    ]
+    completion = "[ASYNC DELEGATION COMPLETE child=durable]"
+    first = agent.run_conversation(
+        completion,
+        conversation_history=history,
+        persist_user_display_kind="internal_notification",
+        persist_user_is_autonomous_completion=True,
+    )
+    replay = db.get_messages_as_conversation(sid)
+    assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
+    assert [m["role"] for m in replay[-4:]] == ["user", "assistant", "user", "assistant"]
+
+    genuine = "[ASYNC DELEGATION COMPLETE child=human-authored]"
+    agent.run_conversation(
+        genuine,
+        conversation_history=first["messages"],
+        persist_user_display_kind="internal_notification",
+        persist_user_is_autonomous_completion=False,
+    )
+    replay = db.get_messages_as_conversation(sid)
+    genuine_row = next(m for m in replay if m.get("content") == genuine)
+    assert genuine_row["display_kind"] == "internal_notification"
+    assert genuine_row["role"] == "user"
 
 
 class TestHTTP413Compression:

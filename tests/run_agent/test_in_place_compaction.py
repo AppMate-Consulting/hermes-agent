@@ -69,6 +69,67 @@ def _materially_compressible_messages(n=8):
 
 
 class TestInPlaceCompaction:
+    def test_rotation_publication_failure_restores_parent_and_all_ephemeral_state(self):
+        """A materially admitted child that cannot publish leaves no boundary trace."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "rotation-publication-failure"
+            _seed(db, sid, "authoritative-parent", n=4)
+            db.patch_session_model_config(sid, {"authority": "parent"})
+            db.update_system_prompt(sid, "durable-parent-prompt")
+            agent = _make_agent(db, sid, in_place=False)
+            messages = _materially_compressible_messages()
+            original = copy.deepcopy(messages)
+            agent._cached_system_prompt = "cached-parent\x00"
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._last_flushed_db_idx = 3
+            agent._flushed_db_message_ids = {101, 202}
+            agent._flushed_db_message_session_id = sid
+            agent._flush_messages_to_session_db = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent.commit_memory_session = MagicMock()
+            agent.event_callback = MagicMock()
+            agent.context_compressor.on_session_start = MagicMock()
+            before_rows = db.get_messages(sid, include_inactive=True)
+            before_parent = db.get_session(sid)
+
+            with patch.object(
+                db,
+                "publish_compression_child",
+                side_effect=RuntimeError("atomic publication denied"),
+            ):
+                returned, prompt = compress_context(
+                    agent, messages, "sys", approx_tokens=100_000
+                )
+
+            assert returned is messages
+            assert messages == original
+            assert prompt == "cached-parent\x00"
+            assert agent._cached_system_prompt == "cached-parent\x00"
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent.session_id == sid
+            assert agent._last_compression_outcome == "persistence_failure"
+            assert agent._last_flushed_db_idx == 3
+            assert agent._flushed_db_message_ids == {101, 202}
+            assert agent._flushed_db_message_session_id == sid
+            assert agent._last_compression_attempt_in_place is None
+            assert agent._last_compaction_in_place is False
+            assert db.get_messages(sid, include_inactive=True) == before_rows
+            after_parent = db.get_session(sid)
+            for field in ("parent_session_id", "message_count", "model_config", "system_prompt", "end_reason"):
+                assert after_parent[field] == before_parent[field]
+            assert db._conn.execute(
+                "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+            ).fetchall() == []
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.context_compressor.on_session_start.assert_not_called()
+            agent.event_callback.assert_not_called()
+
     def test_archive_and_compact_atomically_updates_transcript_config_and_prompt(self):
         """The SessionDB API publishes every boundary field in one transaction."""
         from hermes_state import SessionDB

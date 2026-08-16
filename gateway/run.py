@@ -6398,6 +6398,11 @@ class TurnRunner:
 
 
 
+def _event_is_autonomous_completion(event: Any) -> bool:
+    """Return only the explicit durable-provenance bit from a gateway event."""
+    return bool(getattr(event, "autonomous_completion", False))
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -18450,8 +18455,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind = (
             "internal_notification" if getattr(event, "internal", False) else None
         )
-        persist_user_is_autonomous_completion = bool(
-            getattr(event, "autonomous_completion", False)
+        persist_user_is_autonomous_completion = (
+            _event_is_autonomous_completion(event)
         )
         try:
             _pcfg = _load_gateway_config()

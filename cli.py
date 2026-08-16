@@ -4627,6 +4627,13 @@ class _SyntheticCompletionInput:
         self.text = text
 
 
+def _unwrap_completion_input(value):
+    """Unwrap the private queue sentinel without inferring from wrapper text."""
+    if isinstance(value, _SyntheticCompletionInput):
+        return value.text, True
+    return value, False
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -18836,11 +18843,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
                     if is_voice_input:
                         user_input = user_input.text
-                    is_synthetic_completion = isinstance(
-                        user_input, _SyntheticCompletionInput
+                    user_input, is_synthetic_completion = _unwrap_completion_input(
+                        user_input
                     )
-                    if is_synthetic_completion:
-                        user_input = user_input.text
 
                     if not user_input:
                         continue

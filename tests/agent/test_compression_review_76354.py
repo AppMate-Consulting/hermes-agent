@@ -444,7 +444,13 @@ class TestF6ExecutorSaturation:
             compressor._last_aux_model_failure_model = None
             compressor._last_aux_model_failure_error = None
             agent.context_compressor = compressor
-            agent._cached_system_prompt = "sys"
+            agent.api_mode = "codex_app_server"
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._build_system_prompt = MagicMock(return_value="logical prompt")
+            agent._memory_manager = MagicMock()
+            agent.commit_memory_session = MagicMock()
+            agent.event_callback = MagicMock()
 
             fence = CompressionCommitFence()
             assert fence.cancel_before_commit() is True
@@ -456,8 +462,62 @@ class TestF6ExecutorSaturation:
 
             compressor.compress.assert_not_called()
             assert returned is messages
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent._last_compression_outcome == "cancelled_commit_fence"
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.event_callback.assert_not_called()
+            assert fence.begin_commit() is False
             # The cancelled attempt must not leave the durable lock held.
             assert db.get_compression_lock_holder(session_id) is None
+
+    def test_uncached_automatic_cooldown_skip_is_side_effect_free(self):
+        """The public automatic path preserves absence and releases all gates."""
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as td:
+            db = SessionDB(db_path=Path(td) / "state.db")
+            sid = "UNCAHCED_COOLDOWN_SKIP"
+            db.create_session(sid, source="cli")
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                from run_agent import AIAgent
+
+                agent = AIAgent(
+                    api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                    model="test/model", quiet_mode=True, session_db=db,
+                    session_id=sid, skip_context_files=True, skip_memory=True,
+                )
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._build_system_prompt = MagicMock(return_value="logical prompt")
+            agent.context_compressor._summary_failure_cooldown_until = time.monotonic() + 60
+            agent._memory_manager = MagicMock()
+            agent.commit_memory_session = MagicMock()
+            agent.event_callback = MagicMock()
+            messages = [{"role": "user", "content": "unchanged"}]
+            before = list(messages)
+
+            returned, prompt = agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+            assert returned is messages and messages == before
+            assert prompt == "logical prompt"
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent._last_compression_outcome == "skipped_cooldown"
+            assert agent._compression_skipped_due_to_lock is None
+            assert db.get_compression_lock_holder(sid) is None
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.event_callback.assert_not_called()
 
 
 class TestS3IdleChargedFromLastProgress:

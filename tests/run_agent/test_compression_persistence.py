@@ -237,8 +237,8 @@ class TestFlushAfterCompression:
             agent = self._make_agent(db)
             agent.compression_in_place = True
             original = [
-                {"role": "user", "content": "old question"},
-                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "old question " + "payload " * 3_000},
+                {"role": "assistant", "content": "old answer " + "payload " * 3_000},
             ]
             agent._flush_messages_to_session_db(original, [])
 
@@ -303,7 +303,7 @@ class TestFlushAfterCompression:
             messages = [
                 {
                     "role": "user" if i % 2 == 0 else "assistant",
-                    "content": f"message {i} " + "x" * 200,
+                    "content": f"message {i} " + "x" * 2_000,
                     "_db_persisted": True,
                 }
                 for i in range(40)

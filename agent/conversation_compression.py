@@ -131,6 +131,8 @@ def _compaction_terminal_status(outcome: Any) -> str:
     value = outcome if isinstance(outcome, str) else "unknown"
     if value == "committed_materially_shrunk":
         return COMPACTION_DONE_STATUS
+    if value == "committed_in_memory":
+        return "✓ Context compaction complete — in-memory context updated."
     if value.startswith("rejected_"):
         return f"Context compaction aborted — no changes committed ({value})."
     if value.startswith("skipped_") or value == "adopted_concurrent_compaction":

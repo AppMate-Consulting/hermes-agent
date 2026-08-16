@@ -16,7 +16,11 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+    _compaction_terminal_status,
+)
 from run_agent import AIAgent
 import run_agent
 
@@ -439,6 +443,11 @@ class TestHTTP413Compression:
 
 class TestPreflightCompression:
     """Preflight compression should compress history before the first API call."""
+
+    def test_in_memory_commit_has_truthful_terminal_status(self):
+        assert _compaction_terminal_status("committed_in_memory") == (
+            "✓ Context compaction complete — in-memory context updated."
+        )
 
     def test_compress_context_emits_lifecycle_status_before_work(self, agent):
         """Direct context compression should tell gateway users why the turn paused."""

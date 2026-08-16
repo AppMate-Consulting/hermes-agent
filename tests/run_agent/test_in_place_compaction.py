@@ -165,7 +165,7 @@ class TestInPlaceCompaction:
                 "n", calls["n"] + 1
             )
             compress_context(
-                agent, [{"role": "user", "content": "x"}] * 8,
+                agent, _materially_compressible_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert calls["n"] == 1
@@ -229,7 +229,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, [{"role": "user", "content": "x"}] * 8,
+                a_ip, _materially_compressible_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True
@@ -238,7 +238,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_rot", "rot")
             a_rot = _make_agent(db, "s_rot", in_place=False)
             compress_context(
-                a_rot, [{"role": "user", "content": "x"}] * 8,
+                a_rot, _materially_compressible_messages(),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_rot._last_compaction_in_place is False
@@ -420,6 +420,7 @@ class TestInPlaceAntiGrowthGuard:
             agent.commit_memory_session = MagicMock()
             agent._flush_messages_to_session_db = MagicMock()
             agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = ""
             agent.event_callback = MagicMock()
             with patch.object(db, "archive_and_compact", wraps=db.archive_and_compact) as archive, \
                  patch.object(db, "publish_compression_child", wraps=db.publish_compression_child) as publish, \

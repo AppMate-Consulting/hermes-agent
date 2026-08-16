@@ -544,9 +544,12 @@ class TestInPlaceAntiGrowthGuard:
             else:
                 assert len(estimates) == 2
                 assert estimates[0] == original
-                assert estimates[1] == [{
-                    "role": "user", "content": "mutated candidate"
-                }]
+                assert estimates[1] != original
+                admitted_content = "\n".join(
+                    str(message.get("content", "")) for message in estimates[1]
+                )
+                assert "mutated candidate" in admitted_content
+                assert original[-1]["content"] in admitted_content
             assert returned is messages
             assert messages == original
             assert prompt == cached

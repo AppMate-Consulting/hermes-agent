@@ -821,40 +821,6 @@ def test_restored_anchor_never_creates_consecutive_user_roles() -> None:
     assert not compressed[0].get("_todo_snapshot_synthetic")
 
 
-def test_multipart_anchor_insertion_is_role_aware() -> None:
-    from agent.conversation_compression import (
-        PRESERVED_HUMAN_TASK_BRIDGE,
-        _insert_real_user_anchor,
-    )
-
-    anchor = {
-        "role": "user",
-        "content": [{"type": "text", "text": "EXACT HUMAN ASK"}],
-    }
-
-    trailing_assistant = [
-        {"role": "user", "content": "summary"},
-        {"role": "assistant", "content": "continuation"},
-    ]
-    _insert_real_user_anchor(trailing_assistant, dict(anchor))
-    assert trailing_assistant[-1] == anchor
-    assert not any(
-        m.get("content") == PRESERVED_HUMAN_TASK_BRIDGE
-        for m in trailing_assistant
-    )
-
-    trailing_summary = [{"role": "user", "content": "summary"}]
-    _insert_real_user_anchor(trailing_summary, dict(anchor))
-    assert trailing_summary[-2:] == [
-        {
-            "role": "assistant",
-            "content": PRESERVED_HUMAN_TASK_BRIDGE,
-            "_preserved_human_task_bridge": True,
-        },
-        anchor,
-    ]
-
-
 
 
 def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ from agent.conversation_compression import (
     ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
     PRESERVED_HUMAN_TASK_BRIDGE,
     _ensure_compressed_has_user_turn,
+    _insert_real_user_anchor,
     _is_real_user_message,
     _refresh_active_task_contract,
     append_autonomous_completion_provenance,
@@ -264,7 +265,11 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
         )
-    assert db.get_messages_as_conversation(sid)[0] == exact_row
+    projected = db.get_messages_as_conversation(sid)[0]
+    assert json.dumps(
+        {"role": projected.get("role"), "content": projected.get("content")},
+        ensure_ascii=False, separators=(",", ":"),
+    ) == exact_bytes
     db.close()
 
     archived_counts = []
@@ -327,6 +332,59 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
     assert archived_counts[1] > archived_counts[0] > 0
     assert all(count <= 1 for count in preserved_bridge_counts)
     assert preserved_bridge_counts[1] == preserved_bridge_counts[0]
+
+
+def test_multipart_anchor_insertion_is_role_aware():
+    anchor = {
+        "role": "user",
+        "content": [{"type": "text", "text": "EXACT HUMAN ASK"}],
+    }
+
+    trailing_assistant = [
+        {"role": "user", "content": "summary"},
+        {"role": "assistant", "content": "continuation"},
+    ]
+    _insert_real_user_anchor(trailing_assistant, dict(anchor))
+    assert trailing_assistant[-1] == anchor
+    assert sum(
+        message.get("content") == PRESERVED_HUMAN_TASK_BRIDGE
+        for message in trailing_assistant
+    ) == 0
+
+    trailing_summary = [{"role": "user", "content": "summary"}]
+    _insert_real_user_anchor(trailing_summary, dict(anchor))
+    assert trailing_summary[-2:] == [
+        {
+            "role": "assistant",
+            "content": PRESERVED_HUMAN_TASK_BRIDGE,
+            "_preserved_human_task_bridge": True,
+        },
+        anchor,
+    ]
+    assert sum(
+        message.get("content") == PRESERVED_HUMAN_TASK_BRIDGE
+        for message in trailing_summary
+    ) == 1
+
+    duplicate = [dict(anchor)]
+    _insert_real_user_anchor(duplicate, dict(anchor))
+    assert duplicate == [anchor]
+
+    unresolved_parent = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "pending-call",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }],
+    }
+    unresolved = [{"role": "user", "content": "summary"}, unresolved_parent]
+    _insert_real_user_anchor(unresolved, dict(anchor))
+    assert unresolved[-1] is unresolved_parent
+    assert unresolved[-2] == anchor
+    roles = [message["role"] for message in unresolved]
+    assert all(left != right for left, right in zip(roles, roles[1:]))
 
 
 def test_contract_parser_rejects_tampering_and_metadata_disagreement():

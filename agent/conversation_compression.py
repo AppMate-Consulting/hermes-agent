@@ -4202,7 +4202,7 @@ def compress_context(
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),
-            f"{_compressed_est:,}",
+            f"{_request_out:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(

@@ -6403,6 +6403,12 @@ def _event_is_autonomous_completion(event: Any) -> bool:
     return bool(getattr(event, "autonomous_completion", False))
 
 
+def _event_conversation_forwarding_metadata(event: Any) -> tuple[Optional[str], bool]:
+    """Compose the persistence metadata forwarded for one inbound event."""
+    display_kind = "internal_notification" if getattr(event, "internal", False) else None
+    return display_kind, _event_is_autonomous_completion(event)
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -18452,11 +18458,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # content are untouched — display_kind is a DB-only sidecar stripped
         # from every provider-bound payload (see conversation_loop's
         # api_msg.pop("display_kind")).
-        persist_user_display_kind = (
-            "internal_notification" if getattr(event, "internal", False) else None
-        )
-        persist_user_is_autonomous_completion = (
-            _event_is_autonomous_completion(event)
+        (
+            persist_user_display_kind,
+            persist_user_is_autonomous_completion,
+        ) = _event_conversation_forwarding_metadata(
+            event
         )
         try:
             _pcfg = _load_gateway_config()

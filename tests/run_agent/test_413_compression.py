@@ -215,12 +215,19 @@ def test_production_turn_builder_does_not_retype_genuine_user_wrapper(agent):
     assert not ContextCompressor._has_autonomous_completion_chain(messages[:-1])
 
 
-def test_explicit_completion_provenance_survives_sessiondb_replay(agent, tmp_path):
+def test_explicit_completion_provenance_survives_sessiondb_replay(
+    agent, tmp_path, request
+):
     """A real turn builder and durable flush preserve explicit provenance only."""
     from hermes_state import SessionDB
     from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
 
     db = SessionDB(db_path=Path(tmp_path) / "state.db")
+    request.addfinalizer(db.close)
     sid = "durable-completion-provenance"
     db.create_session(sid, "tui", model="test/model")
     agent._session_db = db
@@ -245,6 +252,16 @@ def test_explicit_completion_provenance_survives_sessiondb_replay(agent, tmp_pat
     replay = db.get_messages_as_conversation(sid)
     assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
     assert [m["role"] for m in replay[-4:]] == ["user", "assistant", "user", "assistant"]
+    completion_index = next(
+        index for index, row in enumerate(replay) if row.get("content") == completion
+    )
+    assert [row.get("content") for row in replay[completion_index - 2:completion_index]] == [
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+    ]
+    assert [row.get("role") for row in replay[completion_index - 2:completion_index + 1]] == [
+        "user", "assistant", "user",
+    ]
 
     genuine = "[ASYNC DELEGATION COMPLETE child=human-authored]"
     agent.run_conversation(
@@ -257,6 +274,14 @@ def test_explicit_completion_provenance_survives_sessiondb_replay(agent, tmp_pat
     genuine_row = next(m for m in replay if m.get("content") == genuine)
     assert genuine_row["display_kind"] == "internal_notification"
     assert genuine_row["role"] == "user"
+    genuine_index = replay.index(genuine_row)
+    assert [row.get("content") for row in replay[max(0, genuine_index - 2):genuine_index]] != [
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+    ]
+    assert not ContextCompressor._completion_has_durable_provenance(
+        replay, genuine_index
+    )
 
 
 class TestHTTP413Compression:

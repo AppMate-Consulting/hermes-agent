@@ -284,11 +284,14 @@ def test_rejected_candidate_never_reaches_memory_observer(monkeypatch, out_token
     assert calls == []
 
 
-def test_stateful_in_place_boundary_orders_durable_publish_before_memory(monkeypatch, tmp_path):
+def test_stateful_in_place_boundary_orders_durable_publish_before_memory(
+    monkeypatch, tmp_path, request
+):
     """The atomic DB boundary is authoritative before any observer is invoked."""
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "state.db")
+    request.addfinalizer(db.close)
     sid = "ordered-memory-boundary"
     db.create_session(sid, "cli", model="test/model")
     db.append_message(sid, "user", "durable original")
@@ -335,10 +338,63 @@ def test_stateful_in_place_boundary_orders_durable_publish_before_memory(monkeyp
     assert len([item for item in calls if item[0] == "commit_memory_session"]) == 1
 
 
-def test_post_commit_memory_exception_keeps_compacted_db_and_committed_outcome(monkeypatch, tmp_path):
+def test_stateful_in_place_persistence_failure_has_no_observer_calls(
+    monkeypatch, tmp_path, request
+):
+    """An atomic publication failure cannot escape to boundary observers."""
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "state.db")
+    request.addfinalizer(db.close)
+    sid = "failed-memory-boundary"
+    db.create_session(sid, "cli", model="test/model")
+    db.append_message(sid, "user", "durable original")
+    calls = []
+    observer = _BoundaryObserver(calls)
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "must not become durable"}
+    ]
+    _configure_engine_state(compressor)
+    agent = _make_agent(observer, compressor)
+    agent._session_db = db
+    agent.session_id = sid
+    agent.compression_in_place = True
+    agent.commit_memory_session = lambda messages: calls.append(
+        ("commit_memory_session", copy.deepcopy(messages))
+    )
+    compressor.on_session_start.side_effect = lambda *_args, **_kwargs: calls.append(
+        ("context_engine_boundary",)
+    )
+    monkeypatch.setattr(
+        db,
+        "archive_and_compact",
+        MagicMock(side_effect=RuntimeError("durable publication failed")),
+    )
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+
+    original = _messages()
+    returned, _ = agent._compress_context(
+        original, "sys", approx_tokens=100_000, force=True
+    )
+
+    assert returned is original
+    assert calls == []
+    assert agent._last_compression_outcome == "persistence_failure"
+    assert db.get_messages_as_conversation(sid)[0]["content"] == "durable original"
+
+
+def test_post_commit_memory_exception_keeps_compacted_db_and_committed_outcome(
+    monkeypatch, tmp_path, request
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    request.addfinalizer(db.close)
     sid = "memory-exception-after-commit"
     db.create_session(sid, "cli", model="test/model")
     db.append_message(sid, "user", "durable original")
@@ -364,3 +420,62 @@ def test_post_commit_memory_exception_keeps_compacted_db_and_committed_outcome(m
     assert db.get_messages_as_conversation(sid)[0]["content"] == "durable compacted"
     assert agent._last_compression_outcome == "committed_materially_shrunk"
     assert calls[0][0] == "on_pre_compress"
+
+
+def test_post_commit_pre_compress_exception_does_not_skip_memory_commit(
+    monkeypatch, tmp_path, request
+):
+    """Observer failure after publication cannot rewrite the committed result."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    request.addfinalizer(db.close)
+    sid = "pre-compress-exception-after-commit"
+    db.create_session(sid, "cli", model="test/model")
+    db.append_message(sid, "user", "durable original")
+    calls = []
+
+    class RaisingObserver(_BoundaryObserver):
+        def on_pre_compress(self, messages):
+            calls.append(("on_pre_compress", copy.deepcopy(messages)))
+            raise RuntimeError("observer failed")
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "durable compacted"}
+    ]
+    _configure_engine_state(compressor)
+    agent = _make_agent(RaisingObserver(calls), compressor)
+    agent._session_db = db
+    agent.session_id = sid
+    agent.compression_in_place = True
+    agent.event_callback = MagicMock()
+    agent.commit_memory_session = lambda messages: calls.append(
+        ("commit_memory_session", copy.deepcopy(messages))
+    )
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+
+    returned, _ = agent._compress_context(
+        _messages(), "sys", approx_tokens=100_000, force=True
+    )
+
+    assert returned[0]["content"] == "durable compacted"
+    assert db.get_messages_as_conversation(sid)[0]["content"] == "durable compacted"
+    assert agent._last_compression_outcome == "committed_materially_shrunk"
+    assert [entry[0] for entry in calls].count("on_pre_compress") == 1
+    assert [entry[0] for entry in calls].count("commit_memory_session") == 1
+    assert not any(entry[0] == "persistence_failure" for entry in calls)
+    agent.event_callback.assert_called_once_with(
+        "session:compress",
+        {
+            "platform": "",
+            "session_id": sid,
+            "old_session_id": "",
+            "in_place": True,
+            "compression_count": 1,
+        },
+    )

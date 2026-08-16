@@ -12,20 +12,6 @@ from tui_gateway import server
 from tools.process_registry import process_registry
 
 
-class _InlineThread:
-    def __init__(self, target=None, daemon=None, args=(), kwargs=None):
-        self.target, self.args, self.kwargs = target, args, kwargs or {}
-
-    def start(self):
-        self.target(*self.args, **self.kwargs)
-
-    def is_alive(self):
-        return False
-
-    def join(self, timeout=None):
-        return None
-
-
 class _OneLivePoll:
     def __init__(self):
         self.checks = 0
@@ -123,7 +109,9 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
     monkeypatch, tmp_path, event, synthetic
 ):
     """A completion arriving during a real submit is recursively typed true."""
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    isolated_queue = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_sessions", {})
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda *_args: None)
@@ -167,6 +155,7 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
     real_agent.client = MagicMock()
     real_agent.client.chat.completions.create.return_value = response
     seen = []
+    recursive_dispatch_complete = threading.Event()
 
     def run_conversation(
         message, *, persist_user_is_autonomous_completion=False, **_kwargs
@@ -175,12 +164,15 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
         if len(seen) == 1:
             pending.append([(event, synthetic)])
             return {"final_response": "done", "messages": []}
-        return real_agent.run_conversation(
-            message,
-            conversation_history=[],
-            persist_user_display_kind="internal_notification",
-            persist_user_is_autonomous_completion=persist_user_is_autonomous_completion,
-        )
+        try:
+            return real_agent.run_conversation(
+                message,
+                conversation_history=[],
+                persist_user_display_kind="internal_notification",
+                persist_user_is_autonomous_completion=persist_user_is_autonomous_completion,
+            )
+        finally:
+            recursive_dispatch_complete.set()
 
     agent = types.SimpleNamespace(
         session_id="completion-owner", run_conversation=run_conversation,
@@ -193,21 +185,36 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
         "tool_progress_mode": "all", "inflight_turn": None, "running": True,
     }
 
-    server._run_prompt_submit("rid", "sid", session, "first user turn")
+    server._sessions["sid"] = session
+    try:
+        server._run_prompt_submit("rid", "sid", session, "first user turn")
+        assert recursive_dispatch_complete.wait(timeout=5), (
+            "recursive completion dispatch did not finish"
+        )
+        run_thread = session.get("_run_thread")
+        if run_thread is not None:
+            run_thread.join(timeout=5)
+            assert not run_thread.is_alive()
 
-    assert seen == [("first user turn", False), (synthetic, True)]
-    replay = db.get_messages_as_conversation("completion-owner")
-    assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
+        assert seen == [("first user turn", False), (synthetic, True)]
+        replay = db.get_messages_as_conversation("completion-owner")
+        assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
+    finally:
+        server._sessions.pop("sid", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+        db.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit", [True, False], ids=["completion", "ordinary-internal"])
 async def test_gateway_explicit_event_bit_reaches_conversation_forwarder(explicit):
     from gateway.platforms.base import MessageEvent
-    from gateway.run import GatewayRunner, _event_is_autonomous_completion
+    from gateway.run import GatewayRunner, _event_conversation_forwarding_metadata
 
     event = MessageEvent(text="same internal wrapper", internal=True)
     event.autonomous_completion = explicit
+    display_kind, autonomous_completion = _event_conversation_forwarding_metadata(event)
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.config = SimpleNamespace(multiplex_profiles=False)
     captured = {}
@@ -219,14 +226,44 @@ async def test_gateway_explicit_event_bit_reaches_conversation_forwarder(explici
     runner._run_agent_inner = inner
     await runner._run_agent(
         "message", "context", [], MagicMock(), "sid",
-        persist_user_is_autonomous_completion=_event_is_autonomous_completion(event),
+        persist_user_display_kind=display_kind,
+        persist_user_is_autonomous_completion=autonomous_completion,
     )
+    assert captured["persist_user_display_kind"] == "internal_notification"
     assert captured["persist_user_is_autonomous_completion"] is explicit
 
 
-def test_cli_sentinel_not_wrapper_text_controls_conversation_provenance():
-    from cli import _SyntheticCompletionInput, _unwrap_completion_input
+def test_cli_notification_drain_sentinel_controls_loop_unwrapping(monkeypatch):
+    from cli import HermesCLI, _unwrap_completion_input
 
     wrapper = "[ASYNC DELEGATION COMPLETE child=identical]"
-    assert _unwrap_completion_input(_SyntheticCompletionInput(wrapper)) == (wrapper, True)
+    pending_input = queue.Queue()
+    cli = SimpleNamespace(
+        session_id="cli-session",
+        _pending_input=pending_input,
+        _owns_process_notification=lambda _event: True,
+    )
+    event = {
+        "type": "async_delegation",
+        "session_key": "cli-session",
+        "delegation_id": "identical",
+    }
+    monkeypatch.setattr(
+        process_registry,
+        "drain_notifications",
+        lambda **_kwargs: [(event, wrapper)],
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda *_args: "claim",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery",
+        lambda *_args: None,
+    )
+
+    HermesCLI._drain_process_notifications(cli, "cli-post-turn")
+
+    queued_by_production = pending_input.get_nowait()
+    assert _unwrap_completion_input(queued_by_production) == (wrapper, True)
     assert _unwrap_completion_input(wrapper) == (wrapper, False)

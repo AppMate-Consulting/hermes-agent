@@ -73,6 +73,7 @@ class TestInPlaceCompaction:
         """A materially admitted child that cannot publish leaves no boundary trace."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
+        from agent import relay_runtime
 
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
@@ -93,10 +94,15 @@ class TestInPlaceCompaction:
             agent.commit_memory_session = MagicMock()
             agent.event_callback = MagicMock()
             agent.context_compressor.on_session_start = MagicMock()
+            boundary_observer = MagicMock()
             before_rows = db.get_messages(sid, include_inactive=True)
             before_parent = db.get_session(sid)
 
             with patch.object(
+                relay_runtime.SESSION_COORDINATOR,
+                "notify_session_compacted",
+                boundary_observer,
+            ), patch.object(
                 db,
                 "publish_compression_child",
                 side_effect=RuntimeError("atomic publication denied"),
@@ -128,6 +134,7 @@ class TestInPlaceCompaction:
             agent._memory_manager.on_session_switch.assert_not_called()
             agent.commit_memory_session.assert_not_called()
             agent.context_compressor.on_session_start.assert_not_called()
+            boundary_observer.assert_not_called()
             agent.event_callback.assert_not_called()
 
     def test_archive_and_compact_atomically_updates_transcript_config_and_prompt(self):
@@ -729,7 +736,7 @@ class TestInPlaceAntiGrowthGuard:
     def test_candidate_preparation_exception_restores_complete_precommit_state(self):
         """A post-engine helper failure unwinds mutable input, caches and callbacks."""
         from hermes_state import SessionDB
-        from agent.conversation_compression import compress_context
+        from agent.conversation_compression import CompressionCommitFence, compress_context
 
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
@@ -744,6 +751,7 @@ class TestInPlaceAntiGrowthGuard:
             agent.commit_memory_session = MagicMock()
             agent._memory_manager = MagicMock()
             agent.event_callback = MagicMock()
+            fence = CompressionCommitFence()
 
             def mutate(candidate, **_kwargs):
                 candidate[:] = [{"role": "user", "content": "candidate"}]
@@ -754,7 +762,13 @@ class TestInPlaceAntiGrowthGuard:
                 "agent.conversation_compression._refresh_active_task_contract",
                 side_effect=RuntimeError("post-engine helper failed"),
             ), pytest.raises(RuntimeError, match="post-engine helper failed"):
-                compress_context(agent, messages, "sys", approx_tokens=100_000)
+                compress_context(
+                    agent,
+                    messages,
+                    "sys",
+                    approx_tokens=100_000,
+                    commit_fence=fence,
+                )
 
             assert messages == original
             assert "_cached_system_prompt" not in vars(agent)
@@ -765,6 +779,9 @@ class TestInPlaceAntiGrowthGuard:
             assert agent.session_id == sid
             assert agent._last_compression_attempt_in_place is None
             assert agent._last_compaction_in_place is False
+            assert db.get_compression_lock_holder(sid) is None
+            assert fence.commit_in_flight is False
+            assert fence._commit_started is False
             agent._memory_manager.on_pre_compress.assert_not_called()
             agent._memory_manager.on_session_switch.assert_not_called()
             agent.commit_memory_session.assert_not_called()
@@ -774,6 +791,7 @@ class TestInPlaceAntiGrowthGuard:
         """A failed durable publication returns the exact pre-attempt boundary."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
+        from agent import relay_runtime
 
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
@@ -789,10 +807,16 @@ class TestInPlaceAntiGrowthGuard:
             agent._memory_manager = MagicMock()
             agent.commit_memory_session = MagicMock()
             agent.event_callback = MagicMock()
+            agent.context_compressor.on_session_start = MagicMock()
+            boundary_observer = MagicMock()
             before_rows = db.get_messages(sid, include_inactive=True)
             before_session = db.get_session(sid)
 
             with patch.object(
+                relay_runtime.SESSION_COORDINATOR,
+                "notify_session_compacted",
+                boundary_observer,
+            ), patch.object(
                 db, "archive_and_compact", side_effect=RuntimeError("disk full")
             ):
                 returned, _prompt = compress_context(
@@ -816,6 +840,8 @@ class TestInPlaceAntiGrowthGuard:
             agent._memory_manager.on_pre_compress.assert_not_called()
             agent._memory_manager.on_session_switch.assert_not_called()
             agent.commit_memory_session.assert_not_called()
+            agent.context_compressor.on_session_start.assert_not_called()
+            boundary_observer.assert_not_called()
             agent.event_callback.assert_not_called()
 
     def test_rejection_restores_both_prompt_cache_tiers_byte_for_byte(self):

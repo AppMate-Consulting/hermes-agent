@@ -91,6 +91,9 @@ class TestInPlaceCompaction:
             agent._flushed_db_message_session_id = sid
             agent._flush_messages_to_session_db = MagicMock()
             agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = (
+                "deterministic external memory prompt"
+            )
             agent.commit_memory_session = MagicMock()
             agent.event_callback = MagicMock()
             agent.context_compressor.on_session_start = MagicMock()
@@ -747,7 +750,12 @@ class TestInPlaceAntiGrowthGuard:
             original = copy.deepcopy(messages)
             vars(agent).pop("_cached_system_prompt", None)
             vars(agent).pop("_cached_system_prompt_static", None)
-            attempt_before = copy.deepcopy(vars(agent.context_compressor))
+            from agent.conversation_compression import (
+                _snapshot_compressor_attempt_state,
+            )
+            attempt_before = _snapshot_compressor_attempt_state(
+                agent.context_compressor
+            )
             agent.commit_memory_session = MagicMock()
             agent._memory_manager = MagicMock()
             agent.event_callback = MagicMock()
@@ -773,9 +781,9 @@ class TestInPlaceAntiGrowthGuard:
             assert messages == original
             assert "_cached_system_prompt" not in vars(agent)
             assert "_cached_system_prompt_static" not in vars(agent)
-            for name, value in attempt_before.items():
-                if name != "compress":
-                    assert vars(agent.context_compressor).get(name) == value
+            assert _snapshot_compressor_attempt_state(
+                agent.context_compressor
+            ) == attempt_before
             assert agent.session_id == sid
             assert agent._last_compression_attempt_in_place is None
             assert agent._last_compaction_in_place is False
@@ -805,6 +813,9 @@ class TestInPlaceAntiGrowthGuard:
             agent._last_flushed_db_idx = 5
             agent._flushed_db_message_ids = {17}
             agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = (
+                "deterministic external memory prompt"
+            )
             agent.commit_memory_session = MagicMock()
             agent.event_callback = MagicMock()
             agent.context_compressor.on_session_start = MagicMock()

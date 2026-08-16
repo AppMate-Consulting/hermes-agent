@@ -498,7 +498,9 @@ class TestF6ExecutorSaturation:
             vars(agent).pop("_cached_system_prompt", None)
             vars(agent).pop("_cached_system_prompt_static", None)
             agent._build_system_prompt = MagicMock(return_value="logical prompt")
-            agent.context_compressor._summary_failure_cooldown_until = time.monotonic() + 60
+            db.record_compression_failure_cooldown(
+                sid, time.time() + 60, "automatic test cooldown"
+            )
             agent._memory_manager = MagicMock()
             agent.commit_memory_session = MagicMock()
             agent.event_callback = MagicMock()

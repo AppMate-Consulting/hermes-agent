@@ -136,6 +136,8 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
 
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("completion-owner", "tui", model="test/model")
+    db.append_message("completion-owner", "user", "real human task")
+    db.append_message("completion-owner", "assistant", "ordinary assistant response")
     with patch("run_agent.get_tool_definitions", return_value=[]), patch(
         "run_agent.check_toolset_requirements", return_value={}
     ), patch("run_agent.OpenAI"):
@@ -167,7 +169,9 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
         try:
             return real_agent.run_conversation(
                 message,
-                conversation_history=[],
+                conversation_history=db.get_messages_as_conversation(
+                    "completion-owner"
+                ),
                 persist_user_display_kind="internal_notification",
                 persist_user_is_autonomous_completion=persist_user_is_autonomous_completion,
             )
@@ -198,6 +202,22 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
 
         assert seen == [("first user turn", False), (synthetic, True)]
         replay = db.get_messages_as_conversation("completion-owner")
+        from agent.conversation_compression import (
+            AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+            AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        )
+        completion_index = next(
+            index for index, row in enumerate(replay)
+            if row.get("content") == synthetic
+        )
+        assert [
+            (row.get("role"), row.get("content"))
+            for row in replay[completion_index - 2:completion_index + 1]
+        ] == [
+            ("user", AUTONOMOUS_COMPLETION_BRIDGE_USER),
+            ("assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT),
+            ("user", synthetic),
+        ]
         assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
     finally:
         server._sessions.pop("sid", None)

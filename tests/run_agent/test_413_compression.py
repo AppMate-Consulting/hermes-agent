@@ -242,6 +242,8 @@ def test_explicit_completion_provenance_survives_sessiondb_replay(
         {"role": "user", "content": "real task"},
         {"role": "assistant", "content": "ordinary response"},
     ]
+    db.append_message(sid, "user", "real task")
+    db.append_message(sid, "assistant", "ordinary response")
     completion = "[ASYNC DELEGATION COMPLETE child=durable]"
     first = agent.run_conversation(
         completion,
@@ -250,18 +252,18 @@ def test_explicit_completion_provenance_survives_sessiondb_replay(
         persist_user_is_autonomous_completion=True,
     )
     replay = db.get_messages_as_conversation(sid)
-    assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
-    assert [m["role"] for m in replay[-4:]] == ["user", "assistant", "user", "assistant"]
     completion_index = next(
         index for index, row in enumerate(replay) if row.get("content") == completion
     )
-    assert [row.get("content") for row in replay[completion_index - 2:completion_index]] == [
+    assert [row.get("content") for row in replay[completion_index - 2:completion_index + 1]] == [
         AUTONOMOUS_COMPLETION_BRIDGE_USER,
         AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        completion,
     ]
     assert [row.get("role") for row in replay[completion_index - 2:completion_index + 1]] == [
         "user", "assistant", "user",
     ]
+    assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
 
     genuine = "[ASYNC DELEGATION COMPLETE child=human-authored]"
     agent.run_conversation(

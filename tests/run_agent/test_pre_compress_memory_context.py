@@ -44,7 +44,7 @@ def _configure_engine_state(engine):
     engine._last_aux_model_failure_error = None
 
 
-def test_on_pre_compress_runs_after_engine_and_does_not_influence_summary():
+def test_on_pre_compress_runs_after_engine_and_does_not_influence_summary(monkeypatch):
     manager = MagicMock()
     manager.on_pre_compress.return_value = "Checkpoint id: ctx-orchestrator"
     received = {}
@@ -69,6 +69,11 @@ def test_on_pre_compress_runs_after_engine_and_does_not_influence_summary():
     _configure_engine_state(compressor)
     agent = _make_agent(manager, compressor)
     messages = _messages()
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
 
     agent._compress_context(
         messages,
@@ -87,7 +92,7 @@ def test_on_pre_compress_runs_after_engine_and_does_not_influence_summary():
     }
 
 
-def test_legacy_engine_receives_only_supported_compression_arguments():
+def test_legacy_engine_receives_only_supported_compression_arguments(monkeypatch):
     manager = MagicMock()
     manager.on_pre_compress.return_value = "Checkpoint id: unsupported-by-legacy"
     calls = []
@@ -100,6 +105,11 @@ def test_legacy_engine_receives_only_supported_compression_arguments():
     engine = StrictLegacyEngine()
     _configure_engine_state(engine)
     agent = _make_agent(manager, engine)
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
 
     compressed, _prompt = agent._compress_context(
         _messages(),
@@ -149,6 +159,11 @@ def test_provider_context_is_strictly_sanitized_before_plugin_engine(monkeypatch
     compressor.compress.side_effect = capture_compress
     _configure_engine_state(compressor)
     agent = _make_agent(manager, compressor)
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
 
     # Provider-to-engine handoff is an external-LLM egress boundary, so it
     # remains strict even when display/log redaction was explicitly disabled.
@@ -160,7 +175,7 @@ def test_provider_context_is_strictly_sanitized_before_plugin_engine(monkeypatch
     manager.on_pre_compress.assert_called_once()
 
 
-def test_provider_context_is_bounded_before_plugin_engine():
+def test_provider_context_is_bounded_before_plugin_engine(monkeypatch):
     manager = MagicMock()
     manager.on_pre_compress.return_value = "HEAD-SENTINEL" + "x" * 8_000 + "TAIL-SENTINEL"
     received = []
@@ -173,6 +188,11 @@ def test_provider_context_is_bounded_before_plugin_engine():
     compressor.compress.side_effect = capture_compress
     _configure_engine_state(compressor)
     agent = _make_agent(manager, compressor)
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
 
     agent._compress_context(_messages(), "sys", approx_tokens=100_000)
 
@@ -416,8 +436,11 @@ def test_post_commit_memory_exception_keeps_compacted_db_and_committed_outcome(
 
     returned, _ = agent._compress_context(_messages(), "sys", approx_tokens=100_000, force=True)
 
-    assert returned[0]["content"] == "durable compacted"
-    assert db.get_messages_as_conversation(sid)[0]["content"] == "durable compacted"
+    expected = "message 5\n\ndurable compacted"
+    assert [row["content"] for row in returned] == [expected]
+    assert [row["content"] for row in db.get_messages_as_conversation(sid)] == [
+        expected,
+    ]
     assert agent._last_compression_outcome == "committed_materially_shrunk"
     assert calls[0][0] == "on_pre_compress"
 
@@ -463,8 +486,11 @@ def test_post_commit_pre_compress_exception_does_not_skip_memory_commit(
         _messages(), "sys", approx_tokens=100_000, force=True
     )
 
-    assert returned[0]["content"] == "durable compacted"
-    assert db.get_messages_as_conversation(sid)[0]["content"] == "durable compacted"
+    expected = "message 5\n\ndurable compacted"
+    assert [row["content"] for row in returned] == [expected]
+    assert [row["content"] for row in db.get_messages_as_conversation(sid)] == [
+        expected,
+    ]
     assert agent._last_compression_outcome == "committed_materially_shrunk"
     assert [entry[0] for entry in calls].count("on_pre_compress") == 1
     assert [entry[0] for entry in calls].count("commit_memory_session") == 1

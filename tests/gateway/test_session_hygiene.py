@@ -619,7 +619,8 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     # Cooldown must be persisted to the state DB (survives restart, #74136),
     # not stashed in an in-memory dict.
     fake_db.record_hygiene_failure.assert_called_once_with(
-        "sess-timeout", 120.0, "timeout"
+        "sess-timeout", 120.0,
+        "session hygiene compression timed out with no output from the summary model",
     )
     timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
     assert len(timeout_warnings) == 1

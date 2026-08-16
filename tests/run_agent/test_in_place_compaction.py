@@ -474,10 +474,12 @@ class TestInPlaceAntiGrowthGuard:
                 side_effect=estimate,
             ):
                 compress_context(agent, messages, "sys", approx_tokens=100_000)
+            assert len(seen) == 2
             assert seen[0][0] is not messages
             assert seen[0][0] == messages
             assert seen[0][1] == "EXACT BUILT PROMPT"
             assert seen[0][1] != ""
+            assert seen[1][1] == "EXACT BUILT PROMPT"
             assert seen[0][2] is seen[1][2]
 
     @pytest.mark.parametrize(
@@ -631,7 +633,7 @@ class TestInPlaceAntiGrowthGuard:
             _seed(db, sid, "manual")
             agent = _make_agent(db, sid, in_place=True)
             messages = _materially_compressible_messages()
-            estimates = iter((100_000, 80_000))
+            estimates = iter((100_000, 97_000))
             with patch(
                 "agent.conversation_compression.estimate_request_tokens_rough",
                 side_effect=lambda candidate, **kwargs: next(estimates),
@@ -639,6 +641,7 @@ class TestInPlaceAntiGrowthGuard:
                 compress_context(
                     agent, messages, "sys", force=True, approx_tokens=100_000
                 )
+            assert agent._last_compression_outcome == "rejected_below_minimum_reclaim"
             assert db.get_compression_failure_cooldown(sid) is None
 
     def test_in_place_still_commits_shrinking_compression(self):

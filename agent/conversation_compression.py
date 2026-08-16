@@ -2075,6 +2075,10 @@ AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT = (
 AUTONOMOUS_COMPLETION_BRIDGE_PRELUDE = (
     "[HERMES_AUTONOMOUS_COMPLETION_BRIDGE:prelude] Runtime delivery boundary."
 )
+PRESERVED_HUMAN_TASK_BRIDGE = (
+    "[HERMES_PRESERVED_HUMAN_TASK_BRIDGE] "
+    "The exact structured human task continues in the following turn."
+)
 _ACTIVE_TASK_CONTRACT_BRIDGE_CONTENTS = frozenset({
     ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
     ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
@@ -2088,6 +2092,40 @@ def _is_active_task_contract_bridge(message: Any) -> bool:
         and message.get("role") == "assistant"
         and message.get("content") in _ACTIVE_TASK_CONTRACT_BRIDGE_CONTENTS
     )
+
+
+def _latest_active_human_task_row(messages: list) -> Optional[dict]:
+    """Return the latest genuine human task using durable sequence provenance."""
+    from agent.context_compressor import ContextCompressor
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        if ContextCompressor._completion_has_durable_provenance(messages, index):
+            continue
+        if message.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER:
+            continue
+        projected_contract = (
+            index > 0
+            and _is_active_task_contract_bridge(messages[index - 1])
+            and messages[index - 1].get("content")
+            == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+            and ContextCompressor.parse_active_task_contract(
+                message, allow_projected=True
+            ) is not None
+        )
+        if projected_contract or _is_active_task_contract_message(message):
+            continue
+        if (
+            isinstance(message.get("content"), list)
+            and message.get("content")
+            and not any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS)
+        ):
+            return message
+        if _is_real_user_message(message):
+            return message
+    return None
 
 
 def append_autonomous_completion_provenance(messages: list) -> None:
@@ -2247,6 +2285,16 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
     if ContextCompressor._is_context_summary_content(
         _message_text(messages[-1])
     ):
+        if isinstance(anchor.get("content"), list):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": PRESERVED_HUMAN_TASK_BRIDGE,
+                    "_preserved_human_task_bridge": True,
+                },
+                anchor,
+            ])
+            return
         # Never merge into a compaction summary: the summary prefix must
         # stay at the start of its message for downstream summary detection.
         # Appending after it makes the anchor "the latest user message after
@@ -2255,6 +2303,16 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
         # repair_message_sequence before the next API call.
         messages.append(anchor)
         return
+    if isinstance(anchor.get("content"), list):
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": PRESERVED_HUMAN_TASK_BRIDGE,
+                "_preserved_human_task_bridge": True,
+            },
+            anchor,
+        ])
+        return
     # Trailing user-role scaffolding (e.g. the todo snapshot): merge instead
     # of inserting a consecutive same-role message (#55677 strict templates).
     _merge_anchor_into_user_message(messages[-1], anchor)
@@ -2262,23 +2320,28 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
 
 def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> None:
     """Preserve human intent, not merely a synthetic user-role placeholder."""
-    if any(
-        _is_real_user_message(message) or _is_active_task_contract_message(message)
-        for message in compressed
-    ):
+    if any(_is_active_task_contract_message(message) for message in compressed):
         return
     from agent.context_compressor import (
         COMPRESSION_CONTINUATION_USER_CONTENT,
         _fresh_compaction_message_copy,
     )
 
-    for message in reversed(original_messages):
-        if _is_real_user_message(message):
-            _insert_real_user_anchor(
-                compressed,
-                _fresh_compaction_message_copy(message),
-            )
+    active = _latest_active_human_task_row(original_messages)
+    if active is not None:
+        active_content = active.get("content")
+        if any(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and message.get("content") == active_content
+            for message in compressed
+        ):
             return
+        _insert_real_user_anchor(
+            compressed,
+            _fresh_compaction_message_copy(active),
+        )
+        return
     from agent.message_metadata import append_message
 
     append_message(
@@ -4078,12 +4141,7 @@ def compress_context(
         # Keep the post-compression rough estimate for diagnostics, but do not
         # treat it as provider-reported prompt usage. Schema-heavy rough estimates
         # can remain above threshold even after the next real API request fits.
-        _compressed_est = estimate_request_tokens_rough(
-            compressed,
-            system_prompt=new_system_prompt or "",
-            tools=agent.tools or None,
-        )
-        agent.context_compressor.last_compression_rough_tokens = _compressed_est
+        agent.context_compressor.last_compression_rough_tokens = _request_out
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True

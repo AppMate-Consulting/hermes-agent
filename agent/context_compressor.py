@@ -4787,28 +4787,20 @@ This compaction should PRIORITISE preserving all information related to the focu
         compacted turns so the summary can be grounded before it becomes live
         context.
         """
-        # Reuse the runtime's real-user predicate so the deterministic
-        # snapshot can never anchor on user-role scaffolding (todo
-        # snapshots, truncation notices, background-process reports) —
-        # the exact class of turn this grounding exists to bypass.
-        from agent.conversation_compression import _is_real_user_message
+        from agent.conversation_compression import _latest_active_human_task_row
 
-        for msg in reversed(messages):
-            if msg.get("role") != "user":
-                continue
-            if not _is_real_user_message(msg):
-                continue
+        msg = _latest_active_human_task_row(messages)
+        if msg is not None:
             content = msg.get("content")
             text = _redact_compaction_text(_content_text_for_contains(content).strip())
-            if not text:
-                continue
-            text = re.sub(r"\s+", " ", text)
-            if len(text) > _ACTIVE_TASK_MAX_CHARS:
-                text = text[: _ACTIVE_TASK_MAX_CHARS - 15].rstrip() + " ...[truncated]"
-            return (
-                f"User asked (deterministic, from compacted turns): {text!r}\n"
-                "Historical only; newer protected-tail messages after this summary win."
-            )
+            if text:
+                text = re.sub(r"\s+", " ", text)
+                if len(text) > _ACTIVE_TASK_MAX_CHARS:
+                    text = text[: _ACTIVE_TASK_MAX_CHARS - 15].rstrip() + " ...[truncated]"
+                return (
+                    f"User asked (deterministic, from compacted turns): {text!r}\n"
+                    "Historical only; newer protected-tail messages after this summary win."
+                )
         return None
 
     @classmethod
@@ -4816,10 +4808,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         """Return the latest real human task, including across compactions."""
         from agent.conversation_compression import (
             ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
-            AUTONOMOUS_COMPLETION_BRIDGE_USER,
-            _is_real_user_message,
+            _latest_active_human_task_row,
         )
 
+        active_row = _latest_active_human_task_row(messages)
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
             projected = (
@@ -4831,27 +4823,21 @@ This compaction should PRIORITISE preserving all information related to the focu
             contract = cls.parse_active_task_contract(message, allow_projected=projected)
             if contract is not None:
                 return contract
-            if message.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER:
+            if message is not active_row:
                 continue
-            if message.get("role") == "user" and _is_real_user_message(message):
-                raw_content = message.get("content")
-                if cls._completion_has_durable_provenance(messages, index):
-                    continue
-                # Structured media/file/unknown parts cannot be represented by
-                # this bounded text contract without loss.  Returning no
-                # contract makes the boundary retain the exact human row as
-                # its protected anchor instead.
-                if isinstance(raw_content, list) and any(
-                    not isinstance(part, dict) or part.get("type") != "text"
-                    for part in raw_content
-                ):
-                    return None
-                content = _content_text_for_contains(raw_content)
-                if content:
-                    return {
-                        "content": content,
-                        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                    }
+            raw_content = active_row.get("content")
+            if isinstance(raw_content, list) and any(
+                not isinstance(part, dict) or part.get("type") != "text"
+                for part in raw_content
+            ):
+                return None
+            content = _content_text_for_contains(raw_content)
+            if content:
+                return {
+                    "content": content,
+                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                }
+            return None
         return None
 
     @classmethod

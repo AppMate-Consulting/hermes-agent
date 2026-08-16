@@ -131,7 +131,7 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
         "sha256": hashlib.sha256(TASK.encode()).hexdigest(),
     }
     assert contract_message["content"].startswith(ACTIVE_TASK_CONTRACT_PREFIX)
-    assert _is_real_user_message(contract_message) is False
+    assert _is_real_user_message(contract_message) is True
     assert "remains active until a later real human user message overrides it" in contract_message["content"]
 
     # A genuine later human turn becomes the sole contract source. The old
@@ -263,6 +263,7 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
         )
+    assert db.get_messages_as_conversation(sid)[0] == exact_row
     db.close()
 
     archived_counts = []

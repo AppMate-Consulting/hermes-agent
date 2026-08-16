@@ -635,7 +635,7 @@ class TestPreflightCompression:
         assert events == [
             ("lifecycle", COMPACTION_STATUS),
             ("compress", "started"),
-            ("compacted", COMPACTION_DONE_STATUS),
+            ("compacted", _compaction_terminal_status("committed_in_memory")),
         ]
 
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):

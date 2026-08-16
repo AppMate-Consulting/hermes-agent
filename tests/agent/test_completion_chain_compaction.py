@@ -336,7 +336,17 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
             not row.get("active", 1)
             for row in db.get_messages(sid, include_inactive=True)
         ))
-        assert compacted == durable
+        durable_fields = ("role", "content", "tool_calls", "tool_call_id", "name")
+
+        def durable_shape(messages):
+            return [
+                {key: message[key] for key in durable_fields if key in message}
+                for message in messages
+            ]
+
+        # SessionDB replay intentionally changes representation metadata, so
+        # compare equality over the durable conversation contract.
+        assert durable_shape(compacted) == durable_shape(durable)
         db.close()
     assert archived_counts[1] > archived_counts[0] > 0
     assert len(bridge_counts) == 2

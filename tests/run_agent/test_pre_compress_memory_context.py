@@ -1,5 +1,6 @@
 """Behavior contracts for the pre-compression memory-context handoff."""
 
+import copy
 from unittest.mock import MagicMock
 
 import pytest
@@ -206,3 +207,78 @@ def test_internal_engine_type_error_propagates_after_one_call():
 
     assert calls == [""]
     manager.on_pre_compress.assert_not_called()
+
+
+class _BoundaryObserver:
+    """Stateful observer: unlike a mock, it records immutable transcript values."""
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def on_pre_compress(self, messages):
+        self.calls.append(("on_pre_compress", copy.deepcopy(messages)))
+        messages.clear()
+        return "legacy return is observational only"
+
+    def on_session_switch(self, new_session_id, **kwargs):
+        self.calls.append(("on_session_switch", new_session_id, kwargs))
+
+
+def test_successful_no_db_boundary_runs_memory_only_after_admission(monkeypatch):
+    """No-DB admission orders observer then memory commit with frozen input."""
+    calls = []
+    observer = _BoundaryObserver(calls)
+    compressor = MagicMock()
+    compressor.compress.side_effect = lambda incoming, **_kwargs: [
+        {"role": "user", "content": "small durable candidate"}
+    ]
+    _configure_engine_state(compressor)
+    agent = _make_agent(observer, compressor)
+    original = _messages()
+
+    def commit(messages):
+        calls.append(("commit_memory_session", copy.deepcopy(messages)))
+        messages.clear()
+
+    agent.commit_memory_session = commit
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+
+    returned, _ = agent._compress_context(
+        original, "sys", approx_tokens=100_000, force=True
+    )
+
+    assert returned != original
+    assert [entry[0] for entry in calls] == [
+        "on_pre_compress", "commit_memory_session", "on_session_switch"
+    ]
+    assert calls[0][1] == _messages()
+    assert calls[1][1] == _messages()
+
+
+@pytest.mark.parametrize("out_tokens", [100_001, 100_000, 99_000])
+def test_rejected_candidate_never_reaches_memory_observer(monkeypatch, out_tokens):
+    """Grow, no-op and below-minimum admission failures are side-effect free."""
+    calls = []
+    observer = _BoundaryObserver(calls)
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "candidate"}]
+    _configure_engine_state(compressor)
+    agent = _make_agent(observer, compressor)
+    agent.commit_memory_session = lambda messages: calls.append(
+        ("commit_memory_session", copy.deepcopy(messages))
+    )
+    estimates = iter((100_000, out_tokens))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+
+    original = _messages()
+    returned, _ = agent._compress_context(original, "sys", approx_tokens=100_000)
+
+    assert returned is original
+    assert calls == []

@@ -17,6 +17,7 @@ fi
   tests/gateway/test_buzz_websocket.py \
   tests/gateway/test_session_hygiene.py \
   tests/gateway/test_hygiene_failure_cooldown_ladder.py \
+  tests/tui_gateway/test_completion_provenance.py \
   tests/run_agent/test_compression_persistence.py \
   tests/run_agent/test_in_place_compaction.py \
   tests/run_agent/test_pre_compress_memory_context.py \

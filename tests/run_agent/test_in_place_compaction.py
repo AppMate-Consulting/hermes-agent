@@ -11,6 +11,7 @@ exactly as before.
 
 import os
 import copy
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -68,6 +69,69 @@ def _materially_compressible_messages(n=8):
 
 
 class TestInPlaceCompaction:
+    def test_archive_and_compact_atomically_updates_transcript_config_and_prompt(self):
+        """The SessionDB API publishes every boundary field in one transaction."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "atomic_boundary"
+            _seed(db, sid, "atomic", n=2)
+
+            db.archive_and_compact(
+                sid,
+                [{"role": "user", "content": "durable summary"}],
+                model_config_patch={"compression_count": 7, "marker": "kept"},
+                system_prompt="prompt-after",
+            )
+
+            assert [m["content"] for m in db.get_messages_as_conversation(sid)] == [
+                "durable summary"
+            ]
+            all_rows = db.get_messages(sid, include_inactive=True)
+            assert [m["content"] for m in all_rows if not m["active"]] == [
+                "msg 0", "msg 1"
+            ]
+            row = db.get_session(sid)
+            model_config = json.loads(row["model_config"])
+            assert model_config["compression_count"] == 7
+            assert model_config["marker"] == "kept"
+            assert row["system_prompt"] == "prompt-after"
+
+    def test_archive_and_compact_failure_rolls_back_every_boundary_field(self):
+        """A failure after archiving starts leaves no partially published state."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=path)
+            sid = "atomic_rollback"
+            _seed(db, sid, "atomic", n=2)
+            db.patch_session_model_config(sid, {"compression_count": 3})
+            db.update_system_prompt(sid, "prompt-before")
+            before_messages = db.get_messages(sid, include_inactive=True)
+            before_session = db.get_session(sid)
+
+            with patch.object(
+                db,
+                "_insert_message_rows",
+                side_effect=RuntimeError("injected after archive"),
+            ):
+                with pytest.raises(RuntimeError, match="injected after archive"):
+                    db.archive_and_compact(
+                        sid,
+                        [{"role": "user", "content": "must-not-land"}],
+                        model_config_patch={"compression_count": 4},
+                        system_prompt="prompt-after",
+                    )
+            db.close()
+
+            reopened = SessionDB(db_path=path)
+            assert reopened.get_messages(sid, include_inactive=True) == before_messages
+            after_session = reopened.get_session(sid)
+            for field in ("message_count", "tool_call_count", "model_config", "system_prompt"):
+                assert after_session[field] == before_session[field]
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB
@@ -600,6 +664,98 @@ class TestInPlaceAntiGrowthGuard:
             agent.event_callback.assert_not_called()
             archive.assert_not_called()
             publish.assert_not_called()
+
+    def test_candidate_preparation_exception_restores_complete_precommit_state(self):
+        """A post-engine helper failure unwinds mutable input, caches and callbacks."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "candidate-preparation-rollback"
+            _seed(db, sid, "candidate")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            original = copy.deepcopy(messages)
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            attempt_before = copy.deepcopy(vars(agent.context_compressor))
+            agent.commit_memory_session = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent.event_callback = MagicMock()
+
+            def mutate(candidate, **_kwargs):
+                candidate[:] = [{"role": "user", "content": "candidate"}]
+                return candidate
+
+            agent.context_compressor.compress = mutate
+            with patch(
+                "agent.conversation_compression._refresh_active_task_contract",
+                side_effect=RuntimeError("post-engine helper failed"),
+            ), pytest.raises(RuntimeError, match="post-engine helper failed"):
+                compress_context(agent, messages, "sys", approx_tokens=100_000)
+
+            assert messages == original
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            for name, value in attempt_before.items():
+                if name != "compress":
+                    assert vars(agent.context_compressor).get(name) == value
+            assert agent.session_id == sid
+            assert agent._last_compression_attempt_in_place is None
+            assert agent._last_compaction_in_place is False
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.event_callback.assert_not_called()
+
+    def test_in_place_publication_failure_has_no_boundary_side_effects(self):
+        """A failed durable publication returns the exact pre-attempt boundary."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "in-place-publication-failure"
+            _seed(db, sid, "failure")
+            messages = _materially_compressible_messages()
+            original = copy.deepcopy(messages)
+            agent = _make_agent(db, sid, in_place=True)
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._last_flushed_db_idx = 5
+            agent._flushed_db_message_ids = {17}
+            agent._memory_manager = MagicMock()
+            agent.commit_memory_session = MagicMock()
+            agent.event_callback = MagicMock()
+            before_rows = db.get_messages(sid, include_inactive=True)
+            before_session = db.get_session(sid)
+
+            with patch.object(
+                db, "archive_and_compact", side_effect=RuntimeError("disk full")
+            ):
+                returned, _prompt = compress_context(
+                    agent, messages, "sys", approx_tokens=100_000
+                )
+
+            assert returned is messages
+            assert messages == original
+            assert agent._last_compression_outcome == "persistence_failure"
+            assert agent.session_id == sid
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent._last_flushed_db_idx == 5
+            assert agent._flushed_db_message_ids == {17}
+            assert agent._last_compression_attempt_in_place is None
+            assert agent._last_compaction_in_place is False
+            assert db.get_messages(sid, include_inactive=True) == before_rows
+            after_session = db.get_session(sid)
+            for field in ("message_count", "model_config", "system_prompt", "end_reason"):
+                assert after_session[field] == before_session[field]
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.event_callback.assert_not_called()
 
     def test_rejection_restores_both_prompt_cache_tiers_byte_for_byte(self):
         from hermes_state import SessionDB

@@ -311,15 +311,6 @@ class MemoryProvider(ABC):
         for API compatibility but cannot influence the already-committed
         summary.
         """
-        """Called before context compression discards old messages.
-
-        Use to extract insights from messages about to be compressed.
-        messages is the list that will be summarized/discarded.
-
-        Return text to include in the compression summary prompt so the
-        compressor preserves provider-extracted insights. Return empty
-        string for no contribution (backwards-compatible default).
-        """
         return ""
 
     def on_delegation(self, task: str, result: str, *,

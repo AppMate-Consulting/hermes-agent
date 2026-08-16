@@ -74,6 +74,7 @@ def _get_scoped_secret(name, default=None):
 
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -92,6 +93,11 @@ _CHAT_KIND = 9
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
 _SEEN_CAP = 500
+# Bound on remembered addressed thread/event ids per channel.  Event ids are
+# sufficient because Nostr replies refer to their thread ancestry with `e`
+# tags; keeping them beside the existing per-channel de-dupe state also makes
+# transport reconnects share exactly the same gating semantics.
+_ADDRESSED_THREAD_CAP = 200
 # Re-run DM discovery (``dms list`` plus the channels-list fallback) every
 # N poll sweeps to pick up conversations opened mid-run.
 _DM_DISCOVERY_EVERY = 5
@@ -106,6 +112,8 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+_TYPING_KIND = 20002
+_TYPING_INTERVAL = 3.0
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -426,9 +434,14 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
+        self._ws_socket = None  # Authenticated socket shared with best-effort egress
+        self._typing_sent_at: Dict[str, float] = {}
+        self._typing_locks: Dict[str, asyncio.Lock] = {}
+        self._typing_lock_users: Dict[str, int] = {}
         self._membership_since = 0
         self._lock_key: Optional[str] = None
-        # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
+        # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict,
+        #                "addressed_threads": OrderedDict[event_id, None]}
         self._channel_state: Dict[str, dict] = {}
         self._channel_names: Dict[str, str] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
@@ -580,6 +593,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
         self._ws_active = False
+        self._ws_socket = None
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -599,6 +613,47 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Sending ───────────────────────────────────────────────────────────
 
+    def _outbound_routing_args(
+        self,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Tuple[List[str], Optional[str]]:
+        """Build reply/mention CLI arguments from trusted gateway metadata."""
+        metadata = metadata or {}
+        reply_target = (
+            reply_to
+            or metadata.get("buzz_reply_to_message_id")
+            or metadata.get("thread_id")
+        )
+        args: List[str] = []
+        if reply_target:
+            args += ["--reply-to", str(reply_target)]
+
+        # ``user_id`` is the standard SessionSource sender identity. Only use
+        # it for a known channel, and re-apply the adapter's authorization
+        # policy before asking buzz-cli to create a mention tag. DMs must not
+        # acquire a channel-member mention.
+        state = self._channel_state.get(str(chat_id))
+        mention = _normalize_user_ref(str(metadata.get("user_id") or ""))
+        persisted_chat_type = metadata.get("buzz_chat_type")
+        chat_type_safe = (
+            persisted_chat_type is None
+            or (
+                isinstance(persisted_chat_type, str)
+                and persisted_chat_type == "group"
+            )
+        )
+        if (
+            state is not None
+            and state.get("chat_type") != "dm"
+            and chat_type_safe
+            and mention is not None
+            and self._is_channel_sender_authorized(mention, str(chat_id))
+        ):
+            args += ["--mention", mention]
+        return args, str(reply_target) if reply_target else None
+
     async def send(
         self,
         chat_id: str,
@@ -609,9 +664,8 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
-        if reply_target:
-            args += ["--reply-to", str(reply_target)]
+        routing_args, reply_target = self._outbound_routing_args(chat_id, reply_to, metadata)
+        args += routing_args
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
@@ -625,9 +679,10 @@ class BuzzAdapter(BasePlatformAdapter):
             data = {}
         event_id = data.get("event_id")
         if event_id:
-            # Belt-and-braces echo suppression: the poll loop already skips
-            # our own pubkey, but marking the id seen makes de-dupe explicit.
-            self._mark_seen(str(chat_id), str(event_id))
+            self._remember_outbound_event(
+                str(chat_id), str(event_id), reply_target,
+                accepted=bool(data.get("accepted", True)),
+            )
         return SendResult(
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
@@ -635,8 +690,47 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
-        pass
+        """Publish Buzz's ephemeral working signal on the active socket."""
+        lock = None
+        channel_id = None
+        try:
+            if not isinstance(chat_id, str) or not chat_id.strip():
+                raise ValueError("invalid Buzz chat id")
+            channel_id = chat_id.strip()
+            lock = self._typing_locks.get(channel_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._typing_locks[channel_id] = lock
+                self._typing_lock_users[channel_id] = 0
+            self._typing_lock_users[channel_id] += 1
+            async with lock:
+                websocket = self._ws_socket
+                if websocket is None:
+                    return
+                now = _monotonic()
+                if now - self._typing_sent_at.get(channel_id, float("-inf")) < _TYPING_INTERVAL:
+                    return
+                event = _load_nostr_auth().build_signed_event(
+                    private_key=self._private_key,
+                    kind=_TYPING_KIND,
+                    tags=[["h", channel_id]],
+                    content="",
+                )
+                await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+                self._typing_sent_at[channel_id] = _monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("Buzz: could not publish typing event: %s", e)
+        finally:
+            if lock is not None and channel_id is not None:
+                users = self._typing_lock_users[channel_id] - 1
+                if users:
+                    self._typing_lock_users[channel_id] = users
+                else:
+                    self._typing_lock_users.pop(channel_id, None)
+                    if self._typing_locks.get(channel_id) is lock:
+                        self._typing_locks.pop(channel_id, None)
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Add a reaction to a message via buzz-cli.
@@ -681,8 +775,8 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            routing_args, reply_target = self._outbound_routing_args(chat_id, reply_to, metadata)
+            args += routing_args
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -692,7 +786,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 data = {}
             event_id = data.get("event_id")
             if event_id:
-                self._mark_seen(str(chat_id), str(event_id))
+                self._remember_outbound_event(
+                    str(chat_id), str(event_id), reply_target,
+                    accepted=bool(data.get("accepted", True)),
+                )
             return SendResult(
                 success=bool(data.get("accepted", True)),
                 message_id=str(event_id) if event_id else None,
@@ -701,6 +798,24 @@ class BuzzAdapter(BasePlatformAdapter):
         # Markdown renders in Buzz, so a URL arrives as a clickable image link.
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload a local image through Buzz's native ``--file`` path."""
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_id = str(chat_id)
@@ -859,6 +974,7 @@ class BuzzAdapter(BasePlatformAdapter):
                         await self._authenticate_websocket(websocket)
                         subscriptions = await self._subscribe_websocket(websocket)
                         self._ws_active = True
+                        self._ws_socket = websocket
                         if self._ws_ready is not None:
                             self._ws_ready.set()
                         backoff = 1.0
@@ -888,15 +1004,20 @@ class BuzzAdapter(BasePlatformAdapter):
                                 raise ConnectionError(str(detail))
                             elif message[0] == "NOTICE":
                                 logger.warning("Buzz: relay notice: %s", message[-1])
+                        # Do not expose a socket after its receive iterator closes.
+                        self._ws_active = False
+                        self._ws_socket = None
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     self._ws_active = False
+                    self._ws_socket = None
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+            self._ws_socket = None
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
@@ -920,7 +1041,12 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
         """Initialize a channel's high-water mark from its newest events."""
-        state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
+        state = {
+            "chat_type": chat_type,
+            "last_ts": 0,
+            "seen": OrderedDict(),
+            "addressed_threads": OrderedDict(),
+        }
         self._channel_state[channel_id] = state
         code, out, err = await self._run_cli(
             ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
@@ -933,7 +1059,8 @@ class BuzzAdapter(BasePlatformAdapter):
             # replay its whole history once it becomes readable.
             state["last_ts"] = int(time.time())
             return
-        for event in _parse_json_list(out):
+        events = _parse_json_list(out)
+        for event in events:
             event_id = event.get("id")
             created_at = int(event.get("created_at") or 0)
             if event_id:
@@ -943,6 +1070,7 @@ class BuzzAdapter(BasePlatformAdapter):
             # leaked in via ``channels list`` latches to chat_type="dm" here,
             # so it bypasses the mention gate from the very first poll.
             self._maybe_latch_dm(channel_id, state, event)
+        self._seed_addressed_threads(channel_id, state, events)
         self._trim_seen(state)
 
     async def _discover_dms(self, *, seed: bool) -> None:
@@ -967,7 +1095,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 if seed:
                     await self._seed_channel(dm_id, chat_type="dm")
                 else:
-                    self._channel_state[dm_id] = {"chat_type": "dm", "last_ts": 0, "seen": OrderedDict()}
+                    self._channel_state[dm_id] = {
+                        "chat_type": "dm", "last_ts": 0, "seen": OrderedDict(),
+                        "addressed_threads": OrderedDict(),
+                    }
                 self._channel_names.setdefault(dm_id, "DM")
 
         code, out, _err = await self._run_cli(["channels", "list"])
@@ -984,7 +1115,10 @@ class BuzzAdapter(BasePlatformAdapter):
             if seed:
                 await self._seed_channel(ch_id, chat_type="group")
             else:
-                self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+                self._channel_state[ch_id] = {
+                    "chat_type": "group", "last_ts": 0, "seen": OrderedDict(),
+                    "addressed_threads": OrderedDict(),
+                }
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
@@ -1001,9 +1135,52 @@ class BuzzAdapter(BasePlatformAdapter):
                 "Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code)
             )
             return
-        for event in _parse_json_list(out):
+        events = _parse_json_list(out)
+        for event in self._order_poll_batch(events):
             await self._handle_event(channel_id, state, event)
         self._trim_seen(state)
+
+    def _order_poll_batch(self, events: List[dict]) -> List[dict]:
+        """Return a bounded parent-before-descendant view of a poll batch.
+
+        Relay result order is unspecified.  Polling receives at most
+        ``_FETCH_LIMIT`` events, so normalize references that are present in
+        this one batch before applying the stateful mention/thread gate.  An
+        unresolved reference (or malformed/cyclic input) retains relay order;
+        it cannot acquire authority merely by appearing in the batch.
+
+        WebSocket delivery deliberately does not use this helper: frames are
+        processed in arrival order and retain the existing one-event semantics.
+        """
+        pending = list(events)
+        batch_ids = {
+            str(event.get("id"))
+            for event in pending
+            if event.get("id")
+        }
+        ordered: List[dict] = []
+        emitted_ids = set()
+
+        while pending:
+            deferred: List[dict] = []
+            progressed = False
+            for event in pending:
+                in_batch_parents = {
+                    ref for ref in self._thread_references(event) if ref in batch_ids
+                }
+                if in_batch_parents - emitted_ids:
+                    deferred.append(event)
+                    continue
+                ordered.append(event)
+                event_id = event.get("id")
+                if event_id:
+                    emitted_ids.add(str(event_id))
+                progressed = True
+            if not progressed:
+                ordered.extend(deferred)
+                break
+            pending = deferred
+        return ordered
 
     async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
@@ -1030,17 +1207,34 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
+        mentioned = self._is_mentioned(content)
+        is_addressed_followup = self._is_addressed_thread_reply(state, event)
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
+        # Replies in a thread previously addressed to us count as addressed;
         # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        if not is_dm and self.require_mention and not mentioned and not is_addressed_followup:
             return
 
-        # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
-        # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
-        if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
+        # Apply both the definitive gateway authorization decision and the
+        # adapter-local relay allow-list before dispatching or extending
+        # addressed-thread state. A missing gateway callback preserves the
+        # adapter's legacy allow-list-only behavior.
+        if not is_dm and not self._is_channel_sender_authorized(pubkey, channel_id):
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
+
+        # DMs retain their existing adapter-local allow-list behavior; their
+        # central authorization is applied by the gateway dispatch path.
+        if is_dm and self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
+            logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
+            return
+
+        # Only accepted, authorized channel messages may extend the thread
+        # cache.  Remember each accepted event id as well as its normalized
+        # root/reply identity so nested replies work with both Buzz tag forms.
+        if not is_dm and (mentioned or is_addressed_followup):
+            self._remember_addressed_thread(state, event)
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->
         # /whoami) and clean prompts are recognized. DM messages often still
@@ -1149,6 +1343,130 @@ class BuzzAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    @staticmethod
+    def _thread_references(event: dict) -> List[str]:
+        """Return the normalized thread identity carried by Nostr ``e`` tags.
+
+        A marked ``root`` is authoritative.  Without one, use marked
+        ``reply`` targets; for older/minimal events with no marker, tolerate
+        the final valid ``e`` tag as the immediate reply target.  Malformed
+        tags are ignored rather than weakening the mention gate.
+        """
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return []
+        roots: List[str] = []
+        replies: List[str] = []
+        unmarked: List[str] = []
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "e":
+                continue
+            event_id = tag[1]
+            if not isinstance(event_id, str) or not event_id.strip():
+                continue
+            event_id = event_id.strip()
+            marker = str(tag[3]).strip().lower() if len(tag) > 3 else ""
+            if marker == "root":
+                roots.append(event_id)
+            elif marker == "reply":
+                replies.append(event_id)
+            elif not marker:
+                unmarked.append(event_id)
+        if roots:
+            return roots[:1]
+        if replies:
+            return replies[-1:]
+        return unmarked[-1:]
+
+    def _is_addressed_thread_reply(self, state: dict, event: dict) -> bool:
+        addressed = state.get("addressed_threads") or {}
+        return any(event_id in addressed for event_id in self._thread_references(event))
+
+    def _remember_addressed_thread(self, state: dict, event: dict) -> None:
+        addressed = state.setdefault("addressed_threads", OrderedDict())
+        identities = self._thread_references(event)
+        event_id = event.get("id")
+        if isinstance(event_id, str) and event_id:
+            identities.append(event_id)
+        for identity in identities:
+            # Refresh insertion order when a thread stays active so eviction
+            # favors inactive threads.
+            addressed.pop(identity, None)
+            addressed[identity] = None
+        while len(addressed) > _ADDRESSED_THREAD_CAP:
+            addressed.popitem(last=False)
+
+    def _is_channel_sender_authorized(self, pubkey: str, channel_id: str) -> bool:
+        """Apply gateway and adapter-local authorization for a channel sender."""
+        gateway_authorized = self._is_sender_authorized(
+            pubkey, chat_type="group", chat_id=channel_id
+        )
+        # Once the central gateway policy is registered, only an affirmative
+        # result is safe enough to create a mention.  A rejected check or a
+        # check that failed with an exception must preserve reply routing but
+        # must not turn untrusted identity metadata into a Buzz p-tag.
+        if self._authorization_check is not None and gateway_authorized is not True:
+            return False
+        return not self._allowed_pubkeys or pubkey in self._allowed_pubkeys
+
+    def _seed_addressed_threads(
+        self, channel_id: str, state: dict, events: List[dict]
+    ) -> None:
+        """Restore the addressed-thread closure without replaying history.
+
+        Relay/CLI history ordering is not a contract, so roots are established
+        first and eligible descendants are repeatedly folded in until no event
+        can extend the closure.  The input is capped by ``_FETCH_LIMIT`` and
+        each event is consumed at most once, which bounds reconstruction.
+        """
+        if state.get("chat_type") == "dm":
+            return
+
+        pending: List[dict] = []
+        for event in events:
+            if int(event.get("kind") or 0) != _CHAT_KIND:
+                continue
+            pubkey = str(event.get("pubkey") or "").lower()
+            content = event.get("content")
+            if not pubkey:
+                continue
+
+            # A successful outbound relay event is identified by its author
+            # and reply tags, not its payload representation (text/file).
+            if pubkey == self._self_pubkey:
+                pending.append(event)
+                continue
+            if not isinstance(content, str) or not content.strip():
+                continue
+
+            # Only a non-self, authorized direct mention can originate seeded
+            # addressed state. Self events never enter the user authorization
+            # path; below they may only inherit through a known reply target.
+            if self._is_mentioned(content):
+                if self._is_channel_sender_authorized(pubkey, channel_id):
+                    self._remember_addressed_thread(state, event)
+                continue
+            pending.append(event)
+
+        while pending:
+            unresolved: List[dict] = []
+            changed = False
+            for event in pending:
+                if not self._is_addressed_thread_reply(state, event):
+                    unresolved.append(event)
+                    continue
+                pubkey = str(event.get("pubkey") or "").lower()
+                if (
+                    pubkey != self._self_pubkey
+                    and not self._is_channel_sender_authorized(pubkey, channel_id)
+                ):
+                    continue
+                self._remember_addressed_thread(state, event)
+                changed = True
+            if not changed:
+                break
+            pending = unresolved
+
     def _strip_mention(self, content: str) -> str:
         """Remove a leading @mention of this agent so the remaining text can be
         recognized as a slash command or clean prompt.
@@ -1210,6 +1528,27 @@ class BuzzAdapter(BasePlatformAdapter):
             state["seen"][event_id] = None
             self._trim_seen(state)
 
+    def _remember_outbound_event(
+        self,
+        channel_id: str,
+        event_id: str,
+        reply_target: Optional[str],
+        *,
+        accepted: bool,
+    ) -> None:
+        """Record a sent event and preserve addressed channel continuity."""
+        self._mark_seen(channel_id, event_id)
+        state = self._channel_state.get(channel_id)
+        if (
+            not accepted
+            or state is None
+            or state.get("chat_type") == "dm"
+            or not reply_target
+            or str(reply_target) not in state.get("addressed_threads", {})
+        ):
+            return
+        self._remember_addressed_thread(state, {"id": event_id})
+
     async def _dispatch_message(
         self,
         text: str,
@@ -1230,6 +1569,7 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            message_id=message_id,
         )
 
         event = MessageEvent(

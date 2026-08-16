@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python_bin=python
+if [[ -x /opt/venv/bin/python ]]; then
+  python_bin=/opt/venv/bin/python
+fi
+
+"$python_bin" -m pytest \
+  tests/agent/test_compaction_anti_thrash.py \
+  tests/agent/test_compression_anti_thrash_persistence.py \
+  tests/agent/test_compression_anti_thrash_recovery.py \
+  tests/gateway/test_buzz_adapter.py \
+  tests/gateway/test_buzz_websocket.py \
+  tests/gateway/test_session_hygiene.py \
+  tests/run_agent/test_compression_persistence.py \
+  tests/run_agent/test_in_place_compaction.py \
+  -o 'addopts=' -q

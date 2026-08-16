@@ -1,0 +1,5 @@
+{
+  "image": "argus-hermes-buzz-verifier:py3.11-v3",
+  "command": "bin/merge-gate",
+  "allowed_env": []
+}

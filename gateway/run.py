@@ -848,7 +848,7 @@ def _resolve_progress_thread_id(
         return str(source_thread_id) if source_thread_id else None
     if source_thread_id:
         return str(source_thread_id)
-    if platform_key in {"slack", "mattermost"} and event_message_id:
+    if platform_key in {"slack", "mattermost", "buzz"} and event_message_id:
         return str(event_message_id)
     return None
 
@@ -11516,8 +11516,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
+            # New rows carry the exact metadata used by the final send.  NULL
+            # (legacy) rows retain the historical generic-thread recovery.
+            persisted_metadata = row.get("routing_metadata")
             metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+                dict(persisted_metadata)
+                if isinstance(persisted_metadata, dict)
+                else ({"thread_id": row["thread_id"]} if row.get("thread_id") else None)
             )
             try:
                 result = await adapter.send(
@@ -22980,6 +22985,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
+        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        source_platform = getattr(source, "platform", None)
+        if getattr(source_platform, "value", source_platform) == "buzz" and anchor is not None:
+            metadata = dict(metadata or {})
+            metadata["buzz_reply_to_message_id"] = str(anchor)
+        if (
+            getattr(source_platform, "value", source_platform) == "buzz"
+            and getattr(source, "chat_type", None) != "dm"
+            and getattr(source, "user_id", None)
+        ):
+            metadata = dict(metadata or {})
+            metadata["user_id"] = str(source.user_id)
         if getattr(source, "platform", None) == Platform.SLACK:
             team_id = getattr(source, "scope_id", None)
             if team_id:
@@ -27605,6 +27622,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #
         # Threading metadata is platform-specific:
         # - Slack DM threading needs event_message_id fallback (reply thread)
+        # - Buzz progress/status replies use the inbound event/source message id
         # - Telegram forum topics use message_thread_id; Hermes-created private
         #   DM topic lanes require both thread metadata and a reply anchor
         # - Feishu only honors reply_in_thread when sending a reply, so topic
@@ -27639,8 +27657,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception:
                     _progress_reply_in_thread = True
+        _progress_event_message_id = event_message_id
+        if _gateway_platform_value(source.platform) == "buzz" and not _progress_event_message_id:
+            _progress_event_message_id = getattr(source, "message_id", None)
         _progress_thread_id = _resolve_progress_thread_id(
-            source.platform, source.thread_id, event_message_id,
+            source.platform, source.thread_id, _progress_event_message_id,
             reply_in_thread=_progress_reply_in_thread,
         )
         # Relay Discord auto-thread lane: a channel-initiating message has no
@@ -27661,16 +27682,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else None
         )
         _progress_metadata = (
-            self._thread_metadata_for_source(source, event_message_id)
+            self._thread_metadata_for_source(source, _progress_event_message_id)
             if _progress_thread_id == source.thread_id
             else self._thread_metadata_for_target(
                 source.platform,
                 source.chat_id,
                 _progress_thread_id,
                 chat_type=getattr(source, "chat_type", None),
-                reply_to_message_id=event_message_id,
+                reply_to_message_id=_progress_event_message_id,
             )
         ) if _progress_thread_id else None
+        if _gateway_platform_value(source.platform) == "buzz" and _progress_thread_id:
+            # Buzz routes by reply anchor rather than a distinct thread id,
+            # and the source-aware builder also carries the sender identity
+            # that the adapter independently re-authorizes before mentioning.
+            _progress_metadata = self._thread_metadata_for_source(
+                source, _progress_event_message_id
+            )
         if _progress_metadata is None and _relay_prospective_thread_id:
             # No real thread yet, but the connector will auto-thread on the
             # reply anchor; carry it so progress joins that thread.
@@ -27803,16 +27831,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         else:
             _status_thread_metadata = (
-                self._thread_metadata_for_source(source, event_message_id)
+                self._thread_metadata_for_source(source, _progress_event_message_id)
                 if _progress_thread_id == source.thread_id
                 else self._thread_metadata_for_target(
                     source.platform,
                     source.chat_id,
                     _progress_thread_id,
                     chat_type=getattr(source, "chat_type", None),
-                    reply_to_message_id=event_message_id,
+                    reply_to_message_id=_progress_event_message_id,
                 )
             ) if _progress_thread_id else None
+            if _gateway_platform_value(source.platform) == "buzz" and _progress_thread_id:
+                _status_thread_metadata = self._thread_metadata_for_source(
+                    source, _progress_event_message_id
+                )
             if _status_thread_metadata is None and _relay_prospective_thread_id:
                 # Relay Discord auto-thread lane (see _progress_metadata above):
                 # carry the reply anchor so status/interim bubbles route into

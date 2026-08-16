@@ -104,22 +104,36 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    platform = _platform_name(getattr(source, "platform", None))
+    anchor = reply_to_message_id or getattr(source, "message_id", None)
+    # Buzz media batching has no top-level ``reply_to`` argument.  Keep its
+    # event anchor in a platform-scoped key so established metadata contracts
+    # for Telegram, Slack, and other adapters remain unchanged.
+    if platform == "buzz" and anchor is not None:
+        metadata["buzz_reply_to_message_id"] = str(anchor)
+    if platform == "buzz":
+        chat_type = getattr(source, "chat_type", None)
+        if chat_type:
+            metadata["buzz_chat_type"] = str(chat_type)
+    if platform == "buzz" and getattr(source, "chat_type", None) != "dm":
+        user_id = getattr(source, "user_id", None)
+        if user_id:
+            metadata["user_id"] = str(user_id)
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
     # WebClient after an async, stream, or recovery boundary.
-    if _platform_name(getattr(source, "platform", None)) == "slack":
+    if platform == "slack":
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
     if not metadata:
         return None
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
+    if platform == "telegram" and getattr(source, "chat_type", None) == "dm":
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:
             metadata["direct_messages_topic_id"] = tid
-        anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
     return metadata
@@ -6516,6 +6530,7 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    routing_metadata=_final_thread_metadata,
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:

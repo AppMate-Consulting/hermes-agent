@@ -1079,6 +1079,86 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [
+    "rejected_would_grow",
+    "rejected_no_progress",
+    "rejected_below_minimum_reclaim",
+])
+async def test_hygiene_policy_rejections_cool_down_without_rewrite(
+    monkeypatch, tmp_path, caplog, outcome
+):
+    """Bind typed policy rejection handling through the real hygiene call site."""
+    from hermes_state import SessionDB
+    import gateway.run as gateway_run
+
+    sid = f"hygiene-{outcome}"
+    db = SessionDB(db_path=tmp_path / f"{outcome}.db")
+    db.create_session(sid, "telegram")
+
+    class RejectedAgent:
+        calls = 0
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", sid)
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self._last_compression_outcome = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_summary_error=None,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            type(self).calls += 1
+            self._last_compression_outcome = outcome
+            return messages, None
+
+    runner, _adapter, event = _make_cooldown_runner(
+        monkeypatch, tmp_path, RejectedAgent, db, sid
+    )
+    session_key = "agent:main:telegram:dm:12345"
+    runner._session_state(session_key).persistent.hygiene_failure_streak = 1
+    recorded = []
+    real_record = gateway_run._record_hygiene_cooldown
+
+    def record(gateway, session_id, seconds, reason=None):
+        recorded.append((session_id, seconds, reason))
+        return real_record(gateway, session_id, seconds, reason)
+
+    monkeypatch.setattr(gateway_run, "_record_hygiene_cooldown", record)
+    caplog.set_level("INFO", logger="gateway.run")
+    assert await runner._handle_message(event) == "ok"
+    runner.session_store.rewrite_transcript.assert_not_called()
+    assert RejectedAgent.calls == 1
+    assert recorded == [(sid, 900.0, outcome.removeprefix("rejected_"))]
+    assert runner._session_state(
+        session_key
+    ).persistent.hygiene_failure_streak == 2
+    text = caplog.text
+    assert "Session hygiene: compressed" not in text
+    assert "no session_db" not in text
+
+    # A second autonomous delivery during the durable cooldown must not call
+    # the summarizer again.
+    event.text = "[ASYNC DELEGATION COMPLETE child=next]"
+    assert await runner._handle_message(event) == "ok"
+    assert RejectedAgent.calls == 1
+
+    # A fresh gateway reconstructs the cooldown from the shared SessionDB.
+    fresh, _adapter2, fresh_event = _make_cooldown_runner(
+        monkeypatch, tmp_path, RejectedAgent, db, sid
+    )
+    assert await fresh._handle_message(fresh_event) == "ok"
+    assert RejectedAgent.calls == 1
+    fresh.session_store.rewrite_transcript.assert_not_called()
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_hygiene_compression_cooldown_survives_gateway_restart(
     monkeypatch, tmp_path
 ):

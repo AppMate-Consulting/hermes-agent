@@ -12,7 +12,7 @@ exactly as before.
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -340,6 +340,121 @@ class TestInPlaceAntiGrowthGuard:
             assert [(r["id"], r["active"]) for r in after_rows] == [
                 (r["id"], r["active"]) for r in before_rows
             ]
+
+    @pytest.mark.parametrize(
+        ("request_out", "outcome"),
+        [
+            (101_000, "rejected_would_grow"),
+            (100_000, "rejected_no_progress"),
+            (97_000, "rejected_below_minimum_reclaim"),
+        ],
+    )
+    def test_policy_rejection_precedes_every_persistence_side_effect(
+        self, request_out, outcome
+    ):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = f"policy_{outcome}"
+            _seed(db, sid, "policy")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            before = [(r["id"], r["active"]) for r in db.get_messages(
+                sid, include_inactive=True
+            )]
+            agent.commit_memory_session = MagicMock()
+            side_effects = [
+                "archive_and_compact", "publish_compression_child",
+                "end_session", "create_session",
+            ]
+            spies = {
+                name: patch.object(db, name, wraps=getattr(db, name))
+                for name in side_effects if hasattr(db, name)
+            }
+            started = {name: spy.start() for name, spy in spies.items()}
+            agent._flush_messages_to_session_db = MagicMock()
+            try:
+                with patch(
+                    "agent.conversation_compression.estimate_request_tokens_rough",
+                    side_effect=lambda candidate, **kwargs: (
+                        100_000 if candidate is messages else request_out
+                    ),
+                ):
+                    returned, _ = compress_context(
+                        agent, messages, approx_tokens=100_000,
+                        system_message="sys",
+                    )
+            finally:
+                for spy in spies.values():
+                    spy.stop()
+            assert returned is messages
+            assert agent._last_compression_outcome == outcome
+            agent.commit_memory_session.assert_not_called()
+            agent._flush_messages_to_session_db.assert_not_called()
+            assert all(mock.call_count == 0 for mock in started.values())
+            after = [(r["id"], r["active"]) for r in db.get_messages(
+                sid, include_inactive=True
+            )]
+            assert after == before
+
+    def test_uncached_admission_uses_built_input_prompt(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "uncached_prompt"
+            _seed(db, sid, "prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            agent._cached_system_prompt = None
+            agent._cached_system_prompt_static = None
+            agent._build_system_prompt = MagicMock(return_value="EXACT BUILT PROMPT")
+            seen = []
+
+            def estimate(candidate, *, system_prompt, tools=None):
+                seen.append((candidate is messages, system_prompt, tools))
+                return 100_000 if candidate is messages else 97_000
+
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=estimate,
+            ):
+                compress_context(agent, messages, "sys", approx_tokens=100_000)
+            assert seen[0][0] is True
+            assert seen[0][1] == "EXACT BUILT PROMPT"
+            assert seen[0][1] != ""
+            assert seen[0][2] is seen[1][2]
+
+    def test_rejection_restores_both_prompt_cache_tiers_byte_for_byte(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "cached_prompt_restore"
+            _seed(db, sid, "prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            cached = "cached\x00prompt\U0001f642"
+            static = "static\x00prefix\U0001f680"
+            agent._cached_system_prompt = cached
+            agent._cached_system_prompt_static = static
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=lambda candidate, **kwargs: (
+                    100_000 if candidate is messages else 100_000
+                ),
+            ):
+                returned, prompt = compress_context(
+                    agent, messages, "sys", approx_tokens=100_000
+                )
+            assert returned is messages
+            assert prompt == cached
+            assert agent._cached_system_prompt == cached
+            assert agent._cached_system_prompt_static == static
 
     def test_manual_rejection_does_not_write_automatic_cooldown(self):
         from hermes_state import SessionDB

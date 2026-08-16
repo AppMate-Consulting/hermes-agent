@@ -7870,6 +7870,9 @@ class AIAgent:
             reset_conversation_context,
             set_conversation_context,
         )
+        # Public attempt boundary: outer pool/timeout exits may occur before
+        # compress_context() runs, so inner initialization is insufficient.
+        self._last_compression_outcome = "pending"
         # Out-of-turn compaction entry points — ``/compact`` (cli.py), the
         # gateway ``/compress`` command and its hygiene sweep (both of which
         # build a throwaway agent), and partial head compression — call this
@@ -8035,17 +8038,26 @@ class AIAgent:
                         "check SessionDB health (disk / lock contention)."
                     )
 
-            result = run_compress_context_with_progress_timeout(
-                worker=_snapshot_worker,
-                messages=messages,
-                system_prompt_fallback=_fallback_prompt,
-                idle_timeout_seconds=idle_timeout,
-                total_ceiling_seconds=total_ceiling,
-                on_timeout=_on_timeout,
-                on_commit_overrun=_on_commit_overrun,
-                fence=active_fence,
-                telemetry_agent=self,
-            )
+            try:
+                result = run_compress_context_with_progress_timeout(
+                    worker=_snapshot_worker,
+                    messages=messages,
+                    system_prompt_fallback=_fallback_prompt,
+                    idle_timeout_seconds=idle_timeout,
+                    total_ceiling_seconds=total_ceiling,
+                    on_timeout=_on_timeout,
+                    on_commit_overrun=_on_commit_overrun,
+                    fence=active_fence,
+                    telemetry_agent=self,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                self._last_compression_outcome = "cancelled_host"
+                raise
+            except BaseException as exc:
+                self._last_compression_outcome = (
+                    f"wrapper_exception_{type(exc).__name__}"
+                )
+                raise
             # compress_context ran on a daemon pool worker thread; the session
             # id rotation updated hermes_logging._session_context (a
             # threading.local) on the WORKER thread, not this one. Propagate

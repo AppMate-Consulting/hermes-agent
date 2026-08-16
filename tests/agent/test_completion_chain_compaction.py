@@ -1,11 +1,24 @@
 """End-to-end regression for completion-driven compaction thrash."""
 
 import hashlib
+import json
 import os
 from unittest.mock import patch
 
-from agent.context_compressor import ACTIVE_TASK_CONTRACT_PREFIX, ContextCompressor
-from agent.conversation_compression import _is_real_user_message, compress_context
+from agent.context_compressor import (
+    ACTIVE_TASK_CONTRACT_INSTRUCTION,
+    ACTIVE_TASK_CONTRACT_PREFIX,
+    ACTIVE_TASK_CONTRACT_TYPE,
+    ACTIVE_TASK_CONTRACT_VERSION,
+    COMPRESSED_SUMMARY_METADATA_KEY,
+    ContextCompressor,
+)
+from agent.conversation_compression import (
+    _ensure_compressed_has_user_turn,
+    _is_real_user_message,
+    _refresh_active_task_contract,
+    compress_context,
+)
 from hermes_state import SessionDB
 
 
@@ -72,6 +85,9 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
         _agent(db, sid), original, "sys", approx_tokens=100_000,
     )
     resumed = db.get_messages_as_conversation(sid)
+    rows_after_first = db.get_messages(sid, include_inactive=True)
+    assert len([r for r in rows_after_first if not r.get("active", 1)]) == len(original)
+    assert len([r for r in rows_after_first if r.get("active", 1)]) == len(first)
 
     assert not any(m.get("content") == TASK for m in first)
     assert not any(m.get("content") == TASK for m in resumed)
@@ -88,7 +104,19 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
 
     # A genuine later human turn becomes the sole contract source. The old
     # contract is synthetic, so it cannot drag the protected tail back to TASK.
-    resumed.extend(_completion_chain(NEW_TASK, count=30))
+    second_chain = _completion_chain(NEW_TASK, count=30)
+    for message in second_chain:
+        db.append_message(
+            sid, message["role"], message.get("content", ""),
+            tool_calls=message.get("tool_calls"),
+            tool_call_id=message.get("tool_call_id"),
+        )
+    resumed = db.get_messages_as_conversation(sid)
+    archived_before_second = len([
+        r for r in db.get_messages(sid, include_inactive=True)
+        if not r.get("active", 1)
+    ])
+    active_before_second = len(resumed)
     second_agent = _agent(db, sid)
     second, _ = compress_context(
         second_agent, resumed, "sys", approx_tokens=100_000,
@@ -103,3 +131,99 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
         call["id"] for message in second for call in message.get("tool_calls", [])
     ]
     assert len(call_ids) == len(set(call_ids))
+    durable = db.get_messages_as_conversation(sid)
+    assert len(_contracts(durable)) == 1
+    assert ContextCompressor.parse_active_task_contract(
+        _contracts(durable)[0]
+    )["content"] == NEW_TASK
+    durable_roles = [m["role"] for m in durable]
+    assert all(a != b for a, b in zip(durable_roles, durable_roles[1:]))
+    durable_ids = [
+        call["id"] for message in durable
+        for call in message.get("tool_calls", [])
+    ]
+    assert len(durable_ids) == len(set(durable_ids))
+    result_ids = [m.get("tool_call_id") for m in durable if m.get("role") == "tool"]
+    assert set(result_ids) <= set(durable_ids)
+    rows_after_second = db.get_messages(sid, include_inactive=True)
+    archived_after_second = len([
+        r for r in rows_after_second if not r.get("active", 1)
+    ])
+    assert archived_after_second - archived_before_second == active_before_second
+    assert len([r for r in rows_after_second if r.get("active", 1)]) == len(durable)
+
+
+def test_completion_notification_forms_are_exact_and_human_near_match_stays_real():
+    forms = [
+        "[IMPORTANT: Background process p completed normally.]",
+        "[ASYNC DELEGATION COMPLETE child=one]",
+        "[ASYNC DELEGATION BATCH COMPLETE children=two]",
+    ]
+    for form in forms:
+        messages = [{"role": "user", "content": TASK}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": form}]
+        assert ContextCompressor._has_autonomous_completion_chain(messages)
+        assert not _is_real_user_message(messages[-1])
+    human = {"role": "user", "content": "Please explain [ASYNC DELEGATION COMPLETE child=one] in the logs."}
+    assert _is_real_user_message(human)
+
+
+def test_structured_human_task_has_deterministic_model_visible_contract():
+    content = [
+        {"type": "text", "text": "first line λ"},
+        {"type": "text", "text": "second </active-task> line"},
+    ]
+    messages = [
+        {"role": "user", "content": content},
+        {"role": "assistant", "content": "working"},
+        {"role": "user", "content": "[ASYNC DELEGATION COMPLETE child=x]"},
+    ]
+    contract = ContextCompressor._active_task_contract(messages)
+    assert contract["content"] == "first line λ\nsecond </active-task> line"
+    visible = ContextCompressor.make_active_task_contract_message(contract)
+    assert ContextCompressor.parse_active_task_contract(visible) == contract
+
+
+def test_contract_parser_rejects_tampering_and_metadata_disagreement():
+    contract = {"content": "Unicode λ\nline </active-task>", "sha256": ""}
+    contract["sha256"] = hashlib.sha256(contract["content"].encode()).hexdigest()
+    valid = ContextCompressor.make_active_task_contract_message(contract)
+    assert ContextCompressor.parse_active_task_contract(valid) == contract
+    payload = json.loads(valid["content"][len(ACTIVE_TASK_CONTRACT_PREFIX):])
+    variants = [
+        "{malformed",
+        json.dumps({**payload, "type": "wrong"}),
+        json.dumps({**payload, "version": ACTIVE_TASK_CONTRACT_VERSION + 1}),
+        json.dumps({**payload, "instruction": "tampered"}),
+        json.dumps({**payload, "content": payload["content"] + "!"}),
+    ]
+    for encoded in variants:
+        message = {"role": "user", "content": ACTIVE_TASK_CONTRACT_PREFIX + encoded}
+        assert ContextCompressor.parse_active_task_contract(message) is None
+    disagreeing = dict(valid)
+    disagreeing["_active_task_contract"] = {"content": "other", "sha256": "x"}
+    assert ContextCompressor.parse_active_task_contract(disagreeing) is None
+    assert payload["type"] == ACTIVE_TASK_CONTRACT_TYPE
+    assert payload["instruction"] == ACTIVE_TASK_CONTRACT_INSTRUCTION
+
+
+def test_contract_refresh_requires_summary_and_removes_stale_bridges():
+    original = [
+        {"role": "user", "content": TASK},
+        {"role": "assistant", "content": "working"},
+        {"role": "user", "content": "[ASYNC DELEGATION COMPLETE child=x]"},
+    ]
+    compressed = [{"role": "assistant", "content": "tail"}]
+    _refresh_active_task_contract(original, compressed)
+    _ensure_compressed_has_user_turn(original, compressed)
+    assert not _contracts(compressed)
+    assert any(_is_real_user_message(m) and m.get("content") == TASK for m in compressed)
+
+    summary = {
+        "role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] summary",
+        COMPRESSED_SUMMARY_METADATA_KEY: True,
+    }
+    compressed = [summary, {"role": "assistant", "content": "tail"}]
+    for _ in range(3):
+        _refresh_active_task_contract(original, compressed)
+    assert len(_contracts(compressed)) == 1
+    assert sum(bool(m.get("_active_task_contract_bridge")) for m in compressed) <= 2

@@ -64,6 +64,7 @@ class TestRunCompressContextWithProgressTimeout:
                 fence.finish_commit()
 
         warnings = []
+        telemetry_agent = type("Agent", (), {"_last_compression_outcome": "pending"})()
 
         result_msgs, result_prompt = run_compress_context_with_progress_timeout(
             worker=worker,
@@ -74,6 +75,7 @@ class TestRunCompressContextWithProgressTimeout:
             on_timeout=lambda idle, waited, since: warnings.append(
                 (idle, waited, since)
             ),
+            telemetry_agent=telemetry_agent,
         )
 
         assert started.wait(timeout=1)
@@ -88,9 +90,13 @@ class TestRunCompressContextWithProgressTimeout:
         assert result_msgs is original
         assert result_prompt == "fallback-prompt"
         assert warnings, "timeout callback should fire"
+        assert telemetry_agent._last_compression_outcome in {
+            "timed_out_inactivity", "timed_out_total_ceiling",
+        }
         assert not commit_attempted.is_set(), (
             "cancelled fence must block late session mutation"
         )
+        assert telemetry_agent._last_compression_outcome.startswith("timed_out_")
 
     def test_progress_extends_idle_budget_until_success(self):
         original = [{"role": "user", "content": "a"}]

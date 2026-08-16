@@ -888,6 +888,8 @@ def run_compress_context_with_progress_timeout(
     # without starting and stay eligible to run as a stale cancelled job when
     # a worker recovers. Fail fast: continue without compression this cycle.
     if not _try_admit_compression_job():
+        if telemetry_agent is not None:
+            telemetry_agent._last_compression_outcome = "rejected_pool_saturated"
         logger.warning(
             "Context compression pool saturated (%d workers busy) — "
             "refusing new compression this cycle and continuing without "
@@ -915,6 +917,12 @@ def run_compress_context_with_progress_timeout(
         # summary work so a stale job never burns an LLM call; its return
         # value is discarded by the already-departed host.
         if worker_fence.is_cancelled:
+            if (
+                telemetry_agent is not None
+                and getattr(telemetry_agent, "_last_compression_outcome", None)
+                == "pending"
+            ):
+                telemetry_agent._last_compression_outcome = "cancelled_before_start"
             logger.info(
                 "Skipping stale compression job: fence cancelled before start"
             )
@@ -1062,6 +1070,12 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        if telemetry_agent is not None:
+            telemetry_agent._last_compression_outcome = (
+                "timed_out_total_ceiling"
+                if waited >= ceiling
+                else "timed_out_inactivity"
+            )
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)
@@ -1924,6 +1938,8 @@ _SYNTHETIC_USER_PREFIXES = (
     "[System: Your previous tool call",
     "[Your active task list was preserved across context compression]",
     "[IMPORTANT: Background process ",
+    "[ASYNC DELEGATION COMPLETE ",
+    "[ASYNC DELEGATION BATCH COMPLETE ",
 )
 
 
@@ -2169,6 +2185,10 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
     compressed[:] = [
         message for message in compressed
         if not _is_active_task_contract_message(message)
+        and not (
+            isinstance(message, dict)
+            and message.get("_active_task_contract_bridge")
+        )
     ]
     if contract is None or not ContextCompressor._has_autonomous_completion_chain(
         original_messages
@@ -2181,6 +2201,11 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
         ),
         -1,
     )
+    if summary_index < 0:
+        # A contract is meaningful only relative to the authoritative
+        # reference-only summary boundary. Fail closed: _ensure_compressed_has_user_turn
+        # will preserve the genuine human anchor instead.
+        return
     insert_at = summary_index + 1
     # A contract is deliberately its own user turn. Add bounded assistant
     # bridges only where a strict role template would otherwise see user/user.
@@ -2346,6 +2371,15 @@ def compress_context(
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
     agent._last_compression_outcome = "pending"
+    def _set_compression_outcome(value: str) -> None:
+        """Publish an inner outcome without overwriting an outer terminal one."""
+        current = getattr(agent, "_last_compression_outcome", None)
+        if isinstance(current, str) and current.startswith((
+            "timed_out_", "cancelled_host", "wrapper_exception_",
+            "rejected_pool_saturated",
+        )):
+            return
+        agent._last_compression_outcome = value
     agent._last_compaction_in_place = False
     # Clear the lock-skip signal at the VERY TOP, before the codex route and
     # the breaker gates below can early-return (per-attempt state rule,
@@ -2390,7 +2424,7 @@ def compress_context(
                 existing_prompt = getattr(agent, "_cached_system_prompt", None)
                 if not existing_prompt:
                     existing_prompt = agent._build_system_prompt(system_message)
-                agent._last_compression_outcome = "cancelled_commit_fence"
+                _set_compression_outcome("cancelled_commit_fence")
                 return messages, existing_prompt
         try:
             return _compress_context_via_codex_app_server(
@@ -2609,7 +2643,7 @@ def compress_context(
                         split_status="aborted",
                         failure_class="commit_fence_cancelled",
                     )
-                    agent._last_compression_outcome = "cancelled_commit_fence"
+                    _set_compression_outcome("cancelled_commit_fence")
                     _complete_compaction_lifecycle()
                     return messages, _existing_sp
             try:
@@ -2756,7 +2790,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class="commit_fence_cancelled",
             )
-            agent._last_compression_outcome = "cancelled_commit_fence"
+            _set_compression_outcome("cancelled_commit_fence")
             _release_lock()
             return messages, _existing_sp
 
@@ -3013,7 +3047,21 @@ def compress_context(
                 )
 
         messages_before_compression = copy.deepcopy(messages)
-        _system_prompt_before_compression = getattr(agent, "_cached_system_prompt", None)
+        # Snapshot the exact request prompt before any compression hook can
+        # invalidate or rebuild prompt state. An uncached request would build
+        # this same prompt on its normal request path; sizing against "" would
+        # overstate reclaim and admit marginal candidates.
+        _cached_prompt_before_compression = getattr(
+            agent, "_cached_system_prompt", None
+        )
+        _cached_static_before_compression = getattr(
+            agent, "_cached_system_prompt_static", None
+        )
+        _system_prompt_before_compression = _cached_prompt_before_compression
+        if _system_prompt_before_compression is None:
+            _system_prompt_before_compression = agent._build_system_prompt(
+                system_message
+            )
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -3284,7 +3332,7 @@ def compress_context(
                     agent.session_id or "none",
                 )
                 agent._last_compaction_in_place = False
-                agent._last_compression_outcome = "cancelled_commit_fence"
+                _set_compression_outcome("cancelled_commit_fence")
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
                     _existing_sp = agent._build_system_prompt(system_message)
@@ -3424,6 +3472,73 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        # Request-size admission precedes every persistence and boundary side
+        # effect. Both sides use the identical tool schema and their exact
+        # system prompt bytes.
+        _request_in = estimate_request_tokens_rough(
+            messages,
+            system_prompt=_system_prompt_before_compression,
+            tools=agent.tools or None,
+        )
+        _request_out = estimate_request_tokens_rough(
+            compressed,
+            system_prompt=new_system_prompt or "",
+            tools=agent.tools or None,
+        )
+        _threshold = int(
+            getattr(agent.context_compressor, "threshold_tokens", 0) or 0
+        )
+        _minimum_reclaim = max(4_096, int(_threshold * 0.05))
+        _reclaimed = _request_in - _request_out
+        _rejection = None
+        if _request_out > _request_in:
+            _rejection = "would_grow"
+        elif _request_out == _request_in:
+            _rejection = "no_progress"
+        elif _reclaimed < _minimum_reclaim:
+            _rejection = "below_minimum_reclaim"
+        if _rejection is not None:
+            logger.warning(
+                "Compression refused (%s): transcript did not materially "
+                "shrink (session=%s, ~%s -> ~%s tokens, minimum reclaim "
+                "~%s); keeping the original transcript unchanged",
+                _rejection,
+                agent.session_id or "none",
+                f"{_request_in:,}",
+                f"{_request_out:,}",
+                f"{_minimum_reclaim:,}",
+            )
+            try:
+                agent._emit_warning(
+                    "⚠️ Compression refused because it did not materially "
+                    "shrink the conversation. No messages were dropped — "
+                    "conversation continues unchanged."
+                )
+            except Exception:
+                pass
+            # Invalidation/rebuild is speculative until admission. Restore
+            # both cache tiers byte-for-byte on every policy rejection.
+            agent._cached_system_prompt = _cached_prompt_before_compression
+            agent._cached_system_prompt_static = _cached_static_before_compression
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class=_rejection,
+            )
+            agent._last_compression_outcome = f"rejected_{_rejection}"
+            if not force and rejection_cooldown_seconds is not None:
+                _record_rejection = getattr(
+                    agent.context_compressor,
+                    "_record_compression_failure_cooldown",
+                    None,
+                )
+                if callable(_record_rejection):
+                    _record_rejection(rejection_cooldown_seconds, _rejection)
+            _release_lock()
+            return messages, _system_prompt_before_compression
+
         _session_commit_succeeded = False
         split_status = "not_applicable"
         if agent._session_db:
@@ -3434,86 +3549,6 @@ def compress_context(
                 # conversation's pre-compaction turns are about to be summarized
                 # away regardless of whether the id rotates).
                 agent.commit_memory_session(messages)
-
-                # Anti-growth guard at the COMMIT SITE: never persist a
-                # compression that makes the transcript larger (observed:
-                # 379K -> 687K when the generated summary plus retained
-                # reasoning exceeded what it replaced). Compare like-for-like
-                # (both rough estimates of the same message shape) so an
-                # "actual vs estimate" measurement mismatch cannot produce a
-                # false verdict. The gateway has a rotation-path-only guard
-                # (#83339), but in-place compaction commits inside this method
-                # via archive_and_compact — before the gateway can inspect the
-                # result — so the guard must live here to protect both paths.
-                # On growth, treat the attempt as a no-op: the original
-                # transcript stays untouched and durable.
-                _rough_in = estimate_messages_tokens_rough(messages)
-                _rough_out = estimate_messages_tokens_rough(compressed)
-                _request_in = estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=_system_prompt_before_compression or "",
-                    tools=agent.tools or None,
-                )
-                _request_out = estimate_request_tokens_rough(
-                    compressed,
-                    system_prompt=new_system_prompt or "",
-                    tools=agent.tools or None,
-                )
-                _threshold = int(
-                    getattr(agent.context_compressor, "threshold_tokens", 0) or 0
-                )
-                _minimum_reclaim = max(4_096, int(_threshold * 0.05))
-                _reclaimed = _request_in - _request_out
-                _rejection = None
-                if _request_out > _request_in:
-                    _rejection = "would_grow"
-                elif _request_out == _request_in:
-                    _rejection = "no_progress"
-                elif _reclaimed < _minimum_reclaim:
-                    _rejection = "below_minimum_reclaim"
-                if _rejection is not None:
-                    logger.warning(
-                        "Compression refused (%s): transcript did not materially "
-                        "shrink (session=%s, ~%s -> ~%s tokens, minimum reclaim "
-                        "~%s); keeping the original transcript unchanged",
-                        _rejection,
-                        agent.session_id or "none",
-                        f"{_request_in:,}",
-                        f"{_request_out:,}",
-                        f"{_minimum_reclaim:,}",
-                    )
-                    try:
-                        agent._emit_warning(
-                            "⚠️ Compression refused because it did not materially "
-                            "shrink the conversation. No messages were dropped — "
-                            "conversation continues unchanged."
-                        )
-                    except Exception:
-                        pass
-                    _existing_sp = getattr(agent, "_cached_system_prompt", None)
-                    if _system_prompt_before_compression is not None:
-                        _existing_sp = _system_prompt_before_compression
-                        agent._cached_system_prompt = _system_prompt_before_compression
-                    elif not _existing_sp:
-                        _existing_sp = agent._build_system_prompt(system_message)
-                    _emit_compression_attempt_telemetry(
-                        agent,
-                        started_at=_attempt_started_at,
-                        commit_status="aborted",
-                        split_status="aborted",
-                        failure_class=_rejection,
-                    )
-                    agent._last_compression_outcome = f"rejected_{_rejection}"
-                    if not force and rejection_cooldown_seconds is not None:
-                        _record_rejection = getattr(
-                            agent.context_compressor,
-                            "_record_compression_failure_cooldown",
-                            None,
-                        )
-                        if callable(_record_rejection):
-                            _record_rejection(rejection_cooldown_seconds, _rejection)
-                    _release_lock()
-                    return messages, _existing_sp
 
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────

@@ -349,6 +349,7 @@ class TestF6ExecutorSaturation:
             cc.logger.addHandler(capture)
             cc.logger.setLevel(_logging.DEBUG)
             t0 = time.monotonic()
+            telemetry_agent = _TelemetryAgent()
             try:
                 msgs, prompt = run_compress_context_with_progress_timeout(
                     worker=fifth_worker,
@@ -356,7 +357,7 @@ class TestF6ExecutorSaturation:
                     system_prompt_fallback="fifth-fallback",
                     idle_timeout_seconds=5.0,
                     total_ceiling_seconds=5.0,
-                    telemetry_agent=_TelemetryAgent(),
+                    telemetry_agent=telemetry_agent,
                 )
             finally:
                 cc.logger.removeHandler(capture)
@@ -370,6 +371,9 @@ class TestF6ExecutorSaturation:
             assert msgs is fifth_msgs
             assert prompt == "fifth-fallback"
             assert not fifth_ran.is_set()
+            assert telemetry_agent._last_compression_outcome == (
+                "rejected_pool_saturated"
+            )
             saturated = [
                 p for p in capture.payloads
                 if p.get("failure_class") == "pool_saturated"

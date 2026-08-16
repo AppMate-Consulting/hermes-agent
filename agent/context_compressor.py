@@ -151,6 +151,12 @@ COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 ACTIVE_TASK_CONTRACT_METADATA_KEY = "_active_task_contract"
 ACTIVE_TASK_CONTRACT_PREFIX = "[ACTIVE_TASK_CONTRACT] "
+ACTIVE_TASK_CONTRACT_TYPE = "active_task_contract"
+ACTIVE_TASK_CONTRACT_VERSION = 1
+ACTIVE_TASK_CONTRACT_INSTRUCTION = (
+    "The exact human task encoded in content remains active until a later real "
+    "human user message overrides it. Continue that task now."
+)
 # Distinguishes rolling micro-compaction markers from batch-compaction
 # markers (both carry COMPRESSED_SUMMARY_METADATA_KEY so resume/handoff
 # treat them alike). Supersede/defrag/rehydration must only ever touch
@@ -180,6 +186,18 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "without calling any more tools."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
+_AUTONOMOUS_COMPLETION_NOTIFICATION_PREFIXES = (
+    _BACKGROUND_PROCESS_NOTIFICATION_PREFIX,
+    "[ASYNC DELEGATION COMPLETE ",
+    "[ASYNC DELEGATION BATCH COMPLETE ",
+)
+
+
+def _is_autonomous_completion_notification(text: Any) -> bool:
+    """Recognize only Hermes-owned completion wrappers at content start."""
+    return isinstance(text, str) and text.startswith(
+        _AUTONOMOUS_COMPLETION_NOTIFICATION_PREFIXES
+    )
 
 
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -4621,9 +4639,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _EMPTY_TOOL_RESPONSE_NUDGE,
             _LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
-        } or text.startswith(
-            _BACKGROUND_PROCESS_NOTIFICATION_PREFIX
-        ) or text.startswith(
+        } or _is_autonomous_completion_notification(text) or text.startswith(
             TODO_INJECTION_HEADER + "\n"
         ) or text.startswith(
             _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX
@@ -4802,8 +4818,8 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         for message in reversed(messages):
             if message.get("role") == "user" and _is_real_user_message(message):
-                content = message.get("content")
-                if isinstance(content, str) and content:
+                content = _content_text_for_contains(message.get("content"))
+                if content:
                     return {
                         "content": content,
                         "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
@@ -4826,25 +4842,35 @@ This compaction should PRIORITISE preserving all information related to the focu
             payload = json.loads(text[len(ACTIVE_TASK_CONTRACT_PREFIX):])
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
-        content = payload.get("content") if isinstance(payload, dict) else None
-        digest = payload.get("sha256") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") != ACTIVE_TASK_CONTRACT_TYPE:
+            return None
+        if payload.get("version") != ACTIVE_TASK_CONTRACT_VERSION:
+            return None
+        if payload.get("instruction") != ACTIVE_TASK_CONTRACT_INSTRUCTION:
+            return None
+        content = payload.get("content")
+        digest = payload.get("sha256")
         if not isinstance(content, str) or not isinstance(digest, str):
             return None
         actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        return {"content": content, "sha256": digest} if digest == actual else None
+        contract = {"content": content, "sha256": digest}
+        metadata = message.get(ACTIVE_TASK_CONTRACT_METADATA_KEY)
+        if metadata is not None and metadata != contract:
+            return None
+        return contract if digest == actual else None
 
     @classmethod
     def make_active_task_contract_message(cls, contract: dict) -> dict:
         """Build one model-visible authoritative synthetic user turn."""
         payload = json.dumps(
             {
-                "type": "active_task_contract",
+                "type": ACTIVE_TASK_CONTRACT_TYPE,
+                "version": ACTIVE_TASK_CONTRACT_VERSION,
                 "content": contract["content"],
                 "sha256": contract["sha256"],
-                "instruction": (
-                    "The exact human task encoded in content remains active until "
-                    "a later real human user message overrides it. Continue that task now."
-                ),
+                "instruction": ACTIVE_TASK_CONTRACT_INSTRUCTION,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -4867,8 +4893,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         start = latest_real + 1 if latest_real >= 0 else 0
         return (latest_real >= 0 or cls._active_task_contract(messages) is not None) and any(
             cls._is_synthetic_compression_user_turn(message)
-            and _content_text_for_contains(message.get("content")).startswith(
-                _BACKGROUND_PROCESS_NOTIFICATION_PREFIX
+            and _is_autonomous_completion_notification(
+                _content_text_for_contains(message.get("content"))
             )
             for message in messages[start:]
         )

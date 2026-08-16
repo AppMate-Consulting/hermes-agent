@@ -4853,7 +4853,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         ):
             return False
         completion = messages[index]
-        return (
+        exact_sequence = (
             completion.get("role") == "user"
             and _is_autonomous_completion_notification(
                 _content_text_for_contains(completion.get("content")).strip()
@@ -4862,6 +4862,35 @@ This compaction should PRIORITISE preserving all information related to the focu
             and messages[index - 2].get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER
             and messages[index - 1].get("role") == "assistant"
             and messages[index - 1].get("content") == AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT
+        )
+        if not exact_sequence:
+            return False
+        # Live runtime rows carry both bridge flags and an explicitly typed
+        # completion wrapper.  SessionDB projection intentionally strips the
+        # underscore flags, so the same exact three-row sequence is the
+        # durable fallback.  A partially flagged/live lookalike fails closed.
+        bridge_flags = (
+            messages[index - 2].get("_autonomous_completion_bridge") is True
+            and messages[index - 1].get("_autonomous_completion_bridge") is True
+        )
+        projected = (
+            "_autonomous_completion_bridge" not in messages[index - 2]
+            and "_autonomous_completion_bridge" not in messages[index - 1]
+        )
+        runtime_typed = completion.get("display_kind") == "internal_notification"
+        return (bridge_flags and runtime_typed) or projected
+
+    @classmethod
+    def _bridge_user_has_durable_provenance(
+        cls, messages: List[Dict[str, Any]], index: int
+    ) -> bool:
+        """Recognize a reserved user bridge only through its full sequence."""
+        return (
+            0 <= index < len(messages)
+            and index + 2 < len(messages)
+            and isinstance(messages[index], dict)
+            and messages[index].get("role") == "user"
+            and cls._completion_has_durable_provenance(messages, index + 2)
         )
 
     @classmethod
@@ -4922,16 +4951,13 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _has_autonomous_completion_chain(cls, messages: List[Dict[str, Any]]) -> bool:
         """Return whether process completions continue the current human task."""
-        from agent.conversation_compression import (
-            AUTONOMOUS_COMPLETION_BRIDGE_USER,
-            _is_real_user_message,
-        )
+        from agent.conversation_compression import _is_real_user_message
 
         latest_real = -1
         for idx, message in enumerate(messages):
             if message.get("role") != "user":
                 continue
-            if message.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER:
+            if cls._bridge_user_has_durable_provenance(messages, idx):
                 continue
             if cls._completion_has_durable_provenance(messages, idx):
                 continue

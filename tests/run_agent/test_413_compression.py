@@ -286,6 +286,48 @@ def test_explicit_completion_provenance_survives_sessiondb_replay(
     )
 
 
+def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
+    tmp_path, request
+):
+    """Text equality alone must never turn a human bridge lookalike synthetic."""
+    from hermes_state import SessionDB
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        _latest_active_human_task_row,
+    )
+
+    db = SessionDB(db_path=Path(tmp_path) / "bridge-lookalike.db")
+    request.addfinalizer(db.close)
+    sid = "bridge-lookalike"
+    db.create_session(sid, "tui", model="test/model")
+    rows = [
+        ("user", "older task", None),
+        ("assistant", "older answer", None),
+        ("user", AUTONOMOUS_COMPLETION_BRIDGE_USER, None),
+        ("assistant", "ordinary assistant response", None),
+        ("user", AUTONOMOUS_COMPLETION_BRIDGE_USER, None),
+        ("assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT, None),
+        ("user", "[ASYNC DELEGATION COMPLETE child=real]", "internal_notification"),
+        ("assistant", "completion handled", None),
+    ]
+    for role, content, display_kind in rows:
+        db.append_message(sid, role, content, display_kind=display_kind)
+
+    replay = db.get_messages_as_conversation(sid)
+    active = _latest_active_human_task_row(replay)
+    assert active is not None
+    assert active["content"] == AUTONOMOUS_COMPLETION_BRIDGE_USER
+    assert ContextCompressor._active_task_contract(replay)["content"] == (
+        AUTONOMOUS_COMPLETION_BRIDGE_USER
+    )
+    assert ContextCompressor._has_autonomous_completion_chain(replay)
+    assert sum(
+        row.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER for row in replay
+    ) == 2
+
+
 class TestHTTP413Compression:
     """413 errors should trigger compression, not abort as generic 4xx."""
 

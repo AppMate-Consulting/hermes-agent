@@ -2104,7 +2104,7 @@ def _latest_active_human_task_row(messages: list) -> Optional[dict]:
             continue
         if ContextCompressor._completion_has_durable_provenance(messages, index):
             continue
-        if message.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER:
+        if ContextCompressor._bridge_user_has_durable_provenance(messages, index):
             continue
         projected_contract = (
             index > 0
@@ -2579,7 +2579,12 @@ def compress_context(
     # feasibility probe, hook, prompt build, or engine can mutate caller-owned
     # state.  In particular, legacy engines are explicitly allowed to mutate
     # their input list and return that same object.
-    _input_messages_snapshot = copy.deepcopy(messages)
+    # The caller-owned snapshot is rollback state only.  Rotation can adopt a
+    # newer durable parent after lease acquisition; that adopted transcript
+    # must become the immutable input for every compression decision without
+    # changing what an aborted attempt restores to the caller.
+    _caller_messages = messages
+    _caller_rollback_snapshot = copy.deepcopy(messages)
     _missing_cache_field = object()
     _prompt_cache_snapshot = {
         name: vars(agent).get(name, _missing_cache_field)
@@ -2588,8 +2593,12 @@ def compress_context(
 
     def _restore_uncommitted_input() -> None:
         """Restore all caller-visible input state on a non-commit path."""
-        if messages != _input_messages_snapshot:
-            messages[:] = copy.deepcopy(_input_messages_snapshot)
+        nonlocal messages
+        if _caller_messages != _caller_rollback_snapshot:
+            _caller_messages[:] = copy.deepcopy(_caller_rollback_snapshot)
+        # Adoption rebinds the working transcript.  Abort paths must return
+        # the caller-owned object, not that speculative durable working copy.
+        messages = _caller_messages
         for name, value in _prompt_cache_snapshot.items():
             if value is _missing_cache_field:
                 vars(agent).pop(name, None)
@@ -3263,7 +3272,13 @@ def compress_context(
                     engine_name,
                 )
 
-        messages_before_compression = copy.deepcopy(_input_messages_snapshot)
+        # Freeze only after the lease-time durable-parent adoption.  Engines
+        # may mutate their argument, so all later comparisons, admission,
+        # task restoration and post-commit callbacks use this deep copy.
+        _authoritative_pre_compression_snapshot = copy.deepcopy(messages)
+        messages_before_compression = copy.deepcopy(
+            _authoritative_pre_compression_snapshot
+        )
         # Snapshot the exact request prompt before any compression hook can
         # invalidate or rebuild prompt state. An uncached request would build
         # this same prompt on its normal request path; sizing against "" would
@@ -3632,8 +3647,12 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
-        _refresh_active_task_contract(_input_messages_snapshot, compressed)
-        _ensure_compressed_has_user_turn(_input_messages_snapshot, compressed)
+        _refresh_active_task_contract(
+            _authoritative_pre_compression_snapshot, compressed
+        )
+        _ensure_compressed_has_user_turn(
+            _authoritative_pre_compression_snapshot, compressed
+        )
 
         cached_system_prompt = getattr(agent, "_cached_system_prompt", None)
         agent._invalidate_system_prompt()
@@ -3676,7 +3695,7 @@ def compress_context(
         # effect. Both sides use the identical tool schema and their exact
         # system prompt bytes.
         _request_in = estimate_request_tokens_rough(
-            _input_messages_snapshot,
+            _authoritative_pre_compression_snapshot,
             system_prompt=_system_prompt_before_compression,
             tools=agent.tools or None,
         )
@@ -4039,14 +4058,16 @@ def compress_context(
         if agent._memory_manager:
             try:
                 _maybe_ctx = agent._memory_manager.on_pre_compress(
-                    copy.deepcopy(_input_messages_snapshot)
+                    copy.deepcopy(_authoritative_pre_compression_snapshot)
                 )
                 if isinstance(_maybe_ctx, str):
                     sanitize_memory_context(_maybe_ctx)
             except Exception:
                 logger.debug("memory on_pre_compress callback failed", exc_info=True)
         try:
-            agent.commit_memory_session(copy.deepcopy(_input_messages_snapshot))
+            agent.commit_memory_session(
+                copy.deepcopy(_authoritative_pre_compression_snapshot)
+            )
         except Exception:
             logger.debug("memory boundary extraction failed", exc_info=True)
 

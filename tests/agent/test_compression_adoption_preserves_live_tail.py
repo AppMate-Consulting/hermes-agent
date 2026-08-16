@@ -25,6 +25,7 @@ summarizer instead.
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -32,6 +33,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_state import SessionDB
+
+
+def _assert_role_alternation(rows):
+    roles = [row.get("role") for row in rows]
+    assert all(left != right for left, right in zip(roles, roles[1:]))
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str):
@@ -210,3 +216,108 @@ def test_adoption_skipped_when_preflush_fails_keeps_live_input(
         "dropped from the summary. "
         f"Compress input contents: {_contents(compress_input)!r}"
     )
+
+
+def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
+    tmp_path: Path,
+) -> None:
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
+
+    db = SessionDB(db_path=tmp_path / "authoritative.db")
+    sid = "AUTHORITATIVE_PARENT"
+    db.create_session(sid, source="desktop")
+    db.append_message(sid, "user", "stale caller task")
+    db.append_message(sid, "assistant", "stale answer")
+    caller = db.get_messages_as_conversation(sid)
+    db.append_message(sid, "user", "NEWER AUTHORITATIVE TASK")
+    db.append_message(sid, "assistant", "task running")
+    db.append_message(sid, "user", AUTONOMOUS_COMPLETION_BRIDGE_USER)
+    db.append_message(sid, "assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT)
+    db.append_message(
+        sid, "user", "[ASYNC DELEGATION COMPLETE child=durable]",
+        display_kind="internal_notification",
+    )
+    db.append_message(sid, "assistant", "runtime completion handled")
+
+    agent = _build_agent_with_db(db, sid)
+    seen_engine = []
+    agent.context_compressor.compress.side_effect = lambda rows, **_kw: (
+        seen_engine.append(copy.deepcopy(rows))
+        or [{"role": "assistant", "content": "[CONTEXT COMPACTION] summary"}]
+    )
+    memory_seen = []
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.on_pre_compress.side_effect = (
+        lambda rows: memory_seen.append(("pre", rows)) or ""
+    )
+    agent.commit_memory_session = lambda rows: memory_seen.append(("commit", rows))
+    estimates = []
+
+    def _estimate(rows, **_kw):
+        estimates.append(copy.deepcopy(rows))
+        return 20_000 if len(estimates) == 1 else 1_000
+
+    with patch("agent.conversation_compression.estimate_request_tokens_rough", _estimate):
+        compressed, _ = agent._compress_context(caller, "sys", approx_tokens=1)
+
+    adopted = seen_engine[0]
+    assert _contents(adopted)[-6:] == [
+        "NEWER AUTHORITATIVE TASK", "task running",
+        AUTONOMOUS_COMPLETION_BRIDGE_USER, AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        "[ASYNC DELEGATION COMPLETE child=durable]", "runtime completion handled",
+    ]
+    assert estimates[0] == adopted
+    assert all(snapshot == adopted for _, snapshot in memory_seen)
+    assert all(snapshot is not adopted for _, snapshot in memory_seen)
+    assert any(row.get("content") == "NEWER AUTHORITATIVE TASK" for row in compressed)
+    assert not any(row.get("content") == "stale caller task" for row in compressed)
+    parent = db.get_messages_as_conversation(sid, include_inactive=True)
+    child = db.get_messages_as_conversation(agent.session_id)
+    assert len(parent) == 8 and child
+    assert agent._persist_user_message_idx == len(adopted)
+    _assert_role_alternation(parent)
+    _assert_role_alternation(child)
+
+
+def test_rotation_publication_failure_keeps_real_parent_preflush_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "publication-failure.db")
+    sid = "PUBLICATION_FAILURE_PARENT"
+    db.create_session(sid, source="desktop")
+    db.append_message(sid, "user", "durable task")
+    db.append_message(sid, "assistant", "durable answer")
+    messages = db.get_messages_as_conversation(sid)
+    messages.append({"role": "user", "content": "ordinary live tail"})
+    original = copy.deepcopy(messages)
+    agent = _build_agent_with_db(db, sid)
+    agent._persist_user_message_idx = 2
+    agent._cached_system_prompt = "cached prompt"
+    agent._cached_system_prompt_static = "cached static"
+    agent._memory_manager = MagicMock()
+    agent.commit_memory_session = MagicMock()
+
+    with (
+        patch.object(
+            db, "publish_compression_child", side_effect=RuntimeError("forced publish failure")
+        ),
+        patch(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            side_effect=[20_000, 1_000],
+        ),
+    ):
+        returned, prompt = agent._compress_context(messages, "sys", approx_tokens=1)
+
+    assert returned == original and messages == original
+    assert prompt == "cached prompt"
+    assert agent.session_id == sid
+    assert _contents(db.get_messages_as_conversation(sid, include_inactive=True)) == [
+        "durable task", "durable answer", "ordinary live tail",
+    ]
+    assert agent._cached_system_prompt == "cached prompt"
+    assert agent._cached_system_prompt_static == "cached static"
+    agent._memory_manager.on_pre_compress.assert_not_called()
+    agent.commit_memory_session.assert_not_called()

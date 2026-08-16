@@ -8,6 +8,7 @@ fi
 
 "$python_bin" -m pytest \
   tests/agent/test_compaction_anti_thrash.py \
+  tests/agent/test_completion_chain_compaction.py \
   tests/agent/test_compression_anti_thrash_persistence.py \
   tests/agent/test_compression_anti_thrash_recovery.py \
   tests/gateway/test_buzz_adapter.py \

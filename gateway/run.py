@@ -19118,6 +19118,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_in_place = bool(
                                         getattr(_hyg_agent, "_last_compaction_in_place", False)
                                     )
+                                    _hyg_outcome = getattr(
+                                        _hyg_agent, "_last_compression_outcome", None
+                                    )
                                     # Anti-growth guard: refuse a compression
                                     # that did not shrink the transcript
                                     # (observed: 427K -> 598K). Compare
@@ -19221,19 +19224,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _new_tokens = _approx_tokens
                                         logger.warning(
                                             "Gateway hygiene compression for session %s "
-                                            "did not rotate or compact in place "
-                                            "(no session_db on the hygiene agent) — "
-                                            "preserving the original transcript instead "
-                                            "of overwriting it with the summary (#21301).",
+                                            "did not commit (outcome=%s) — preserving "
+                                            "the original transcript instead of "
+                                            "overwriting it with the summary (#21301).",
                                             session_entry.session_id,
+                                            _hyg_outcome or "persistence_failure",
                                         )
 
-                                    logger.info(
-                                        "Session hygiene: compressed %s → %s msgs, "
-                                        "~%s → ~%s tokens",
-                                        _msg_count, _new_count,
-                                        f"{_approx_tokens:,}", f"{_new_tokens:,}",
-                                    )
+                                    if _hyg_outcome == "committed_materially_shrunk":
+                                        logger.info(
+                                            "Session hygiene: compressed %s → %s msgs, "
+                                            "~%s → ~%s tokens",
+                                            _msg_count, _new_count,
+                                            f"{_approx_tokens:,}", f"{_new_tokens:,}",
+                                        )
 
                                     if _new_tokens >= _warn_token_threshold:
                                         logger.warning(
@@ -19255,6 +19259,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_aborted = _comp is not None and getattr(
                                         _comp, "_last_compress_aborted", False
                                     )
+                                    _hyg_rejected = _hyg_outcome in {
+                                        "rejected_no_progress",
+                                        "rejected_would_grow",
+                                        "rejected_below_minimum_reclaim",
+                                    }
+                                    if _hyg_rejected and _hyg_failure_cooldown_seconds >= 0:
+                                        _record_hygiene_cooldown(
+                                            self,
+                                            session_entry.session_id,
+                                            _hygiene_cooldown_for_failure(
+                                                self, session_key,
+                                                _hyg_failure_cooldown_seconds,
+                                            ),
+                                            _hyg_outcome.removeprefix("rejected_"),
+                                        )
                                     if not _hyg_aborted:
                                         # Recovery decision lives in the
                                         # extracted, unit-tested predicate — the

@@ -58,6 +58,14 @@ def _seed(db, sid, title, n=8):
         )
 
 
+def _materially_compressible_messages(n=8):
+    """Input whose like-for-like estimate can reclaim the 4K token floor."""
+    return [
+        {"role": "user", "content": f"m{i} " + ("payload " * 3_000)}
+        for i in range(n)
+    ]
+
+
 class TestInPlaceCompaction:
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
@@ -71,7 +79,7 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _materially_compressible_messages()
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -134,7 +142,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _materially_compressible_messages()
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -178,7 +186,7 @@ class TestRotationFallbackWhenFlagOff:
             agent = _make_agent(db, sid, in_place=False)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _materially_compressible_messages()
             compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -273,7 +281,7 @@ class TestInPlaceAntiGrowthGuard:
                 ]
 
             agent.context_compressor.compress = _growing_compress
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _materially_compressible_messages()
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -306,7 +314,7 @@ class TestInPlaceAntiGrowthGuard:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = _materially_compressible_messages()
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )

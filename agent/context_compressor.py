@@ -149,6 +149,12 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 # "is_compressed_summary" would reach the wire and trip exactly that.
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
+ACTIVE_TASK_CONTRACT_METADATA_KEY = "_active_task_contract"
+_ACTIVE_TASK_CONTRACT_RE = re.compile(
+    r"\n?## Active Human Task Contract\n"
+    r"SHA256: ([0-9a-f]{64})\n<active-task>\n(.*?)\n</active-task>\n?",
+    re.DOTALL,
+)
 # Distinguishes rolling micro-compaction markers from batch-compaction
 # markers (both carry COMPRESSED_SUMMARY_METADATA_KEY so resume/handoff
 # treat them alike). Supersede/defrag/rehydration must only ever touch
@@ -4794,6 +4800,65 @@ This compaction should PRIORITISE preserving all information related to the focu
         return None
 
     @classmethod
+    def _active_task_contract(cls, messages: List[Dict[str, Any]]) -> Optional[dict]:
+        """Return the latest real human task, including across compactions."""
+        from agent.conversation_compression import _is_real_user_message
+
+        for message in reversed(messages):
+            if message.get("role") == "user" and _is_real_user_message(message):
+                content = message.get("content")
+                if isinstance(content, str) and content:
+                    return {
+                        "content": content,
+                        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    }
+        for message in reversed(messages):
+            contract = message.get(ACTIVE_TASK_CONTRACT_METADATA_KEY)
+            if isinstance(contract, dict) and isinstance(contract.get("content"), str):
+                content = contract["content"]
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if contract.get("sha256") == digest:
+                    return {"content": content, "sha256": digest}
+            match = _ACTIVE_TASK_CONTRACT_RE.search(
+                _content_text_for_contains(message.get("content"))
+            )
+            if match:
+                content = match.group(2)
+                if hashlib.sha256(content.encode("utf-8")).hexdigest() == match.group(1):
+                    return {"content": content, "sha256": match.group(1)}
+        return None
+
+    @classmethod
+    def _refresh_active_task_contract(cls, summary: str, contract: Optional[dict]) -> str:
+        """Replace (never stack) the deterministic active-task marker."""
+        summary = _ACTIVE_TASK_CONTRACT_RE.sub("\n", summary).rstrip()
+        if not contract:
+            return summary
+        return (
+            f"{summary}\n\n## Active Human Task Contract\n"
+            f"SHA256: {contract['sha256']}\n<active-task>\n"
+            f"{contract['content']}\n</active-task>"
+        )
+
+    @classmethod
+    def _has_autonomous_completion_chain(cls, messages: List[Dict[str, Any]]) -> bool:
+        """Return whether process completions continue the current human task."""
+        from agent.conversation_compression import _is_real_user_message
+
+        latest_real = -1
+        for idx, message in enumerate(messages):
+            if message.get("role") == "user" and _is_real_user_message(message):
+                latest_real = idx
+        start = latest_real + 1 if latest_real >= 0 else 0
+        return (latest_real >= 0 or cls._active_task_contract(messages) is not None) and any(
+            cls._is_synthetic_compression_user_turn(message)
+            and _content_text_for_contains(message.get("content")).startswith(
+                _BACKGROUND_PROCESS_NOTIFICATION_PREFIX
+            )
+            for message in messages[start:]
+        )
+
+    @classmethod
     def _ground_historical_task_snapshot(
         cls,
         summary: str,
@@ -5609,7 +5674,8 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Ensure the most recent user message is always in the tail so the
         # active task is never lost to compression (fixes #10896).
-        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+        if not self._has_autonomous_completion_chain(messages):
+            cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
 
         # Ensure the most recent assistant message is always in the tail
         # so the previously-visible reply isn't silently rolled into the
@@ -6592,6 +6658,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             return messages
 
         turns_to_summarize = messages[compress_start:compress_end]
+        active_task_contract = (
+            self._active_task_contract(messages)
+            if self._has_autonomous_completion_chain(messages)
+            else None
+        )
         # Snapshot the rehydration state so an aborted attempt below can roll
         # it back. The self-heal scan mutates ``_previous_summary`` (populating
         # it from a fossil, or discarding a stale cross-session one); if
@@ -7092,6 +7163,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # summary text as their own output (#33256). In both cases, append
         # the explicit end marker so the model has a clear "summary ends
         # here, respond to the message below" signal.
+        summary = self._refresh_active_task_contract(summary, active_task_contract)
+
         if not _merge_summary_into_tail:
             summary = summary + "\n\n" + _SUMMARY_END_MARKER
 
@@ -7103,6 +7176,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(
                     self._summary_has_user_turn
                 ),
+                ACTIVE_TASK_CONTRACT_METADATA_KEY: active_task_contract,
             })
 
         # Default merge target: literal tail index 0. For an ordinary
@@ -7164,6 +7238,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 msg[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = bool(
                     self._summary_has_user_turn
                 )
+                msg[ACTIVE_TASK_CONTRACT_METADATA_KEY] = active_task_contract
                 # Content rewritten → the api_content sidecar (exact bytes
                 # previously sent) is stale; drop it so replay can't resend
                 # the pre-merge bytes without the summary.

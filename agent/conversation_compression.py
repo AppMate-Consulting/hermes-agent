@@ -2263,6 +2263,45 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
     def _role(msg: Any) -> Optional[str]:
         return msg.get("role") if isinstance(msg, dict) else None
 
+    if isinstance(anchor.get("content"), list):
+        anchor_content = anchor.get("content")
+        if any(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and message.get("content") == anchor_content
+            for message in messages
+        ):
+            return
+        if not messages:
+            messages.append(anchor)
+            return
+
+        trailing = messages[-1]
+        trailing_role = _role(trailing)
+        if trailing_role == "assistant" and not trailing.get("tool_calls"):
+            messages.append(anchor)
+            return
+
+        # A tool-call parent must remain adjacent to its results.  When the
+        # transcript ends at an unresolved parent, put the complete anchor
+        # sequence before that parent rather than between it and a future
+        # result.
+        insertion_index = len(messages)
+        if trailing_role == "assistant" and trailing.get("tool_calls"):
+            insertion_index -= 1
+        previous_role = (
+            _role(messages[insertion_index - 1]) if insertion_index else None
+        )
+        rows = [anchor]
+        if previous_role != "assistant":
+            rows.insert(0, {
+                "role": "assistant",
+                "content": PRESERVED_HUMAN_TASK_BRIDGE,
+                "_preserved_human_task_bridge": True,
+            })
+        messages[insertion_index:insertion_index] = rows
+        return
+
     # Preferred: the summary boundary — before the first assistant message
     # not already preceded by a user turn. The left neighbour is then
     # non-user by construction and the right neighbour is an assistant.
@@ -2285,16 +2324,6 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
     if ContextCompressor._is_context_summary_content(
         _message_text(messages[-1])
     ):
-        if isinstance(anchor.get("content"), list):
-            messages.extend([
-                {
-                    "role": "assistant",
-                    "content": PRESERVED_HUMAN_TASK_BRIDGE,
-                    "_preserved_human_task_bridge": True,
-                },
-                anchor,
-            ])
-            return
         # Never merge into a compaction summary: the summary prefix must
         # stay at the start of its message for downstream summary detection.
         # Appending after it makes the anchor "the latest user message after
@@ -2302,16 +2331,6 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
         # adjacent user turns are merged summary-first by
         # repair_message_sequence before the next API call.
         messages.append(anchor)
-        return
-    if isinstance(anchor.get("content"), list):
-        messages.extend([
-            {
-                "role": "assistant",
-                "content": PRESERVED_HUMAN_TASK_BRIDGE,
-                "_preserved_human_task_bridge": True,
-            },
-            anchor,
-        ])
         return
     # Trailing user-role scaffolding (e.g. the todo snapshot): merge instead
     # of inserting a consecutive same-role message (#55677 strict templates).

@@ -16,6 +16,7 @@ from agent.context_compressor import (
 from agent.conversation_compression import (
     ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
     ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+    PRESERVED_HUMAN_TASK_BRIDGE,
     _ensure_compressed_has_user_turn,
     _is_real_user_message,
     _refresh_active_task_contract,
@@ -267,6 +268,7 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
     db.close()
 
     archived_counts = []
+    preserved_bridge_counts = []
     for cycle in range(2):
         db = SessionDB(db_path=path)
         resumed = db.get_messages_as_conversation(sid)
@@ -283,26 +285,39 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
             _agent(db, sid), resumed, "sys", approx_tokens=100_000
         )
         durable = db.get_messages_as_conversation(sid)
-        exact = [m for m in durable if json.dumps(
-            {"role": m.get("role"), "content": m.get("content")},
-            ensure_ascii=False, separators=(",", ":"),
-        ) == exact_bytes]
-        assert len(exact) == 1
+        for persisted in (compacted, durable):
+            exact = [m for m in persisted if json.dumps(
+                {"role": m.get("role"), "content": m.get("content")},
+                ensure_ascii=False, separators=(",", ":"),
+            ) == exact_bytes]
+            assert len(exact) == 1
         assert not _contracts(durable)
-        roles = [m["role"] for m in durable]
-        assert all(a != b for a, b in zip(roles, roles[1:]))
+        for persisted in (compacted, durable):
+            roles = [m["role"] for m in persisted]
+            assert all(a != b for a, b in zip(roles, roles[1:]))
         calls = {
             call["id"] for m in durable for call in m.get("tool_calls", [])
+        }
+        results = {
+            m.get("tool_call_id") for m in durable if m.get("role") == "tool"
         }
         assert all(
             m.get("tool_call_id") in calls
             for m in durable if m.get("role") == "tool"
         )
+        assert calls <= results
         bridge_markers = [
             m for m in durable
-            if "HERMES_AUTONOMOUS_COMPLETION_BRIDGE" in str(m.get("content", ""))
+            if (
+                "HERMES_AUTONOMOUS_COMPLETION_BRIDGE"
+                in str(m.get("content", ""))
+                or m.get("content") == PRESERVED_HUMAN_TASK_BRIDGE
+            )
         ]
         assert len(bridge_markers) <= 3
+        preserved_bridge_counts.append(sum(
+            m.get("content") == PRESERVED_HUMAN_TASK_BRIDGE for m in durable
+        ))
         archived_counts.append(sum(
             not row.get("active", 1)
             for row in db.get_messages(sid, include_inactive=True)
@@ -310,6 +325,8 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
         assert compacted == durable
         db.close()
     assert archived_counts[1] > archived_counts[0] > 0
+    assert all(count <= 1 for count in preserved_bridge_counts)
+    assert preserved_bridge_counts[1] == preserved_bridge_counts[0]
 
 
 def test_contract_parser_rejects_tampering_and_metadata_disagreement():

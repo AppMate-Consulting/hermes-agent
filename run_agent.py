@@ -7861,6 +7861,7 @@ class AIAgent:
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
+            _publish_compression_outcome,
             compress_context,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
@@ -8051,11 +8052,15 @@ class AIAgent:
                     telemetry_agent=self,
                 )
             except (KeyboardInterrupt, SystemExit):
-                self._last_compression_outcome = "cancelled_host"
+                _publish_compression_outcome(
+                    self, "cancelled_host", outer_terminal=True
+                )
                 raise
             except BaseException as exc:
-                self._last_compression_outcome = (
-                    f"wrapper_exception_{type(exc).__name__}"
+                _publish_compression_outcome(
+                    self,
+                    f"wrapper_exception_{type(exc).__name__}",
+                    outer_terminal=True,
                 )
                 raise
             # compress_context ran on a daemon pool worker thread; the session

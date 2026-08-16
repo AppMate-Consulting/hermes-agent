@@ -19057,6 +19057,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 "hygiene compression timeout "
                                                 "activity stamp failed",
                                             )
+                                            from agent.conversation_compression import (
+                                                _publish_compression_outcome,
+                                            )
+                                            _publish_compression_outcome(
+                                                _hyg_agent,
+                                                "timed_out_hygiene_commit_fence",
+                                                outer_terminal=True,
+                                            )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "

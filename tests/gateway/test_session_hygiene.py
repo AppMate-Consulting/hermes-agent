@@ -1141,6 +1141,7 @@ async def test_hygiene_policy_rejections_cool_down_without_rewrite(
     text = caplog.text
     assert "Session hygiene: compressed" not in text
     assert "no session_db" not in text
+    assert f"did not commit (outcome={outcome})" in text
 
     # A second autonomous delivery during the durable cooldown must not call
     # the summarizer again.

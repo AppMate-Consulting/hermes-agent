@@ -399,6 +399,52 @@ class TestInPlaceAntiGrowthGuard:
             )]
             assert after == before
 
+    @pytest.mark.parametrize("rejection_cooldown_seconds", [60.0, None])
+    def test_compressor_no_progress_has_no_persistence_side_effects(
+        self, rejection_cooldown_seconds
+    ):
+        """Equivalent compressor output is rejected before request admission."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = f"compressor_no_progress_{rejection_cooldown_seconds}"
+            _seed(db, sid, "no-progress")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = _materially_compressible_messages()
+            agent.context_compressor.compress = lambda current, **kwargs: current
+            before = [(r["id"], r["active"]) for r in db.get_messages(
+                sid, include_inactive=True
+            )]
+            agent.commit_memory_session = MagicMock()
+            agent._flush_messages_to_session_db = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent.event_callback = MagicMock()
+            with patch.object(db, "archive_and_compact", wraps=db.archive_and_compact) as archive, \
+                 patch.object(db, "publish_compression_child", wraps=db.publish_compression_child) as publish, \
+                 patch.object(db, "record_compression_failure_cooldown", wraps=db.record_compression_failure_cooldown) as cooldown:
+                returned, _ = compress_context(
+                    agent, messages, "sys", approx_tokens=100_000,
+                    rejection_cooldown_seconds=rejection_cooldown_seconds,
+                )
+            assert returned is messages
+            assert agent._last_compression_outcome == "rejected_no_progress"
+            agent.commit_memory_session.assert_not_called()
+            agent._flush_messages_to_session_db.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.event_callback.assert_not_called()
+            archive.assert_not_called()
+            publish.assert_not_called()
+            assert [(r["id"], r["active"]) for r in db.get_messages(
+                sid, include_inactive=True
+            )] == before
+            if rejection_cooldown_seconds is None:
+                cooldown.assert_not_called()
+            else:
+                cooldown.assert_called_once()
+                assert db.get_compression_failure_cooldown(sid)["error"] == "no_progress"
+
     def test_uncached_admission_uses_built_input_prompt(self):
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context

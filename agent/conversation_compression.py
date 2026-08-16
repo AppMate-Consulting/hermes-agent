@@ -71,10 +71,7 @@ from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
 )
-from agent.model_metadata import (
-    estimate_messages_tokens_rough,
-    estimate_request_tokens_rough,
-)
+from agent.model_metadata import estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
@@ -101,7 +98,48 @@ COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
 )
 
-COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
+COMPACTION_DONE_STATUS = "✓ Context compaction complete — changes committed."
+
+_OUTER_TERMINAL_COMPRESSION_OUTCOMES = frozenset({
+    "rejected_pool_saturated",
+    "cancelled_before_start",
+    "cancelled_host",
+})
+
+
+def _is_outer_terminal_compression_outcome(value: Any) -> bool:
+    return isinstance(value, str) and (
+        value in _OUTER_TERMINAL_COMPRESSION_OUTCOMES
+        or value.startswith(("timed_out_", "wrapper_exception_"))
+    )
+
+
+def _publish_compression_outcome(
+    agent: Any, value: str, *, outer_terminal: bool = False
+) -> bool:
+    """Publish one typed outcome while preserving terminal host authority."""
+    if not outer_terminal and _is_outer_terminal_compression_outcome(
+        getattr(agent, "_last_compression_outcome", None)
+    ):
+        return False
+    agent._last_compression_outcome = value
+    return True
+
+
+def _compaction_terminal_status(outcome: Any) -> str:
+    """Return bounded, provider-text-free terminal status for ``outcome``."""
+    value = outcome if isinstance(outcome, str) else "unknown"
+    if value == "committed_materially_shrunk":
+        return COMPACTION_DONE_STATUS
+    if value.startswith("rejected_"):
+        return f"Context compaction aborted — no changes committed ({value})."
+    if value.startswith("skipped_") or value == "adopted_concurrent_compaction":
+        return f"Context compaction skipped — no changes committed ({value})."
+    if value.startswith("timed_out_"):
+        return f"Context compaction timed out — no changes committed ({value})."
+    if value.startswith("cancelled_"):
+        return f"Context compaction cancelled — no changes committed ({value})."
+    return f"Context compaction failed — no changes committed ({value})."
 
 
 def _emit_compaction_done(agent: Any) -> None:
@@ -110,7 +148,17 @@ def _emit_compaction_done(agent: Any) -> None:
     if not status_callback:
         return
     try:
-        status_callback("compacted", COMPACTION_DONE_STATUS)
+        outcome = getattr(agent, "_last_compression_outcome", None)
+        status = _compaction_terminal_status(outcome)
+        if (
+            outcome in {"persistence_failure", "rollback_failure"}
+            and bool(getattr(agent, "_compression_durable_commit_occurred", False))
+        ):
+            status = (
+                "Context compaction failed after durable changes were committed "
+                f"({outcome})."
+            )
+        status_callback("compacted", status)
     except Exception:
         logger.debug("status_callback error in compaction completion", exc_info=True)
 
@@ -889,7 +937,9 @@ def run_compress_context_with_progress_timeout(
     # a worker recovers. Fail fast: continue without compression this cycle.
     if not _try_admit_compression_job():
         if telemetry_agent is not None:
-            telemetry_agent._last_compression_outcome = "rejected_pool_saturated"
+            _publish_compression_outcome(
+                telemetry_agent, "rejected_pool_saturated", outer_terminal=True
+            )
         logger.warning(
             "Context compression pool saturated (%d workers busy) — "
             "refusing new compression this cycle and continuing without "
@@ -922,7 +972,9 @@ def run_compress_context_with_progress_timeout(
                 and getattr(telemetry_agent, "_last_compression_outcome", None)
                 == "pending"
             ):
-                telemetry_agent._last_compression_outcome = "cancelled_before_start"
+                _publish_compression_outcome(
+                    telemetry_agent, "cancelled_before_start", outer_terminal=True
+                )
             logger.info(
                 "Skipping stale compression job: fence cancelled before start"
             )
@@ -1071,11 +1123,11 @@ def run_compress_context_with_progress_timeout(
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
         if telemetry_agent is not None:
-            telemetry_agent._last_compression_outcome = (
+            _publish_compression_outcome(telemetry_agent, (
                 "timed_out_total_ceiling"
                 if waited >= ceiling
                 else "timed_out_inactivity"
-            )
+            ), outer_terminal=True)
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)
@@ -1996,6 +2048,29 @@ def _is_active_task_contract_message(message: Any) -> bool:
     return ContextCompressor.parse_active_task_contract(message) is not None
 
 
+ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE = (
+    "[HERMES_ACTIVE_TASK_CONTRACT_BRIDGE:before] "
+    "The authoritative active-task contract follows."
+)
+ACTIVE_TASK_CONTRACT_BRIDGE_AFTER = (
+    "[HERMES_ACTIVE_TASK_CONTRACT_BRIDGE:after] "
+    "I will continue the active task under that contract."
+)
+_ACTIVE_TASK_CONTRACT_BRIDGE_CONTENTS = frozenset({
+    ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+    ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+})
+
+
+def _is_active_task_contract_bridge(message: Any) -> bool:
+    """Recognize only exact Hermes bridge rows, including DB projections."""
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and message.get("content") in _ACTIVE_TASK_CONTRACT_BRIDGE_CONTENTS
+    )
+
+
 def _strip_stale_todo_snapshot(content: Any) -> Any:
     """Remove a previously merged todo-snapshot block from message content.
 
@@ -2185,10 +2260,7 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
     compressed[:] = [
         message for message in compressed
         if not _is_active_task_contract_message(message)
-        and not (
-            isinstance(message, dict)
-            and message.get("_active_task_contract_bridge")
-        )
+        and not _is_active_task_contract_bridge(message)
     ]
     if contract is None or not ContextCompressor._has_autonomous_completion_chain(
         original_messages
@@ -2212,7 +2284,7 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
     if insert_at > 0 and compressed[insert_at - 1].get("role") == "user":
         compressed.insert(insert_at, {
             "role": "assistant",
-            "content": "The authoritative active-task contract follows.",
+            "content": ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
             "_active_task_contract_bridge": True,
         })
         insert_at += 1
@@ -2225,7 +2297,7 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
     ):
         compressed.insert(insert_at + 1, {
             "role": "assistant",
-            "content": "I will continue the active task under that contract.",
+            "content": ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
             "_active_task_contract_bridge": True,
         })
 
@@ -2370,16 +2442,10 @@ def compress_context(
     # boundary, so the previous flush baseline remains authoritative.
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
-    agent._last_compression_outcome = "pending"
+    agent._compression_durable_commit_occurred = False
     def _set_compression_outcome(value: str) -> None:
         """Publish an inner outcome without overwriting an outer terminal one."""
-        current = getattr(agent, "_last_compression_outcome", None)
-        if isinstance(current, str) and current.startswith((
-            "timed_out_", "cancelled_host", "wrapper_exception_",
-            "rejected_pool_saturated",
-        )):
-            return
-        agent._last_compression_outcome = value
+        _publish_compression_outcome(agent, value)
     agent._last_compaction_in_place = False
     # Clear the lock-skip signal at the VERY TOP, before the codex route and
     # the breaker gates below can early-return (per-attempt state rule,
@@ -2450,7 +2516,7 @@ def compress_context(
             None,
         )
         if callable(blocked) and blocked(agent.context_compressor):
-            agent._last_compression_outcome = "skipped_cooldown"
+            _set_compression_outcome("skipped_cooldown")
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -2715,7 +2781,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class="lock_contended",
             )
-            agent._last_compression_outcome = "skipped_lock_contention"
+            _set_compression_outcome("skipped_lock_contention")
             _complete_compaction_lifecycle()
             return messages, _existing_sp
     _lock_released = False
@@ -2814,7 +2880,7 @@ def compress_context(
                 type(_session_err).__name__,
                 _session_err,
             )
-            agent._last_compression_outcome = "skipped_session_state_unavailable"
+            _set_compression_outcome("skipped_session_state_unavailable")
             _release_lock()
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
@@ -2834,14 +2900,14 @@ def compress_context(
                     _lock_sid,
                     agent.session_id,
                 )
-                agent._last_compression_outcome = "adopted_concurrent_compaction"
+                _set_compression_outcome("adopted_concurrent_compaction")
                 return recovered_messages, _existing_sp
             logger.warning(
                 "compression skipped: session=%s was already rotated by "
                 "another compression path, but no unique live child could be adopted",
                 _lock_sid,
             )
-            agent._last_compression_outcome = "skipped_already_compacted"
+            _set_compression_outcome("skipped_already_compacted")
             return messages, _existing_sp
 
     # Snapshot the authoritative durable cooldown only after this attempt owns
@@ -2858,7 +2924,7 @@ def compress_context(
         # failed. Proceeding with force=True could clear an unknown newer row
         # before cancellation has enough information to restore it. This is a
         # persistence-safety abort, not automatic breaker gating.
-        agent._last_compression_outcome = "persistence_guard_read_failure"
+        _set_compression_outcome("persistence_guard_read_failure")
         _release_lock()
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
@@ -2881,7 +2947,7 @@ def compress_context(
             None,
         )
         if callable(blocked) and blocked(compressor):
-            agent._last_compression_outcome = "skipped_cooldown"
+            _set_compression_outcome("skipped_cooldown")
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
@@ -3164,7 +3230,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class=f"rollback:{type(_rollback_exc).__name__}",
             )
-            agent._last_compression_outcome = "rollback_failure"
+            _set_compression_outcome("rollback_failure")
             raise
         if (
             messages_before_compression is not None
@@ -3182,7 +3248,7 @@ def compress_context(
             split_status="aborted",
             failure_class="explicit_interrupt",
         )
-        agent._last_compression_outcome = "cancelled_explicit_interrupt"
+        _set_compression_outcome("cancelled_explicit_interrupt")
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
             _existing_sp = agent._build_system_prompt(system_message)
@@ -3202,7 +3268,7 @@ def compress_context(
             split_status="aborted",
             failure_class=f"exception:{type(_compress_exc).__name__}",
         )
-        agent._last_compression_outcome = (
+        _set_compression_outcome(
             f"compression_exception_{type(_compress_exc).__name__}"
         )
         raise
@@ -3233,12 +3299,13 @@ def compress_context(
         # the no-op via len(returned) == len(input).
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
-                agent._last_compression_outcome = "summary_failure"
+                _set_compression_outcome("summary_failure")
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
                     agent._emit_warning(
-                        f"⚠ Compression aborted: {_err}. "
+                        "⚠ Compression aborted because the summary model did "
+                        "not return a usable result. "
                         "No messages were dropped — conversation continues unchanged. "
                         "Run /compress to retry, or /new to start a fresh session."
                     )
@@ -3280,7 +3347,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class="no_progress",
             )
-            agent._last_compression_outcome = "rejected_no_progress"
+            _set_compression_outcome("rejected_no_progress")
             if not force and rejection_cooldown_seconds is not None:
                 _record_rejection = getattr(
                     agent.context_compressor,
@@ -3308,7 +3375,7 @@ def compress_context(
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
-            agent._last_compression_outcome = "rejected_empty_transcript"
+            _set_compression_outcome("rejected_empty_transcript")
             _release_lock()
             return messages, _existing_sp
 
@@ -3527,7 +3594,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class=_rejection,
             )
-            agent._last_compression_outcome = f"rejected_{_rejection}"
+            _set_compression_outcome(f"rejected_{_rejection}")
             if not force and rejection_cooldown_seconds is not None:
                 _record_rejection = getattr(
                     agent.context_compressor,
@@ -3580,6 +3647,7 @@ def compress_context(
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
                     )
+                    agent._compression_durable_commit_occurred = True
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3591,7 +3659,7 @@ def compress_context(
                     # place (id unchanged). The gateway reads this (NOT an id-change
                     # diff) to re-baseline transcript handling.
                     compacted_in_place = True
-                    agent._last_compression_outcome = "committed_materially_shrunk"
+                    _set_compression_outcome("committed_materially_shrunk")
                 else:
                     # ── Rotation (legacy): end this session, fork a continuation ─
                     # Flush any un-persisted current-turn messages to the OLD
@@ -3657,6 +3725,7 @@ def compress_context(
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
                     )
+                    agent._compression_durable_commit_occurred = True
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id
@@ -3672,7 +3741,7 @@ def compress_context(
                         pass
                     agent._session_db_created = True
                     split_status = "rotated_committed"
-                    agent._last_compression_outcome = "committed_materially_shrunk"
+                    _set_compression_outcome("committed_materially_shrunk")
                     # Carry a persistent /goal onto the continuation session.
                     # Compression mints a fresh child id; load_goal does a flat
                     # per-session lookup with no parent walk, so without this an
@@ -3760,7 +3829,7 @@ def compress_context(
                     }
                 _session_commit_succeeded = True
             except Exception as e:
-                agent._last_compression_outcome = "persistence_failure"
+                _set_compression_outcome("persistence_failure")
                 if (
                     not in_place
                     and locals().get("old_session_id")
@@ -3809,7 +3878,7 @@ def compress_context(
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
         if not agent._session_db:
-            agent._last_compression_outcome = "committed_in_memory"
+            _set_compression_outcome("committed_in_memory")
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
@@ -4076,6 +4145,9 @@ def _compress_context_via_codex_app_server(
     except BaseException:
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
+        _publish_compression_outcome(
+            agent, "compression_exception_codex_app_server"
+        )
         _complete_compaction_lifecycle()
         raise
 
@@ -4092,9 +4164,11 @@ def _compress_context_via_codex_app_server(
         agent._codex_session = None
 
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
+        _publish_compression_outcome(agent, "summary_failure")
         try:
             agent._emit_warning(
-                f"⚠ Codex app-server compaction failed: {result.error}"
+                "⚠ Codex app-server compaction failed. No local transcript "
+                "changes were committed."
             )
         except Exception:
             pass
@@ -4138,6 +4212,7 @@ def _compress_context_via_codex_app_server(
         getattr(result, "thread_id", None) or "",
         getattr(result, "turn_id", None) or "",
     )
+    _publish_compression_outcome(agent, "committed_materially_shrunk")
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)

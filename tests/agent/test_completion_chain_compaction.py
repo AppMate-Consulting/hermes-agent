@@ -14,6 +14,8 @@ from agent.context_compressor import (
     ContextCompressor,
 )
 from agent.conversation_compression import (
+    ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+    ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
     _ensure_compressed_has_user_turn,
     _is_real_user_message,
     _refresh_active_task_contract,
@@ -152,6 +154,24 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
     assert archived_after_second - archived_before_second == active_before_second
     assert len([r for r in rows_after_second if r.get("active", 1)]) == len(durable)
 
+    # Repeat through another DB projection. Visible exact bridge markers let
+    # refresh remove stale rows even though SessionDB omits underscore metadata.
+    third_agent = _agent(db, sid)
+    third, _ = compress_context(
+        third_agent, db.get_messages_as_conversation(sid), "sys",
+        approx_tokens=100_000,
+    )
+    durable_third = db.get_messages_as_conversation(sid)
+    assert len(_contracts(third)) == len(_contracts(durable_third)) == 1
+    assert ContextCompressor.parse_active_task_contract(
+        _contracts(durable_third)[0]
+    )["content"] == NEW_TASK
+    bridge_contents = {
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+    }
+    assert sum(m.get("content") in bridge_contents for m in durable_third) <= 2
+
 
 def test_completion_notification_forms_are_exact_and_human_near_match_stays_real():
     forms = [
@@ -226,4 +246,13 @@ def test_contract_refresh_requires_summary_and_removes_stale_bridges():
     for _ in range(3):
         _refresh_active_task_contract(original, compressed)
     assert len(_contracts(compressed)) == 1
-    assert sum(bool(m.get("_active_task_contract_bridge")) for m in compressed) <= 2
+    assert sum(m.get("content") in {
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+    } for m in compressed) <= 2
+    ordinary = {"role": "assistant", "content": "The authoritative active-task contract follows."}
+    _refresh_active_task_contract(original, [summary, ordinary])
+    # A human/model near-match without the exact Hermes marker is never classified away.
+    retained = [summary, ordinary]
+    _refresh_active_task_contract(original, retained)
+    assert ordinary in retained

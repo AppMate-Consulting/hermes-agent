@@ -43,7 +43,7 @@ def _configure_engine_state(engine):
     engine._last_aux_model_failure_error = None
 
 
-def test_on_pre_compress_result_reaches_compressor_with_existing_options():
+def test_on_pre_compress_runs_after_engine_and_does_not_influence_summary():
     manager = MagicMock()
     manager.on_pre_compress.return_value = "Checkpoint id: ctx-orchestrator"
     received = {}
@@ -82,7 +82,7 @@ def test_on_pre_compress_result_reaches_compressor_with_existing_options():
         "current_tokens": 100_000,
         "focus_topic": "checkpoint continuity",
         "force": True,
-        "memory_context": "Checkpoint id: ctx-orchestrator",
+        "memory_context": "",
     }
 
 
@@ -155,28 +155,8 @@ def test_provider_context_is_strictly_sanitized_before_plugin_engine(monkeypatch
     agent._compress_context(_messages(), "sys", approx_tokens=100_000)
 
     assert len(received) == 1
-    context = received[0]
-    assert prefix_secret not in context
-    assert query_secret not in context
-    assert userinfo_value not in context
-    assert fragment_secret not in context
-    assert relative_secret not in context
-    assert encoded_key_secret not in context
-    assert hyphen_client_secret not in context
-    assert hyphen_access_secret not in context
-    assert hyphen_api_secret not in context
-    assert encoded_hyphen_secret not in context
-    assert network_userinfo_secret not in context
-    assert "access_token=***" in context
-    assert "https://user:***@example.test/private" in context
-    assert "https://x.test/#access_token=***&view=public" in context
-    assert "/resume?token=***&view=public" in context
-    assert "client%5Fsecret=***&view=public" in context
-    assert "client-secret=***&view=public" in context
-    assert "Access-Token=***&view=public" in context
-    assert "api-key=***&view=public" in context
-    assert "client%2Dsecret=***&view=public" in context
-    assert "//user:***@x.test/path" in context
+    assert received == [""]
+    manager.on_pre_compress.assert_called_once()
 
 
 def test_provider_context_is_bounded_before_plugin_engine():
@@ -196,11 +176,8 @@ def test_provider_context_is_bounded_before_plugin_engine():
     agent._compress_context(_messages(), "sys", approx_tokens=100_000)
 
     assert len(received) == 1
-    context = received[0]
-    assert len(context) <= 6_000
-    assert context.startswith("HEAD-SENTINEL")
-    assert context.endswith("TAIL-SENTINEL")
-    assert "[memory provider context truncated]" in context
+    assert received == [""]
+    manager.on_pre_compress.assert_called_once()
 
 
 def test_internal_engine_type_error_propagates_after_one_call():
@@ -227,4 +204,5 @@ def test_internal_engine_type_error_propagates_after_one_call():
     with pytest.raises(TypeError, match="engine implementation bug"):
         agent._compress_context(_messages(), "sys", approx_tokens=100_000)
 
-    assert calls == ["Checkpoint id: ctx-typeerror"]
+    assert calls == [""]
+    manager.on_pre_compress.assert_not_called()

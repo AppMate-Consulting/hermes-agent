@@ -1022,6 +1022,11 @@ class MemoryManager:
                 )
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Notify providers only after a compaction boundary has committed.
+
+        The historical name is retained for provider compatibility; callers
+        must pass an immutable snapshot of the pre-compaction transcript.
+        """
         """Notify all providers before context compression.
 
         Returns combined text from providers to include in the compression

@@ -15453,6 +15453,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         persist_user_display_kind=(
                             "internal_notification" if synthetic_completion else None
                         ),
+                        persist_user_is_autonomous_completion=synthetic_completion,
                         moa_config=_moa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):

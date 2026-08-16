@@ -2670,11 +2670,8 @@ def compress_context(
                 _restore_compressor_attempt_state(
                     agent.context_compressor, _compressor_attempt_snapshot
                 )
-                existing_prompt = getattr(agent, "_cached_system_prompt", None)
-                if not existing_prompt:
-                    existing_prompt = agent._build_system_prompt(system_message)
                 _set_compression_outcome("cancelled_commit_fence")
-                return messages, existing_prompt
+                return messages, _rollback_prompt()
         try:
             return _compress_context_via_codex_app_server(
                 agent,
@@ -2700,10 +2697,7 @@ def compress_context(
         )
         if callable(blocked) and blocked(agent.context_compressor):
             _set_compression_outcome("skipped_cooldown")
-            existing_prompt = getattr(agent, "_cached_system_prompt", None)
-            if not existing_prompt:
-                existing_prompt = agent._build_system_prompt(system_message)
-            return messages, existing_prompt
+            return messages, _rollback_prompt()
 
     # Lazy feasibility check — run the auxiliary-provider probe + context
     # length lookup just-in-time on the first compression attempt instead of
@@ -2882,9 +2876,6 @@ def compress_context(
                         agent.session_id or "none",
                     )
                     agent._last_compaction_in_place = False
-                    _existing_sp = getattr(agent, "_cached_system_prompt", None)
-                    if not _existing_sp:
-                        _existing_sp = agent._build_system_prompt(system_message)
                     _emit_compression_attempt_telemetry(
                         agent,
                         started_at=_attempt_started_at,
@@ -2894,7 +2885,7 @@ def compress_context(
                     )
                     _set_compression_outcome("cancelled_commit_fence")
                     _complete_compaction_lifecycle()
-                    return messages, _existing_sp
+                    return messages, _rollback_prompt()
             try:
                 _lock_acquired = _try_acquire_lock(
                     _lock_sid, _lock_holder, ttl_seconds=_lock_ttl
@@ -2949,9 +2940,6 @@ def compress_context(
                     )
                 except Exception:
                     pass
-            _existing_sp = getattr(agent, "_cached_system_prompt", None)
-            if not _existing_sp:
-                _existing_sp = agent._build_system_prompt(system_message)
             try:
                 if hasattr(agent.context_compressor, "_begin_compression_telemetry"):
                     agent.context_compressor._begin_compression_telemetry(current_tokens=approx_tokens)
@@ -2966,7 +2954,7 @@ def compress_context(
             )
             _set_compression_outcome("skipped_lock_contention")
             _complete_compaction_lifecycle()
-            return messages, _existing_sp
+            return messages, _rollback_prompt()
     _lock_released = False
     _lock_release_guard = threading.Lock()
 
@@ -3029,9 +3017,6 @@ def compress_context(
                 agent.session_id or "none",
             )
             agent._last_compaction_in_place = False
-            _existing_sp = getattr(agent, "_cached_system_prompt", None)
-            if not _existing_sp:
-                _existing_sp = agent._build_system_prompt(system_message)
             _emit_compression_attempt_telemetry(
                 agent,
                 started_at=_attempt_started_at,
@@ -3041,7 +3026,7 @@ def compress_context(
             )
             _set_compression_outcome("cancelled_commit_fence")
             _release_lock()
-            return messages, _existing_sp
+            return messages, _rollback_prompt()
 
     # Publish the holder-qualified release hook before a timeout can win the
     # fence. If no durable lock was acquired there is no hook to publish.
@@ -3065,10 +3050,7 @@ def compress_context(
             )
             _set_compression_outcome("skipped_session_state_unavailable")
             _release_lock()
-            _existing_sp = getattr(agent, "_cached_system_prompt", None)
-            if not _existing_sp:
-                _existing_sp = agent._build_system_prompt(system_message)
-            return messages, _existing_sp
+            return messages, _rollback_prompt()
         if _parent_already_rotated:
             recovered_messages = _adopt_live_compression_child(
                 agent, _lock_db, _lock_sid
@@ -3109,10 +3091,7 @@ def compress_context(
         # persistence-safety abort, not automatic breaker gating.
         _set_compression_outcome("persistence_guard_read_failure")
         _release_lock()
-        existing_prompt = getattr(agent, "_cached_system_prompt", None)
-        if not existing_prompt:
-            existing_prompt = agent._build_system_prompt(system_message)
-        return messages, existing_prompt
+        return messages, _rollback_prompt()
 
     # The agent may have been constructed before another path completed an
     # in-place compaction on the same session. Re-read durable breaker state
@@ -3132,10 +3111,7 @@ def compress_context(
         if callable(blocked) and blocked(compressor):
             _set_compression_outcome("skipped_cooldown")
             _release_lock()
-            existing_prompt = getattr(agent, "_cached_system_prompt", None)
-            if not existing_prompt:
-                existing_prompt = agent._build_system_prompt(system_message)
-            return messages, existing_prompt
+            return messages, _rollback_prompt()
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
@@ -3257,18 +3233,10 @@ def compress_context(
                         # re-appending the concurrent rows and the live tail.
                         agent._persist_user_message_idx = len(messages)
 
-        # Notify external memory provider before compression discards context.
-        # The provider's on_pre_compress() may return a string of insights it
-        # wants surfaced inside the compression summary; capture and forward it
-        # instead of silently discarding the provider's return value.
+        # Memory providers are notified only after an admitted durable boundary.
+        # Their callbacks may mutate external systems, so their returned text
+        # cannot participate in the summary produced by this transaction.
         memory_context = ""
-        if agent._memory_manager:
-            try:
-                _maybe_ctx = agent._memory_manager.on_pre_compress(messages)
-                if isinstance(_maybe_ctx, str):
-                    memory_context = sanitize_memory_context(_maybe_ctx)
-            except Exception:
-                pass
 
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
@@ -3777,12 +3745,6 @@ def compress_context(
         if agent._session_db:
             split_status = "pending"
             try:
-                # Trigger memory extraction on the current session before the
-                # transcript is rewritten (runs in BOTH modes — the logical
-                # conversation's pre-compaction turns are about to be summarized
-                # away regardless of whether the id rotates).
-                agent.commit_memory_session(messages)
-
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────
                     # No end_session, no new row, no parent_session_id, no title
@@ -3812,6 +3774,7 @@ def compress_context(
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
+                        system_prompt=new_system_prompt,
                     )
                     agent._compression_durable_commit_occurred = True
                     split_status = "in_place_committed"
@@ -3978,12 +3941,7 @@ def compress_context(
                                         _src_err,
                                     )
 
-                # In-place mode still updates/replaces the current row here.
-                # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
-                    )
                     agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)
@@ -3996,6 +3954,10 @@ def compress_context(
                 _session_commit_succeeded = True
             except Exception as e:
                 _set_compression_outcome("persistence_failure")
+                _restore_uncommitted_input()
+                compressed = messages
+                compacted_in_place = False
+                agent._compression_durable_commit_occurred = False
                 if (
                     not in_place
                     and locals().get("old_session_id")
@@ -4044,6 +4006,8 @@ def compress_context(
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
         if not agent._session_db:
+            _session_commit_succeeded = True
+            agent._compression_durable_commit_occurred = True
             _set_compression_outcome("committed_in_memory")
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
@@ -4051,11 +4015,40 @@ def compress_context(
         # is the id the boundary notifications attribute the prior state to: the old
         # id on rotation, the (unchanged) current id in-place.
         _old_sid = locals().get("old_session_id")
-        _is_boundary = bool(_old_sid) or in_place
+        _is_boundary = _session_commit_succeeded and (bool(_old_sid) or in_place)
         _context_engine_boundary_committed = _session_commit_succeeded and (
             bool(_old_sid) or compacted_in_place
         )
         _boundary_parent = _old_sid or agent.session_id or ""
+
+        if not _session_commit_succeeded:
+            _restore_uncommitted_input()
+            _restore_compressor_attempt_state(
+                agent.context_compressor,
+                _compressor_attempt_snapshot,
+                durable_cooldown_authoritative=_durable_cooldown_authoritative,
+                durable_cooldown_state=_durable_cooldown_state,
+            )
+            agent._last_compression_attempt_in_place = None
+            agent._last_compaction_in_place = False
+            return messages, _rollback_prompt()
+
+        # These callbacks are deliberately post-admission/post-persistence.
+        # Run each exactly once from the immutable pre-attempt transcript and
+        # isolate failures: the database transaction is already authoritative.
+        if agent._memory_manager:
+            try:
+                _maybe_ctx = agent._memory_manager.on_pre_compress(
+                    copy.deepcopy(_input_messages_snapshot)
+                )
+                if isinstance(_maybe_ctx, str):
+                    sanitize_memory_context(_maybe_ctx)
+            except Exception:
+                logger.debug("memory on_pre_compress callback failed", exc_info=True)
+        try:
+            agent.commit_memory_session(copy.deepcopy(_input_messages_snapshot))
+        except Exception:
+            logger.debug("memory boundary extraction failed", exc_info=True)
 
         # Round-2 #4: the activity heartbeat's terminal "context compression
         # completed" stamp landed on the PARENT row (force-persisted before
@@ -4217,6 +4210,22 @@ def compress_context(
             ),
         )
         return compressed, new_system_prompt
+    except BaseException:
+        # Candidate preparation and persistence form a transaction from the
+        # caller's perspective. Restore every speculative mutation unless the
+        # durable boundary is already authoritative; post-commit callbacks are
+        # best-effort and must never masquerade as a database rollback.
+        if not getattr(agent, "_compression_durable_commit_occurred", False):
+            _restore_uncommitted_input()
+            _restore_compressor_attempt_state(
+                agent.context_compressor,
+                _compressor_attempt_snapshot,
+                durable_cooldown_authoritative=_durable_cooldown_authoritative,
+                durable_cooldown_state=_durable_cooldown_state,
+            )
+            agent._last_compression_attempt_in_place = None
+            agent._last_compaction_in_place = False
+        raise
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed
         # and all post-rotation bookkeeping (memory manager, context engine,

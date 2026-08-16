@@ -9690,6 +9690,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
+        system_prompt: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -9714,7 +9715,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
         matching what the live load returns. ``model_config_patch`` is merged
         into the session's JSON config in the same transaction; a ``None``
-        value removes that key. Returns the new active count.
+        value removes that key. When supplied, ``system_prompt`` is updated in
+        that same transaction too. Returns the new active count.
         """
 
         def _do(conn):
@@ -9744,16 +9746,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
-            if model_config_patch is None:
+            if model_config_patch is None and system_prompt is None:
                 conn.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                     (inserted, tool_calls_total, session_id),
                 )
             else:
+                assignments = ["message_count = ?", "tool_call_count = ?"]
+                values: list[Any] = [inserted, tool_calls_total]
+                if model_config_patch is not None:
+                    assignments.append("model_config = ?")
+                    values.append(patched_model_config)
+                if system_prompt is not None:
+                    assignments.append("system_prompt = ?")
+                    values.append(_scrub_surrogates(system_prompt))
+                values.append(session_id)
                 conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                    "model_config = ? WHERE id = ?",
-                    (inserted, tool_calls_total, patched_model_config, session_id),
+                    f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
+                    values,
                 )
             return inserted
 

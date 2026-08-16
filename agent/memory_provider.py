@@ -25,7 +25,9 @@ Optional hooks (override to opt in):
   on_turn_start(turn, message, **kwargs) — per-turn tick with runtime context
   on_session_end(messages)               — end-of-session extraction
   on_session_switch(new_session_id, **kwargs) — mid-process session_id rotation
-  on_pre_compress(messages) -> str       — extract before context compression
+  on_pre_compress(messages) -> str       — observe an admitted, committed
+                                           compaction boundary (despite the
+                                           compatibility name)
   on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
   backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
@@ -303,6 +305,12 @@ class MemoryProvider(ABC):
         """
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Observe the immutable pre-compaction transcript after commit.
+
+        Providers may perform external writes here. The return value is kept
+        for API compatibility but cannot influence the already-committed
+        summary.
+        """
         """Called before context compression discards old messages.
 
         Use to extract insights from messages about to be compressed.

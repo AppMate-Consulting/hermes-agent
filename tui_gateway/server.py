@@ -9863,9 +9863,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    is_autonomous_completion=True,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, is_autonomous_completion=True
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -9941,9 +9944,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    is_autonomous_completion=True,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, is_autonomous_completion=True
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10279,6 +10285,7 @@ def _run_prompt_submit(
     *,
     display_kind: str | None = None,
     display_metadata: dict | None = None,
+    is_autonomous_completion: bool = False,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> None:
@@ -10601,6 +10608,11 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if (
+                is_autonomous_completion
+                and "persist_user_is_autonomous_completion" in _run_params
+            ):
+                run_kwargs["persist_user_is_autonomous_completion"] = True
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -11195,7 +11207,23 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        display_kind=(
+                            "async_delegation_complete"
+                            if _evt.get("type") == "async_delegation"
+                            else None
+                        ),
+                        display_metadata=(
+                            _async_delegation_display_metadata(_evt)
+                            if _evt.get("type") == "async_delegation"
+                            else None
+                        ),
+                        is_autonomous_completion=True,
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)

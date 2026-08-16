@@ -182,6 +182,7 @@ def test_production_turn_builder_injects_completion_provenance(agent, notificati
         notification,
         conversation_history=history,
         persist_user_display_kind="internal_notification",
+        persist_user_is_autonomous_completion=True,
     )
     messages = result["messages"]
     assert [m.get("content") for m in messages[2:5]] == [
@@ -205,10 +206,11 @@ def test_production_turn_builder_does_not_retype_genuine_user_wrapper(agent):
             {"role": "user", "content": "real task"},
             {"role": "assistant", "content": "ordinary response"},
         ],
+        persist_user_display_kind="internal_notification",
     )
     messages = result["messages"]
     wrapper_row = next(m for m in messages if m.get("content") == wrapper)
-    assert wrapper_row.get("display_kind") is None
+    assert wrapper_row.get("display_kind") == "internal_notification"
     assert not ContextCompressor._has_autonomous_completion_chain(messages[:-1])
 
 

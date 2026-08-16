@@ -440,6 +440,7 @@ def build_turn_context(
     persist_user_timestamp: Optional[float] = None,
     *,
     persist_user_display_kind: Optional[str] = None,
+    persist_user_is_autonomous_completion: bool = False,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -679,10 +680,8 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
-    if persist_user_display_kind == "internal_notification":
-        from agent.context_compressor import _is_autonomous_completion_notification
-        if _is_autonomous_completion_notification(user_message):
-            append_autonomous_completion_provenance(messages)
+    if persist_user_is_autonomous_completion:
+        append_autonomous_completion_provenance(messages)
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

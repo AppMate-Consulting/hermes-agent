@@ -680,8 +680,15 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    # Never accept trusted provenance from a staged/external message mapping;
+    # normalize it solely from the explicit runtime-only turn parameter.
+    user_msg.pop("_autonomous_completion_bridge", None)
     if persist_user_is_autonomous_completion:
         append_autonomous_completion_provenance(messages)
+        # This normalized internal marker cannot be supplied through the
+        # external user-message input.  Together with the two bridge markers
+        # it distinguishes a live runtime completion from an exact lookalike.
+        user_msg["_autonomous_completion_bridge"] = True
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

@@ -6,6 +6,7 @@ Verifies that:
 - Preflight compression proactively compresses oversized sessions before API calls
 """
 
+import hashlib
 import os
 
 import pytest
@@ -195,6 +196,33 @@ def test_production_turn_builder_injects_completion_provenance(agent, notificati
     ]
     assert [m.get("role") for m in messages[2:5]] == ["user", "assistant", "user"]
     assert ContextCompressor._has_autonomous_completion_chain(messages[:-1])
+
+
+def test_live_completion_provenance_does_not_require_presentation_metadata(agent):
+    """Trusted runtime markers classify a live completion without display fields."""
+    from agent.context_compressor import ContextCompressor
+
+    agent.compression_enabled = False
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+    result = agent.run_conversation(
+        "[ASYNC DELEGATION COMPLETE child=live-no-display]",
+        conversation_history=[
+            {"role": "user", "content": "real task"},
+            {"role": "assistant", "content": "ordinary response"},
+        ],
+        persist_user_is_autonomous_completion=True,
+    )
+    live = result["messages"][:-1]
+    completion_index = len(live) - 1
+    assert "display_kind" not in live[completion_index]
+    assert all(
+        live[index].get("_autonomous_completion_bridge") is True
+        for index in range(completion_index - 2, completion_index + 1)
+    )
+    assert ContextCompressor._completion_has_durable_provenance(
+        live, completion_index
+    )
+    assert ContextCompressor._has_autonomous_completion_chain(live)
 
 
 def test_production_turn_builder_does_not_retype_genuine_user_wrapper(agent):
@@ -393,12 +421,13 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
 
     durable = db.get_messages_as_conversation(sid)
     for transcript in (compacted, durable):
-        active = _latest_active_human_task_row(transcript)
-        assert active is not None
-        assert active["content"] == AUTONOMOUS_COMPLETION_BRIDGE_USER
-        assert ContextCompressor._active_task_contract(transcript)["content"] == (
-            AUTONOMOUS_COMPLETION_BRIDGE_USER
-        )
+        contract = ContextCompressor._active_task_contract(transcript)
+        assert contract == {
+            "content": AUTONOMOUS_COMPLETION_BRIDGE_USER,
+            "sha256": hashlib.sha256(
+                AUTONOMOUS_COMPLETION_BRIDGE_USER.encode("utf-8")
+            ).hexdigest(),
+        }
         assert not any(row.get("content") == "older task" for row in transcript)
         assert ContextCompressor._has_autonomous_completion_chain(transcript)
         assert any(

@@ -4865,20 +4865,24 @@ This compaction should PRIORITISE preserving all information related to the focu
         )
         if not exact_sequence:
             return False
-        # Live runtime rows carry both bridge flags and an explicitly typed
-        # completion wrapper.  SessionDB projection intentionally strips the
-        # underscore flags, so the same exact three-row sequence is the
-        # durable fallback.  A partially flagged/live lookalike fails closed.
-        bridge_flags = (
-            messages[index - 2].get("_autonomous_completion_bridge") is True
-            and messages[index - 1].get("_autonomous_completion_bridge") is True
+        # Live runtime provenance is entirely internal: all three rows are
+        # stamped only by the normalized turn builder.  Presentation metadata
+        # is optional in memory and must not participate in that decision.
+        runtime_markers = all(
+            messages[row_index].get("_autonomous_completion_bridge") is True
+            for row_index in (index - 2, index - 1, index)
         )
+        # SessionDB projection intentionally strips underscore metadata.  Its
+        # durable equivalent therefore requires all three markers to be absent
+        # and the persisted completion-row presentation type to be explicit.
         projected = (
-            "_autonomous_completion_bridge" not in messages[index - 2]
-            and "_autonomous_completion_bridge" not in messages[index - 1]
+            all(
+                "_autonomous_completion_bridge" not in messages[row_index]
+                for row_index in (index - 2, index - 1, index)
+            )
+            and completion.get("display_kind") == "internal_notification"
         )
-        runtime_typed = completion.get("display_kind") == "internal_notification"
-        return (bridge_flags and runtime_typed) or projected
+        return runtime_markers or projected
 
     @classmethod
     def _bridge_user_has_durable_provenance(

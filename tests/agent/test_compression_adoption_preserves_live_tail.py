@@ -250,6 +250,9 @@ def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
     )
     memory_seen = []
     agent._memory_manager = MagicMock()
+    agent._memory_manager.build_system_prompt.return_value = (
+        "deterministic memory prompt"
+    )
     agent._memory_manager.on_pre_compress.side_effect = (
         lambda rows: memory_seen.append(("pre", rows)) or ""
     )
@@ -298,6 +301,9 @@ def test_rotation_publication_failure_keeps_real_parent_preflush_and_rolls_back(
     agent._cached_system_prompt = "cached prompt"
     agent._cached_system_prompt_static = "cached static"
     agent._memory_manager = MagicMock()
+    agent._memory_manager.build_system_prompt.return_value = (
+        "deterministic memory prompt"
+    )
     agent.commit_memory_session = MagicMock()
 
     with (

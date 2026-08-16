@@ -5675,7 +5675,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         the head so compression still runs.
 
         Never cuts inside a tool_call/result group.  Always ensures the most
-        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
+        recent user message is in the tail when no autonomous completion chain
+        is proven (see ``_ensure_last_user_message_in_tail``).  Proven chains
+        restore the exact task after compression instead of retaining the
+        entire chain behind it.
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
@@ -5757,31 +5760,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
 
-        # Ensure the most recent user message is always in the tail so the
-        # active task is never lost to compression (fixes #10896).
-        if (
-            not self._has_autonomous_completion_chain(messages)
-            or self._active_task_contract(messages) is None
-        ):
+        # Without a proven autonomous completion chain, keep the historical
+        # latest-user tail anchor (fixes #10896).  Proven chains restore their
+        # exact human task after compression, so anchoring it here would retain
+        # the whole completion transcript.
+        if not self._has_autonomous_completion_chain(messages):
             cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
-            # A proven completion chain may follow a multipart task that the
-            # bounded text contract cannot encode.  Protect that exact row,
-            # not merely the newer synthetic completion user row.
-            if self._has_autonomous_completion_chain(messages):
-                for task_idx in range(len(messages) - 1, head_end - 1, -1):
-                    task = messages[task_idx]
-                    if task.get("role") != "user":
-                        continue
-                    if self._completion_has_durable_provenance(messages, task_idx):
-                        continue
-                    raw = task.get("content")
-                    if isinstance(raw, list) and any(
-                        not isinstance(part, dict) or part.get("type") != "text"
-                        for part in raw
-                    ):
-                        cut_idx = min(cut_idx, task_idx)
-                        cut_idx = self._align_boundary_backward(messages, cut_idx)
-                        break
 
         # Ensure the most recent assistant message is always in the tail
         # so the previously-visible reply isn't silently rolled into the

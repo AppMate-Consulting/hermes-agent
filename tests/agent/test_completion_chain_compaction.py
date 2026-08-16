@@ -273,6 +273,7 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
     db.close()
 
     archived_counts = []
+    bridge_counts = []
     preserved_bridge_counts = []
     for cycle in range(2):
         db = SessionDB(db_path=path)
@@ -286,8 +287,10 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
                     tool_call_id=message.get("tool_call_id"),
                 )
             resumed = db.get_messages_as_conversation(sid)
+        cycle_agent = _agent(db, sid)
+        protected_tail_bound = cycle_agent.context_compressor.protect_last_n
         compacted, _ = compress_context(
-            _agent(db, sid), resumed, "sys", approx_tokens=100_000
+            cycle_agent, resumed, "sys", approx_tokens=100_000
         )
         durable = db.get_messages_as_conversation(sid)
         for persisted in (compacted, durable):
@@ -319,7 +322,9 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
                 or m.get("content") == PRESERVED_HUMAN_TASK_BRIDGE
             )
         ]
-        assert len(bridge_markers) <= 3
+        bridge_count = len(bridge_markers)
+        assert bridge_count <= protected_tail_bound
+        bridge_counts.append(bridge_count)
         preserved_bridge_counts.append(sum(
             m.get("content") == PRESERVED_HUMAN_TASK_BRIDGE for m in durable
         ))
@@ -330,6 +335,8 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
         assert compacted == durable
         db.close()
     assert archived_counts[1] > archived_counts[0] > 0
+    assert len(bridge_counts) == 2
+    assert all(count <= protected_tail_bound for count in bridge_counts)
     assert all(count <= 1 for count in preserved_bridge_counts)
     assert preserved_bridge_counts[1] == preserved_bridge_counts[0]
 

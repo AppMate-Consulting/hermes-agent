@@ -103,16 +103,17 @@ class TestInPlaceCompaction:
             # compacted set so compaction actually shrinks the live session and
             # doesn't immediately re-compact (#38763).
             reloaded = db.get_messages_as_conversation(sid)
-            assert len(reloaded) == 2
+            assert len(reloaded) == 3
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                messages[-1]["content"],
             ]
-            assert row["message_count"] == 2  # live (active) count
+            assert row["message_count"] == 3  # live (active) count
             # NON-DESTRUCTIVE: the 8 seeded originals survive at active=0
-            # alongside the 2 compacted rows — nothing was DELETEd.
+            # alongside the 3 compacted rows — nothing was DELETEd.
             all_rows = db.get_messages(sid, include_inactive=True)
-            assert len(all_rows) == 10
+            assert len(all_rows) == 11
             archived = [m for m in all_rows if not m.get("active", 1)]
             assert len(archived) == 8
             # The originals remain FTS-searchable (active=0 is a content-
@@ -131,7 +132,7 @@ class TestInPlaceCompaction:
             # Rotation-independent in-place signal set for the gateway.
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
-            assert len(compressed) == 2
+            assert len(compressed) == 3
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
@@ -206,11 +207,12 @@ class TestRotationFallbackWhenFlagOff:
             assert child[0]["title"] == "my-research"
             # The compacted child is persisted atomically at the rotation
             # boundary, so a headless process killed before finalization can
-            # still resume it without duplicating the two handoff messages.
-            assert agent._last_flushed_db_idx == 2
+            # still resume it without duplicating the three handoff messages.
+            assert agent._last_flushed_db_idx == 3
             assert [m.get("content") for m in db.get_messages_as_conversation(agent.session_id)] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                messages[-1]["content"],
             ]
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
@@ -671,6 +673,7 @@ class TestInPlaceAntiGrowthGuard:
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                messages[-1]["content"],
             ]
 
 

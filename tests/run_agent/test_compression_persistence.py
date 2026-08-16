@@ -270,6 +270,7 @@ class TestFlushAfterCompression:
             )] == [
                 "[summary] earlier state",
                 "retained tail",
+                original[0]["content"],
                 "new request",
                 "new answer",
             ]

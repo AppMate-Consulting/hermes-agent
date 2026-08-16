@@ -6,6 +6,8 @@ Verifies that:
 - Preflight compression proactively compresses oversized sessions before API calls
 """
 
+import os
+
 import pytest
 #pytestmark = pytest.mark.skip(reason="Hangs in non-interactive environments")
 
@@ -222,6 +224,8 @@ def test_explicit_completion_provenance_survives_sessiondb_replay(
     from hermes_state import SessionDB
     from agent.context_compressor import ContextCompressor
     from agent.conversation_compression import (
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
         AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
         AUTONOMOUS_COMPLETION_BRIDGE_USER,
     )
@@ -289,13 +293,14 @@ def test_explicit_completion_provenance_survives_sessiondb_replay(
 def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
     tmp_path, request
 ):
-    """Text equality alone must never turn a human bridge lookalike synthetic."""
+    """Replay and compaction preserve an exact human bridge lookalike."""
     from hermes_state import SessionDB
     from agent.context_compressor import ContextCompressor
     from agent.conversation_compression import (
         AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
         AUTONOMOUS_COMPLETION_BRIDGE_USER,
         _latest_active_human_task_row,
+        compress_context,
     )
 
     db = SessionDB(db_path=Path(tmp_path) / "bridge-lookalike.db")
@@ -310,10 +315,23 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
         ("user", AUTONOMOUS_COMPLETION_BRIDGE_USER, None),
         ("assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT, None),
         ("user", "[ASYNC DELEGATION COMPLETE child=real]", "internal_notification"),
-        ("assistant", "completion handled", None),
     ]
     for role, content, display_kind in rows:
         db.append_message(sid, role, content, display_kind=display_kind)
+    db.append_message(
+        sid,
+        "assistant",
+        "",
+        tool_calls=[{
+            "id": "completion-proof-call",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }],
+    )
+    db.append_message(
+        sid, "tool", "completion tool result", tool_call_id="completion-proof-call"
+    )
+    db.append_message(sid, "assistant", "completion handled")
 
     replay = db.get_messages_as_conversation(sid)
     active = _latest_active_human_task_row(replay)
@@ -326,6 +344,114 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
     assert sum(
         row.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER for row in replay
     ) == 2
+
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        compacting_agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            session_db=db,
+            session_id=sid,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    compacting_agent.compression_in_place = True
+    compacting_agent.context_compressor.protect_first_n = 0
+    compacting_agent.context_compressor.protect_last_n = 3
+    compacting_agent.context_compressor._generate_summary = (
+        lambda *_args, **_kwargs: "Deterministic completion history summary."
+    )
+    compacting_agent._cached_system_prompt = "stable system prompt"
+
+    estimate_calls = []
+
+    def _admitted_full_request_estimate(messages, *, system_prompt="", tools=None):
+        estimate_calls.append((list(messages), system_prompt, tools))
+        return 20_000 if len(estimate_calls) == 1 else 1_000
+
+    telemetry = []
+
+    def _record_telemetry(owner, **kwargs):
+        telemetry.append(dict(kwargs))
+
+    with (
+        patch(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            side_effect=_admitted_full_request_estimate,
+        ),
+        patch(
+            "agent.conversation_compression._emit_compression_attempt_telemetry",
+            side_effect=_record_telemetry,
+        ),
+        patch.object(db, "archive_and_compact", wraps=db.archive_and_compact) as commit,
+        patch.object(db, "append_message", wraps=db.append_message) as append,
+    ):
+        compacted, _ = compress_context(
+            compacting_agent, replay, "sys", approx_tokens=1, force=True
+        )
+
+    durable = db.get_messages_as_conversation(sid)
+    for transcript in (compacted, durable):
+        active = _latest_active_human_task_row(transcript)
+        assert active is not None
+        assert active["content"] == AUTONOMOUS_COMPLETION_BRIDGE_USER
+        assert ContextCompressor._active_task_contract(transcript)["content"] == (
+            AUTONOMOUS_COMPLETION_BRIDGE_USER
+        )
+        assert not any(row.get("content") == "older task" for row in transcript)
+        assert ContextCompressor._has_autonomous_completion_chain(transcript)
+        assert any(
+            row.get("role") == "user"
+            and row.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER
+            and not ContextCompressor._completion_has_durable_provenance(
+                transcript, index
+            )
+            for index, row in enumerate(transcript)
+        )
+        roles = [row["role"] for row in transcript]
+        assert all(left != right for left, right in zip(roles, roles[1:]))
+        call_ids = {
+            call["id"]
+            for row in transcript
+            for call in row.get("tool_calls", [])
+        }
+        assert all(
+            row.get("tool_call_id") in call_ids
+            for row in transcript
+            if row.get("role") == "tool"
+        )
+        assert call_ids == {"completion-proof-call"}
+
+    bridge_contents = {
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+    }
+    bridge_counts = {
+        content: sum(row.get("content") == content for row in durable)
+        for content in bridge_contents
+    }
+    assert bridge_counts[AUTONOMOUS_COMPLETION_BRIDGE_USER] <= 2
+    assert bridge_counts[AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT] <= 1
+    assert bridge_counts[ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE] <= 1
+    assert bridge_counts[ACTIVE_TASK_CONTRACT_BRIDGE_AFTER] <= 1
+    assert len(estimate_calls) == 2
+    assert estimate_calls[0][0] == replay
+    assert all(system_prompt for _, system_prompt, _ in estimate_calls)
+    assert estimate_calls[0][2] == estimate_calls[1][2]
+    assert commit.call_count == 1
+    append.assert_not_called()
+    persisted = db.get_messages(sid, include_inactive=True)
+    assert sum(not row.get("active", 1) for row in persisted) == len(replay)
+    assert sum(bool(row.get("active", 1)) for row in persisted) == len(durable)
+    assert compacting_agent._last_compression_outcome == (
+        "committed_materially_shrunk"
+    )
+    assert compacting_agent._compression_durable_commit_occurred is True
+    assert telemetry[-1]["commit_status"] == "committed"
+    assert telemetry[-1]["split_status"] == "in_place_committed"
 
 
 class TestHTTP413Compression:

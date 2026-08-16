@@ -3635,7 +3635,7 @@ def compress_context(
         _refresh_active_task_contract(_input_messages_snapshot, compressed)
         _ensure_compressed_has_user_turn(_input_messages_snapshot, compressed)
 
-        cached_system_prompt = agent._cached_system_prompt
+        cached_system_prompt = getattr(agent, "_cached_system_prompt", None)
         agent._invalidate_system_prompt()
 
         # Built-in memory is the only system-prompt input that a normal

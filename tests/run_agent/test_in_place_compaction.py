@@ -758,6 +758,9 @@ class TestInPlaceAntiGrowthGuard:
             )
             agent.commit_memory_session = MagicMock()
             agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = (
+                "deterministic external memory prompt"
+            )
             agent.event_callback = MagicMock()
             fence = CompressionCommitFence()
 

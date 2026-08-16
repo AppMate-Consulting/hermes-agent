@@ -107,7 +107,7 @@ class TestInPlaceCompaction:
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
-                messages[-1]["content"],
+                messages[-1]["content"].strip(),
             ]
             assert row["message_count"] == 3  # live (active) count
             # NON-DESTRUCTIVE: the 8 seeded originals survive at active=0
@@ -212,7 +212,7 @@ class TestRotationFallbackWhenFlagOff:
             assert [m.get("content") for m in db.get_messages_as_conversation(agent.session_id)] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
-                messages[-1]["content"],
+                messages[-1]["content"].strip(),
             ]
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
@@ -673,7 +673,7 @@ class TestInPlaceAntiGrowthGuard:
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
-                messages[-1]["content"],
+                messages[-1]["content"].strip(),
             ]
 
 

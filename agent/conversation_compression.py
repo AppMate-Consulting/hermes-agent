@@ -3584,7 +3584,9 @@ def compress_context(
             _authoritative_pre_compression_snapshot
         )
         _protected_tail_snapshot: list = []
-        _compression_input = messages
+        _compression_head_snapshot = copy.deepcopy(
+            _authoritative_pre_compression_snapshot
+        )
         if protected_tail is not None:
             _requested_tail = copy.deepcopy(protected_tail)
             if not _requested_tail or len(_requested_tail) >= len(messages):
@@ -3594,7 +3596,14 @@ def compress_context(
                     "protected compression tail does not match authoritative transcript"
                 )
             _protected_tail_snapshot = _requested_tail
-            _compression_input = copy.deepcopy(messages[:-len(_requested_tail)])
+            _compression_head_snapshot = copy.deepcopy(
+                _authoritative_pre_compression_snapshot[:-len(_requested_tail)]
+            )
+        # Compressor implementations are third-party extension points and may
+        # mutate the list they receive.  Keep the authoritative head frozen for
+        # semantic comparison and candidate restoration, and dispatch a
+        # separate working copy even for full compression.
+        _compression_working_copy = copy.deepcopy(_compression_head_snapshot)
         # Snapshot the exact request prompt before any compression hook can
         # invalidate or rebuild prompt state. An uncached request would build
         # this same prompt on its normal request path; sizing against "" would
@@ -3680,7 +3689,9 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
-                    compressed = compress_fn(_compression_input, **compress_kwargs)
+                    compressed = compress_fn(
+                        _compression_working_copy, **compress_kwargs
+                    )
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
@@ -3891,7 +3902,7 @@ def compress_context(
         # legacy/plugin engines may return an equal copy for a no-op, or mutate
         # the live list while returning an unchanged snapshot. Neither case may
         # rotate or rewrite the session.
-        if compressed == _compression_input:
+        if compressed == _compression_head_snapshot:
             _restore_uncommitted_input()
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
@@ -4039,8 +4050,8 @@ def compress_context(
         # generated output.  Leave generated-head repair to the seam validator
         # and preserve the suffix as the sole latest-human evidence.
         if not _protected_tail_snapshot:
-            _refresh_active_task_contract(_compression_input, compressed)
-            _ensure_compressed_has_user_turn(_compression_input, compressed)
+            _refresh_active_task_contract(_compression_head_snapshot, compressed)
+            _ensure_compressed_has_user_turn(_compression_head_snapshot, compressed)
         if _protected_tail_snapshot:
             # The protected suffix is appended byte-for-byte before admission
             # and before the sole SessionDB publication.  Never run sequence

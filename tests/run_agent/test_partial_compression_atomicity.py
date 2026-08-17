@@ -104,6 +104,7 @@ def _agent(db: SessionDB, sid: str, *, in_place: bool, seen: list[list[dict]]):
     compressor._last_summary_dropped_count = 0
     compressor._last_aux_model_failure_model = None
     compressor._last_aux_model_failure_error = None
+    compressor.select_context.side_effect = lambda rows, **_kwargs: copy.deepcopy(rows)
     agent.context_compressor = compressor
     agent.context_engine = None
     agent._context_engine = None

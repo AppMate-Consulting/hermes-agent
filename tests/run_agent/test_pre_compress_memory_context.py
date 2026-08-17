@@ -332,7 +332,20 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
 
     if mode == "anthropic-native":
         native_client = MagicMock()
-        native_client.messages.create.side_effect = create
+
+        def stream(**kwargs):
+            final_message = create(**kwargs)
+            event = SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(type="text_delta", text="done"),
+            )
+            context = MagicMock()
+            context.__enter__.return_value = context
+            context.__iter__.return_value = iter([event])
+            context.get_final_message.return_value = final_message
+            return context
+
+        native_client.messages.stream.side_effect = stream
         monkeypatch.setattr(
             agent,
             "_create_request_anthropic_client",

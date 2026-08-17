@@ -21,6 +21,8 @@ from pathlib import Path
 
 from agent.context_compressor import SUMMARY_PREFIX
 from agent.conversation_compression import (
+    ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+    ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
     COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
     _compaction_terminal_status,

@@ -481,10 +481,13 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
     assert [row.get("content") for row in request_in[1:]] == [
         row.get("content") for row in replay
     ]
-    projected_active = _latest_active_human_task_row(request_in[1:])
-    assert projected_active is not None
-    assert projected_active["content"] == AUTONOMOUS_COMPLETION_BRIDGE_USER
-    assert not projected_active.get("autonomous_completion_provenance", False)
+    assert request_in[3]["role"] == replay[2]["role"] == "user"
+    assert request_in[3]["content"] == replay[2]["content"] == (
+        AUTONOMOUS_COMPLETION_BRIDGE_USER
+    )
+    assert not any(
+        row.get("autonomous_completion_provenance", False) for row in request_in
+    )
     assert request_out[0]["role"] == "system"
     assert tools_in == tools_out == tools_before
     assert replay == replay_before

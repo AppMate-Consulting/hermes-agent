@@ -839,6 +839,7 @@ class TestInPlaceAntiGrowthGuard:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
         from agent.conversation_loop import project_provider_request
+        from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
@@ -901,10 +902,19 @@ class TestInPlaceAntiGrowthGuard:
                     static_system_prefix=static,
                 )
                 assert request_in == expected_in["messages"]
-                assert request_out_rows[0] == {
-                    "role": "system",
-                    "content": "deterministic external memory prompt",
-                }
+                assert request_out_rows[0]["role"] == "system"
+                built_output_prompt = request_out_rows[0]["content"]
+                for required_fragment in (
+                    DEFAULT_AGENT_IDENTITY,
+                    "deterministic external memory prompt",
+                    "Conversation started:",
+                    "Model: test/model",
+                ):
+                    assert built_output_prompt.count(required_fragment) == 1
+                assert built_output_prompt.split("\n\n").count("sys") == 1
+                assert sum(
+                    row.get("role") == "system" for row in request_out_rows
+                ) == 1
                 assert request_out_rows != request_in
                 admitted_content = "\n".join(
                     str(message.get("content", "")) for message in request_out_rows
@@ -912,10 +922,6 @@ class TestInPlaceAntiGrowthGuard:
                 assert "mutated candidate" in admitted_content
                 assert original[-2]["content"] in admitted_content
                 assert sum(row.get("content") == cached for row in request_in) == 1
-                assert sum(
-                    row.get("content") == "deterministic external memory prompt"
-                    for row in request_out_rows
-                ) == 1
                 assert tools_in == tools_out == tools_before
             assert returned is messages
             assert messages == original

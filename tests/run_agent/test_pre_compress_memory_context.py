@@ -436,11 +436,10 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     assert db.get_compression_lock_holder(sid) is None
     assert agent._last_compression_outcome == "committed_materially_shrunk"
 
-    # Grow provider-visible history while leaving the latest human task short.
-    second_input = [
-        {"role": "assistant", "content": "large second history " * 10_000},
-        *copy.deepcopy(first),
-    ]
+    # Grow the authoritative child while leaving its latest human task short.
+    db.append_message(child_b, "assistant", "large second history " * 10_000)
+    db.append_message(child_b, "user", "second latest short human task")
+    second_input = db.get_messages_as_conversation(child_b)
     second, _ = agent._compress_context(
         second_input, "sys", approx_tokens=100_000, force=True
     )
@@ -452,7 +451,7 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     frozen_parent_a = copy.deepcopy(events[0][2])
     assert db.get_compression_lock_holder(child_b) is None
     assert "small child" in second[0]["content"]
-    assert "latest short human task" in second[0]["content"]
+    assert "second latest short human task" in second[0]["content"]
 
     release.set()
     tail = agent._compression_observer_lane_tail

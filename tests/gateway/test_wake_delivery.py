@@ -9,6 +9,7 @@ Two strategies:
 """
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -127,3 +128,80 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     asyncio.run(run())
     assert calls["n"] == 2
 
+
+def test_api_internal_wake_capability_is_end_to_end_and_unforgeable(monkeypatch):
+    """Only the per-process capability minted by the real adapter types a turn."""
+    from aiohttp import ClientSession, web
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sekrit"}))
+    observed = []
+
+    fake_agent = MagicMock()
+    fake_agent.session_prompt_tokens = 0
+    fake_agent.session_completion_tokens = 0
+    fake_agent.session_total_tokens = 0
+    fake_agent.session_id = "wake-capability-session"
+
+    def run_conversation(user_message, **kwargs):
+        observed.append((
+            user_message,
+            kwargs.get("persist_user_is_autonomous_completion", False),
+        ))
+        return {"final_response": "ok", "completed": True}
+
+    fake_agent.run_conversation.side_effect = run_conversation
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: fake_agent)
+    monkeypatch.setattr(adapter, "_ensure_session_db_async", AsyncMock(return_value=None))
+
+    async def exercise():
+        app = web.Application()
+        app["api_server_adapter"] = adapter
+        app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        adapter._host = "127.0.0.1"
+        adapter._port = site._server.sockets[0].getsockname()[1]
+        payload = {
+            "model": "hermes-agent", "stream": False,
+            "messages": [{"role": "user", "content": "identical completion text"}],
+        }
+        authenticated = {
+            "Authorization": "Bearer sekrit",
+            "X-Hermes-Session-Id": "wake-capability-session",
+        }
+        try:
+            await deliver_wake(
+                adapter, text="identical completion text",
+                session_id="wake-capability-session",
+            )
+            async with ClientSession() as client:
+                for supplied in (None, "wrong-capability"):
+                    headers = dict(authenticated)
+                    if supplied is not None:
+                        headers["X-Hermes-Internal-Wake"] = supplied
+                    response = await client.post(
+                        f"http://127.0.0.1:{adapter._port}/v1/chat/completions",
+                        json=payload, headers=headers,
+                    )
+                    assert response.status == 200
+                    await response.read()
+                response = await client.post(
+                    f"http://127.0.0.1:{adapter._port}/v1/chat/completions",
+                    json=payload,
+                    headers={"X-Hermes-Internal-Wake": "wrong-capability"},
+                )
+                assert response.status == 401
+                await response.read()
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(exercise())
+    assert observed == [
+        ("identical completion text", True),
+        ("identical completion text", False),
+        ("identical completion text", False),
+    ]

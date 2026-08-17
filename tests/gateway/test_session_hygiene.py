@@ -1256,10 +1256,15 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
 
 
 @pytest.mark.asyncio
-async def test_hygiene_rejection_ladder_advances_after_expiry_and_restart(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("outcome", [
+    "persistence_failure",
+    "compression_exception_RuntimeError",
+    "wrapper_exception_RuntimeError",
+])
+async def test_hygiene_terminal_failure_ladder_advances_after_expiry_and_restart(
+    monkeypatch, tmp_path, outcome
 ):
-    """Each rung is earned by a real post-deadline hygiene rejection."""
+    """Every generic terminal class earns exactly one durable rung per run."""
     from hermes_state import SessionDB
 
     path = tmp_path / "ladder-restart.db"
@@ -1279,7 +1284,7 @@ async def test_hygiene_rejection_ladder_advances_after_expiry_and_restart(
             self.close = MagicMock()
 
         def _compress_context(self, messages, *_args, **_kwargs):
-            self._last_compression_outcome = "rejected_no_progress"
+            self._last_compression_outcome = outcome
             return messages, ""
 
     deadlines = []
@@ -1302,6 +1307,7 @@ async def test_hygiene_rejection_ladder_advances_after_expiry_and_restart(
         assert await runner._handle_message(event) == "ok"
         state = db.get_compression_failure_cooldown(sid)
         assert db.get_hygiene_failure_streak(sid) == expected_streak
+        assert state["error"] == outcome
         assert state["cooldown_until"] - before == pytest.approx(
             min(300 * multiplier, 3600), abs=5
         )

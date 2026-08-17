@@ -40,7 +40,9 @@ def _assert_role_alternation(rows):
     assert all(left != right for left, right in zip(roles, roles[1:]))
 
 
-def _build_agent_with_db(db: SessionDB, session_id: str):
+def _build_agent_with_db(
+    db: SessionDB, session_id: str, *, in_place: bool | None = False
+):
     """Build an AIAgent wired to ``db`` and pinned to ``session_id``.
 
     Mirrors the helper in ``test_rotation_flush_persisted_boundary_68196.py``:
@@ -82,7 +84,8 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     # One-time compression-model feasibility probe would resolve a REAL
     # auxiliary provider; mark it done like test_compression_concurrent_fork.
     agent._compression_feasibility_checked = True
-    agent.compression_in_place = False
+    if in_place is not None:
+        agent.compression_in_place = in_place
     return agent
 
 
@@ -238,11 +241,15 @@ def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
     db.append_message(sid, "assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT)
     db.append_message(
         sid, "user", "[ASYNC DELEGATION COMPLETE child=durable]",
-        display_kind="internal_notification",
+        display_kind="async_delegation_complete",
+        is_autonomous_completion=True,
     )
     db.append_message(sid, "assistant", "runtime completion handled")
 
-    agent = _build_agent_with_db(db, sid)
+    # Do not override compression_in_place: the production default is the
+    # contract under test here.
+    agent = _build_agent_with_db(db, sid, in_place=None)
+    assert agent.compression_in_place is True
     seen_engine = []
     agent.context_compressor.compress.side_effect = lambda rows, **_kw: (
         seen_engine.append(copy.deepcopy(rows))
@@ -277,12 +284,106 @@ def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
     assert all(snapshot is not adopted for _, snapshot in memory_seen)
     assert any(row.get("content") == "NEWER AUTHORITATIVE TASK" for row in compressed)
     assert not any(row.get("content") == "stale caller task" for row in compressed)
-    parent = db.get_messages_as_conversation(sid, include_inactive=True)
-    child = db.get_messages_as_conversation(agent.session_id)
-    assert len(parent) == 8 and child
+    active = db.get_messages_as_conversation(sid)
+    assert agent.session_id == sid
+    assert _contents(active) == _contents(compressed)
+    assert [row.get("role") for row in active] == [
+        row.get("role") for row in compressed
+    ]
+    assert any(row.get("content") == "NEWER AUTHORITATIVE TASK" for row in active)
+    from agent.context_compressor import ContextCompressor
+    contract = ContextCompressor._active_task_contract(active)
+    assert contract is not None
+    assert contract["content"] == "NEWER AUTHORITATIVE TASK"
     assert agent._persist_user_message_idx == len(adopted)
-    _assert_role_alternation(parent)
-    _assert_role_alternation(child)
+    _assert_role_alternation(active)
+
+
+@pytest.mark.parametrize("in_place", [True, False], ids=["in-place", "rotation"])
+def test_compress_context_rejects_commit_time_durable_drift(
+    tmp_path: Path, in_place: bool
+) -> None:
+    """The summary hook races the real publication after identity capture.
+
+    This deliberately does not call either SessionDB CAS API directly.  The
+    production ``compress_context`` flow captures the authoritative identity,
+    invokes the context engine, and then reaches the real publication method.
+    Appending from the engine is therefore the exact post-read/pre-commit race.
+    """
+    from agent import relay_runtime
+    from agent.conversation_compression import CompressionCommitFence
+
+    db = SessionDB(db_path=tmp_path / f"drift-{in_place}.db")
+    sid = f"COMMIT_DRIFT_{in_place}"
+    db.create_session(sid, source="desktop")
+    for index in range(8):
+        db.append_message(
+            sid,
+            "user" if index % 2 == 0 else "assistant",
+            f"durable row {index} " + ("payload " * 2_000),
+        )
+    caller = db.get_messages_as_conversation(sid)
+    before_all = db.get_messages(sid, include_inactive=True)
+    agent = _build_agent_with_db(db, sid, in_place=in_place)
+    agent._cached_system_prompt = "stable prompt"
+    agent._cached_system_prompt_static = "stable static"
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.build_system_prompt.return_value = "memory prompt"
+    agent.commit_memory_session = MagicMock()
+    agent.event_callback = MagicMock()
+    boundary = MagicMock()
+    fence = CompressionCommitFence()
+
+    def race_after_authoritative_read(rows, **_kwargs):
+        assert _contents(rows) == _contents(caller)
+        db.append_message(sid, "user", "LATE DURABLE ROW")
+        return [{"role": "assistant", "content": "[CONTEXT COMPACTION] summary"}]
+
+    agent.context_compressor.compress.side_effect = race_after_authoritative_read
+    with (
+        patch.object(
+            relay_runtime.SESSION_COORDINATOR,
+            "notify_session_compacted",
+            boundary,
+        ),
+        patch.object(
+            db, "archive_and_compact", wraps=db.archive_and_compact
+        ) as archive,
+        patch.object(
+            db, "publish_compression_child", wraps=db.publish_compression_child
+        ) as publish,
+        patch(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            side_effect=[100_000, 1_000],
+        ),
+    ):
+        returned, prompt = agent._compress_context(
+            caller, "sys", approx_tokens=100_000, commit_fence=fence
+        )
+
+    assert returned is caller
+    assert prompt == "stable prompt"
+    assert agent.session_id == sid
+    assert agent._last_compression_outcome == "persistence_failure"
+    assert agent._last_compaction_in_place is False
+    assert fence.commit_in_flight is False
+    assert db.get_compression_lock_holder(sid) is None
+    active = db.get_messages_as_conversation(sid)
+    assert _contents(active) == _contents(caller) + ["LATE DURABLE ROW"]
+    after_all = db.get_messages(sid, include_inactive=True)
+    assert len(after_all) == len(before_all) + 1
+    assert all(row["active"] for row in after_all)
+    assert db._conn.execute(
+        "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+    ).fetchall() == []
+    assert (archive.call_count, publish.call_count) == (
+        (1, 0) if in_place else (0, 1)
+    )
+    agent._memory_manager.on_pre_compress.assert_not_called()
+    agent._memory_manager.on_session_switch.assert_not_called()
+    agent.commit_memory_session.assert_not_called()
+    agent.event_callback.assert_not_called()
+    boundary.assert_not_called()
 
 
 def test_rotation_publication_failure_keeps_real_parent_preflush_and_rolls_back(

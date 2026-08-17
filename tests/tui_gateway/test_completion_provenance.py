@@ -94,6 +94,8 @@ def test_poller_dispatches_every_completion_shape_with_explicit_provenance(
     assert calls[0][1]["is_autonomous_completion"] is True
     if event["type"] == "async_delegation":
         assert calls[0][1]["display_kind"] == "async_delegation_complete"
+    else:
+        assert calls[0][1].get("display_kind") is None
 
 
 @pytest.mark.parametrize(
@@ -160,9 +162,11 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
     recursive_dispatch_complete = threading.Event()
 
     def run_conversation(
-        message, *, persist_user_is_autonomous_completion=False, **_kwargs
+        message, *, persist_user_is_autonomous_completion=False,
+        persist_user_display_kind=None, **_kwargs
     ):
-        seen.append((message, persist_user_is_autonomous_completion))
+        seen.append((message, persist_user_display_kind,
+                     persist_user_is_autonomous_completion))
         if len(seen) == 1:
             pending.append([(event, synthetic)])
             return {"final_response": "done", "messages": []}
@@ -172,7 +176,7 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
                 conversation_history=db.get_messages_as_conversation(
                     "completion-owner"
                 ),
-                persist_user_display_kind="internal_notification",
+                persist_user_display_kind=persist_user_display_kind,
                 persist_user_is_autonomous_completion=persist_user_is_autonomous_completion,
             )
         finally:
@@ -200,7 +204,15 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
             run_thread.join(timeout=5)
             assert not run_thread.is_alive()
 
-        assert seen == [("first user turn", False), (synthetic, True)]
+        expected_kind = (
+            "async_delegation_complete"
+            if event["type"] == "async_delegation"
+            else None
+        )
+        assert seen == [
+            ("first user turn", None, False),
+            (synthetic, expected_kind, True),
+        ]
         replay = db.get_messages_as_conversation("completion-owner")
         from agent.conversation_compression import (
             AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
@@ -218,7 +230,23 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
             ("assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT),
             ("user", synthetic),
         ]
+        assert replay[completion_index].get("display_kind") == expected_kind
+        assert replay[completion_index].get("is_autonomous_completion") is True
         assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
+        db.close()
+        db = SessionDB(db_path=tmp_path / "state.db")
+        replay_after_restart = db.get_messages_as_conversation("completion-owner")
+        restarted_index = next(
+            index for index, row in enumerate(replay_after_restart)
+            if row.get("content") == synthetic
+        )
+        assert replay_after_restart[restarted_index].get("display_kind") == expected_kind
+        assert replay_after_restart[restarted_index].get(
+            "is_autonomous_completion"
+        ) is True
+        assert ContextCompressor._has_autonomous_completion_chain(
+            replay_after_restart[:restarted_index + 1]
+        )
     finally:
         server._sessions.pop("sid", None)
         while not isolated_queue.empty():

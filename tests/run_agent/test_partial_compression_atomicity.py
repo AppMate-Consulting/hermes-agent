@@ -448,6 +448,171 @@ def test_autonomous_only_suffix_restores_task_contract_across_restart(
 
 
 @pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "rotation"])
+def test_push_wake_provenance_survives_restart_and_partial_compaction(
+    tmp_path: Path, in_place: bool
+):
+    """The real push wake is trusted, durable, and never becomes task authority."""
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        _latest_active_human_task_row,
+    )
+    from gateway.config import Platform
+    from gateway.run import _event_conversation_forwarding_metadata
+    from gateway.session import SessionSource
+    from gateway.wake import deliver_wake
+    from hermes_cli.partial_compress import split_history_for_partial_compress
+
+    path = tmp_path / "push-wake-provenance.db"
+    sid = "PUSH_WAKE_PROVENANCE"
+    notification = "[ASYNC DELEGATION COMPLETE child=push-proof]"
+    genuine_task = "PUSH PATH GENUINE HUMAN TASK"
+    db = SessionDB(db_path=path)
+    db.create_session(sid, source="telegram", model="test/model")
+    db.append_message(sid, "user", OLD_TASK)
+    db.append_message(sid, "assistant", "old answer " + "bulk " * 1200)
+    db.append_message(sid, "user", genuine_task)
+    db.append_message(sid, "assistant", "genuine task completed")
+
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), patch(
+        "run_agent.get_tool_definitions", return_value=[]
+    ), patch("run_agent.check_toolset_requirements", return_value={}), patch(
+        "run_agent.OpenAI"
+    ):
+        from run_agent import AIAgent
+
+        delivery_agent = AIAgent(
+            api_key="test-key", base_url="https://invalid.test/v1",
+            model="test/model", quiet_mode=True, session_db=db, session_id=sid,
+            skip_context_files=True, skip_memory=True,
+        )
+    delivery_agent.compression_enabled = False
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content="push completion consumed", tool_calls=None,
+                reasoning_content=None, reasoning=None,
+            ),
+            finish_reason="stop",
+        )],
+        model="test/model", usage=None,
+    )
+    delivery_agent.client = MagicMock()
+    delivery_agent.client.chat.completions.create.return_value = response
+
+    class PersistingPushAdapter:
+        handled = []
+
+        async def handle_message(self, event):
+            self.handled.append(event)
+            display_kind, autonomous = _event_conversation_forwarding_metadata(event)
+            delivery_agent.run_conversation(
+                event.text,
+                conversation_history=db.get_messages_as_conversation(sid),
+                persist_user_display_kind=display_kind,
+                persist_user_is_autonomous_completion=autonomous,
+            )
+
+    adapter = PersistingPushAdapter()
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="trusted-chat", chat_type="group"
+    )
+    asyncio.run(deliver_wake(adapter, text=notification, source=source))
+    assert len(adapter.handled) == 1
+    delivered_event = adapter.handled[0]
+    assert delivered_event.internal is True
+    assert delivered_event.autonomous_completion is True
+    assert delivered_event.allow_gateway_control is True
+
+    pushed = db.get_messages_as_conversation(sid)
+    exact_suffix = pushed[-4:]
+    assert [(row["role"], row.get("content")) for row in exact_suffix] == [
+        ("user", AUTONOMOUS_COMPLETION_BRIDGE_USER),
+        ("assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT),
+        ("user", notification),
+        ("assistant", "push completion consumed"),
+    ]
+    assert [
+        row.get("_autonomous_completion_bridge") is True for row in exact_suffix
+    ] == [True, True, True, False]
+    assert exact_suffix[2]["display_kind"] == "internal_notification"
+    assert ContextCompressor._completion_has_durable_provenance(
+        pushed, len(pushed) - 2
+    )
+    assert _latest_active_human_task_row(pushed)["content"] == genuine_task
+
+    db.close()
+    db = SessionDB(db_path=path)
+    restarted = db.get_messages_as_conversation(sid)
+    assert restarted == pushed
+    assert ContextCompressor._completion_has_durable_provenance(
+        restarted, len(restarted) - 2
+    )
+    assert _latest_active_human_task_row(restarted)["content"] == genuine_task
+
+    head, protected = split_history_for_partial_compress(restarted, 1)
+    assert head == restarted[:-4]
+    assert protected == exact_suffix
+    seen: list[list[dict]] = []
+    compression_agent = _agent(db, sid, in_place=in_place, seen=seen)
+    with patch(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        side_effect=[100_000, 1_000],
+    ):
+        published, _ = compression_agent._compress_context(
+            restarted, None, approx_tokens=100_000, force=True,
+            protected_tail=protected,
+        )
+    active_sid = compression_agent.session_id
+    assert len(seen) == 1
+    assert seen[0] == head
+    assert published[-4:] == exact_suffix
+    durable = db.get_messages_as_conversation(active_sid)
+    assert durable == published
+    assert durable[-4:] == exact_suffix
+    assert durable.count(exact_suffix[0]) == 1
+    assert _latest_active_human_task_row(durable)["content"] == genuine_task
+    before = [
+        i for i, row in enumerate(durable)
+        if row.get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+    ]
+    after = [
+        i for i, row in enumerate(durable)
+        if row.get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
+    ]
+    assert len(before) == len(after) == 1
+    assert after == [before[0] + 2]
+    contract = ContextCompressor.parse_active_task_contract(
+        durable[before[0] + 1], allow_projected=True
+    )
+    assert contract is not None
+    assert contract["content"] == genuine_task
+    assert ContextCompressor._active_task_contract(durable) == contract
+    assert ContextCompressor._completion_has_durable_provenance(
+        durable, len(durable) - 2
+    )
+    if in_place:
+        assert active_sid == sid
+    else:
+        assert active_sid != sid
+        assert db.get_session(active_sid)["parent_session_id"] == sid
+
+    db.close()
+    reopened = SessionDB(db_path=path)
+    replay = reopened.get_messages_as_conversation(active_sid)
+    assert replay == durable
+    assert replay[-4:] == exact_suffix
+    assert _latest_active_human_task_row(replay)["content"] == genuine_task
+    assert ContextCompressor._completion_has_durable_provenance(
+        replay, len(replay) - 2
+    )
+    reopened.close()
+
+
+@pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "rotation"])
 def test_cli_manual_compress_real_sessiondb_partial_matrix(durable_case, in_place):
     """HermesCLI._manual_compress publishes one exact head+suffix transcript."""
     from cli import HermesCLI

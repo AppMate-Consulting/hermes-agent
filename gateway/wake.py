@@ -82,6 +82,7 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            autonomous_completion=True,
         )
         await adapter.handle_message(synth_event)
         return

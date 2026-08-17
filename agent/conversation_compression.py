@@ -3795,40 +3795,29 @@ def compress_context(
                 if not _commit_fence_entered:
                     raise _CompressionPublicationCancelled()
             operation()
-            # The durable replay projection is authoritative.  Persisting a
-            # generated row can replace its speculative ``_row_id`` with the
-            # canonical generated timestamp, so adopting ``compressed`` here
-            # would leave caller/host bookkeeping divergent from SessionDB.
+            # The SessionDB operation above is the irreversible publication
+            # boundary.  From this point on, failures are post-commit failures:
+            # the durable transcript and (for rotation) its child id remain
+            # authoritative and must never be reported as a rollback.
+            agent._compression_durable_commit_occurred = True
+            agent.session_id = active_session_id
+
+            # Adopt the durable replay projection exactly.  Candidate admission
+            # already performed the prepublication CAS, suffix, seam, and
+            # finalized-payload checks.  SessionDB is allowed to normalize its
+            # persisted representation, so comparing the readback byte-for-byte
+            # with speculative rows here would turn a successful commit into a
+            # false rollback.
             durable = agent._session_db.get_messages_as_conversation(
                 active_session_id
             )
             if (
                 not isinstance(durable, list)
                 or not durable
-                or len(durable) != len(compressed)
+                or not all(isinstance(row, dict) for row in durable)
             ):
-                raise RuntimeError(
-                    "Compression publication durable readback mismatched"
-                )
-            for speculative_row, durable_row in zip(compressed, durable):
-                if not isinstance(speculative_row, dict) or not isinstance(
-                    durable_row, dict
-                ):
-                    raise RuntimeError(
-                        "Compression publication durable readback mismatched"
-                    )
-                expected = {
-                    key: value for key, value in speculative_row.items()
-                    if key != "_row_id"
-                }
-                actual = copy.deepcopy(durable_row)
-                if "timestamp" not in expected:
-                    actual.pop("timestamp", None)
-                if actual != expected:
-                    raise RuntimeError(
-                        "Compression publication durable readback mismatched"
-                    )
-            compressed = copy.deepcopy(durable)
+                raise RuntimeError("Compression publication durable readback unusable")
+            compressed = durable
             _adopt_host_publication = getattr(
                 agent, "_adopt_compression_host_publication", None
             )
@@ -4500,6 +4489,12 @@ def compress_context(
                 return messages, _rollback_prompt()
             except Exception as e:
                 if e is _host_claim_exception:
+                    raise
+                if agent._compression_durable_commit_occurred:
+                    # Publication already crossed the irreversible SessionDB
+                    # boundary.  Preserve the committed id/transcript authority
+                    # and let the outer transaction handler re-raise without
+                    # restoring speculative precommit state.
                     raise
                 _set_compression_outcome("persistence_failure")
                 _restore_uncommitted_input()

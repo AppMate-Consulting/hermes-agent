@@ -863,7 +863,10 @@ class TestInPlaceAntiGrowthGuard:
             def mutate(candidate, **_kwargs):
                 candidate[:] = (
                     copy.deepcopy(original) if outcome == "rejected_no_progress"
-                    else [{"role": "user", "content": "mutated candidate"}]
+                    else [
+                        {"role": "user", "content": "mutated candidate"},
+                        {"role": "assistant", "content": "mutated answer"},
+                    ]
                 )
                 return candidate
 
@@ -1014,8 +1017,9 @@ class TestInPlaceAntiGrowthGuard:
                 return candidate
 
             agent.context_compressor.compress = mutate
-            with patch(
-                "agent.conversation_compression._refresh_active_task_contract",
+            with patch.object(
+                agent,
+                "_invalidate_system_prompt",
                 side_effect=RuntimeError("post-engine helper failed"),
             ), pytest.raises(RuntimeError, match="post-engine helper failed"):
                 compress_context(

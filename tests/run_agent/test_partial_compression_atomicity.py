@@ -105,6 +105,7 @@ def _agent(db: SessionDB, sid: str, *, in_place: bool, seen: list[list[dict]]):
     compressor._last_aux_model_failure_model = None
     compressor._last_aux_model_failure_error = None
     agent.context_compressor = compressor
+    agent.context_engine = None
     agent._context_engine = None
     agent.compression_in_place = in_place
     agent._compression_feasibility_checked = True
@@ -431,6 +432,50 @@ def test_host_claim_exception_releases_lease_before_commit_fence(durable_case):
     host_release.assert_not_called()
     assert db.get_messages_as_conversation(sid) == source
     assert db.get_compression_lock_holder(sid) is None
+
+
+def test_postcommit_host_adoption_failure_preserves_rotated_authority(durable_case):
+    """A host failure after SQLite commit cannot resurrect the durable parent."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    db, parent, source = durable_case
+    agent = _agent(db, parent, in_place=False, seen=[])
+    fence = CompressionCommitFence()
+    host_release = MagicMock()
+    agent._claim_compression_host_publication = MagicMock(
+        return_value=host_release
+    )
+    agent._adopt_compression_host_publication = MagicMock(
+        side_effect=RuntimeError("injected postcommit adoption failure")
+    )
+
+    with patch.object(
+        db, "publish_compression_child", wraps=db.publish_compression_child
+    ) as publish, patch(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        side_effect=[100_000, 1_000],
+    ), pytest.raises(RuntimeError, match="postcommit adoption failure"):
+        agent._compress_context(
+            source,
+            None,
+            approx_tokens=100_000,
+            force=True,
+            protected_tail=source[4:],
+            commit_fence=fence,
+        )
+
+    child = agent.session_id
+    assert child != parent
+    assert agent._compression_durable_commit_occurred is True
+    assert db.get_session(child)["parent_session_id"] == parent
+    assert db.get_messages_as_conversation(child)
+    assert db.get_session(parent)["end_reason"] == "compression"
+    assert db.find_live_compression_child(parent)["id"] == child
+    publish.assert_called_once()
+    agent._adopt_compression_host_publication.assert_called_once()
+    host_release.assert_called_once_with()
+    assert fence.commit_in_flight is False
+    assert db.get_compression_lock_holder(parent) is None
 
 
 def test_begin_commit_cancel_after_host_claim_releases_once(durable_case):

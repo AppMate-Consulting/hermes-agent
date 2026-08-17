@@ -272,6 +272,7 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
     agent._use_native_cache_layout = mode == "anthropic-native"
     agent._cache_ttl = "5m"
     agent.context_length = 200_000
+    agent.context_compressor.context_length = 200_000
     agent._direct_native_anthropic_tool_cache_capability = (
         lambda: mode == "anthropic-native"
     )
@@ -767,7 +768,8 @@ def test_real_compressions_deferred_notification_is_claimed_and_fifo_frozen(
     compressor.on_session_start = frozen_callback
 
     def status_callback(_kind, _message):
-        order.append("b-status")
+        if "Session compressed 2 times" in _message:
+            order.append("b-status")
 
     monkeypatch.setattr(
         "agent.conversation_compression._POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.02

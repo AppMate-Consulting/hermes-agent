@@ -405,8 +405,8 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
     replay_before = copy.deepcopy(replay)
     tools_before = copy.deepcopy(compacting_agent.tools)
 
-    def _admitted_full_request_estimate(messages, *, tools=None):
-        estimate_calls.append((copy.deepcopy(messages), copy.deepcopy(tools)))
+    def _admitted_full_request_estimate(payload):
+        estimate_calls.append(copy.deepcopy(payload))
         return 20_000 if len(estimate_calls) == 1 else 1_000
 
     telemetry = []
@@ -416,7 +416,7 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
 
     with (
         patch(
-            "agent.conversation_compression.estimate_request_tokens_rough",
+            "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
             side_effect=_admitted_full_request_estimate,
         ),
         patch(
@@ -470,8 +470,10 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
     assert bridge_counts[ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE] <= 1
     assert bridge_counts[ACTIVE_TASK_CONTRACT_BRIDGE_AFTER] <= 1
     assert len(estimate_calls) == 2
-    request_in, tools_in = estimate_calls[0]
-    request_out, tools_out = estimate_calls[1]
+    request_in = estimate_calls[0]["messages"]
+    tools_in = estimate_calls[0].get("tools")
+    request_out = estimate_calls[1]["messages"]
+    tools_out = estimate_calls[1].get("tools")
     assert request_in[0] == {
         "role": "system", "content": "stable system prompt"
     }

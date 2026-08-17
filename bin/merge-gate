@@ -6,4 +6,28 @@ if [[ -x /opt/venv/bin/python ]]; then
   python_bin=/opt/venv/bin/python
 fi
 
-"$python_bin" -m pytest -o 'addopts=' -q
+"$python_bin" -m pytest \
+  tests/agent/test_compaction_anti_thrash.py \
+  tests/agent/test_completion_chain_compaction.py \
+  tests/agent/test_compress_context_progress_timeout.py \
+  tests/agent/test_compression_review_76354.py \
+  tests/agent/test_compression_adoption_preserves_live_tail.py \
+  tests/agent/test_compression_anti_thrash_persistence.py \
+  tests/agent/test_compression_anti_thrash_recovery.py \
+  tests/gateway/test_buzz_adapter.py \
+  tests/gateway/test_buzz_websocket.py \
+  tests/gateway/test_wake_delivery.py \
+  tests/gateway/test_api_server.py \
+  tests/gateway/test_session_hygiene.py \
+  tests/gateway/test_hygiene_failure_cooldown_ladder.py \
+  tests/gateway/test_compress_command.py \
+  tests/cli/test_compress_here.py \
+  tests/cli/test_compress_type_ahead.py \
+  tests/tui_gateway/test_completion_provenance.py \
+  tests/tui_gateway/test_compress_lock_skip.py \
+  tests/run_agent/test_compression_persistence.py \
+  tests/run_agent/test_partial_compression_atomicity.py \
+  tests/run_agent/test_in_place_compaction.py \
+  tests/run_agent/test_pre_compress_memory_context.py \
+  tests/run_agent/test_413_compression.py \
+  -o 'addopts=' -q

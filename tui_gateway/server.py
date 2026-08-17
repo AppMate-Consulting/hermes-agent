@@ -5072,53 +5072,53 @@ def _compress_session_history(
     # auto-compaction runs inside the agent loop, not here. Manual
     # compaction bypasses the summary-failure cooldown, matching the CLI
     # and gateway handlers.
-    try:
-        compressed, _ = agent._compress_context(
-            history,
-            None,
-            approx_tokens=approx_tokens,
-            # Partial compress has no focus topic (the modes are exclusive;
-            # parse_partial_compress_args returns focus_topic=None for the
-            # boundary-aware forms).
-            focus_topic=focus_topic or None,
-            force=True,
-            defer_context_engine_notification=True,
-            protected_tail=tail if partial and tail else None,
-        )
-    except Exception:
-        finalize_context_engine_compression_notification(
-            agent,
-            committed=False,
-        )
-        raise
-    # If _compress_context returned unchanged because a concurrent
-    # compression lock is held, raise so callers can surface a clear
-    # message instead of the misleading "No changes from compression" text.
-    # Type-pinned (is True / str): real values are None/True/holder-string;
-    # bare truthiness is fooled by MagicMock auto-attrs on test doubles.
-    _lock_skipped = getattr(agent, "_compression_skipped_due_to_lock", None)
-    if _lock_skipped is True or isinstance(_lock_skipped, str):
-        agent._compression_skipped_due_to_lock = None
-        # No boundary was committed on a lock-skip; discard any pending
-        # deferred context-engine notification (exactly-once, no-op safe).
-        finalize_context_engine_compression_notification(
-            agent,
-            committed=False,
-        )
-        raise CompressionLockHeld(
-            _lock_skipped if isinstance(_lock_skipped, str) else None
-        )
-
+    # The durable publication happens inside _compress_context.  Keep the
+    # host-history mutex from the final version check through that publication
+    # and the host adoption below.  Checking history_version only *after* the
+    # SessionDB CAS committed was too late: a typed prompt could make this
+    # helper report a noncommit while the database had already compacted.
+    # Holding this narrow host transaction also guarantees that the returned
+    # in-memory history and the active durable transcript become visible as one
+    # state transition.  Direct SessionDB writers remain covered by the
+    # transcript-generation CAS in archive_and_compact/publish_compression_child.
     with session["history_lock"]:
         if int(session.get("history_version", 0)) != history_version:
-            # External mutation during compaction — drop the compressed
-            # result so we don't clobber concurrent edits.
+            finalize_context_engine_compression_notification(agent, committed=False)
+            return 0, _get_usage(agent)
+        try:
+            compressed, _ = agent._compress_context(
+                history,
+                None,
+                approx_tokens=approx_tokens,
+                # Partial compress has no focus topic (the modes are exclusive;
+                # parse_partial_compress_args returns focus_topic=None for the
+                # boundary-aware forms).
+                focus_topic=focus_topic or None,
+                force=True,
+                defer_context_engine_notification=True,
+                protected_tail=tail if partial and tail else None,
+            )
+        except Exception:
             finalize_context_engine_compression_notification(
                 agent,
                 committed=False,
             )
-            usage = _get_usage(agent)
-            return 0, usage
+            raise
+        # If _compress_context returned unchanged because a concurrent
+        # compression lock is held, raise so callers can surface a clear
+        # message instead of the misleading "No changes from compression".
+        _lock_skipped = getattr(agent, "_compression_skipped_due_to_lock", None)
+        if _lock_skipped is True or isinstance(_lock_skipped, str):
+            agent._compression_skipped_due_to_lock = None
+            finalize_context_engine_compression_notification(
+                agent, committed=False
+            )
+            raise CompressionLockHeld(
+                _lock_skipped if isinstance(_lock_skipped, str) else None
+            )
+
+        # Still under history_lock: no prompt can interleave between the
+        # authoritative SessionDB publication and host adoption.
         session["history"] = compressed
         session["history_version"] = history_version + 1
     usage = _get_usage(agent)

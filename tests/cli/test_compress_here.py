@@ -29,24 +29,28 @@ def _wire_agent(shell, compressed_head):
     shell.agent._compression_skipped_due_to_lock = False
 
 
-def test_compress_here_compresses_head_only(capsys):
-    """/compress here 2 passes only the head to _compress_context."""
+def test_compress_here_transaction_receives_full_snapshot_and_protected_tail(capsys):
+    """The transaction validates the suffix and gives only its head to the engine."""
     shell = _make_cli()
     history = _make_history()
     shell.conversation_history = history
     # Pretend compression collapses the head into a single summary message.
     summary = [{"role": "user", "content": "[summary of earlier turns]"}]
-    _wire_agent(shell, summary)
+    # _compress_context returns the already-published full candidate; the host
+    # must adopt it without re-appending/reflushing the suffix.
+    _wire_agent(shell, summary + history[4:])
 
     with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
         shell._manual_compress("/compress here 2")
 
-    # _compress_context should have been called with the HEAD only
-    # (everything before the last 2 user-starts = first 4 messages).
+    # The atomic compression transaction receives the full authoritative
+    # snapshot plus its exact protected suffix.  It, not the CLI host, is
+    # responsible for passing only the head to the compressor and publishing
+    # head+tail exactly once under the SessionDB generation CAS.
     shell.agent._compress_context.assert_called_once()
     call = shell.agent._compress_context.call_args
-    passed_head = call.args[0]
-    assert passed_head == history[:4]
+    assert call.args[0] == history
+    assert call.kwargs["protected_tail"] == history[4:]
     # focus_topic must be None in partial mode (modes are exclusive).
     assert call.kwargs.get("focus_topic") is None
 
@@ -59,7 +63,7 @@ def test_compress_here_reappends_verbatim_tail(capsys):
     # Head compresses to an assistant-role summary so the seam
     # (assistant -> user tail) is already valid — tail rides along whole.
     summary = [{"role": "assistant", "content": "[summary]"}]
-    _wire_agent(shell, summary)
+    _wire_agent(shell, summary + history[4:])
 
     with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
         shell._manual_compress("/compress here 2")

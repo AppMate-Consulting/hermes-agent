@@ -3979,13 +3979,16 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
-        # Restoration is head-scoped.  The protected suffix is authoritative
-        # evidence in the final candidate and must never be copied into or
-        # used to rewrite the generated head.
-        _refresh_active_task_contract(_compression_input, compressed)
-        _ensure_compressed_has_user_turn(
-            _compression_input, compressed
-        )
+        # Full compression must restore the latest human/active-task contract
+        # when an engine omitted it.  Partial compression is different: the
+        # protected suffix is already the authoritative latest contract.  A
+        # head-only restoration would either resurrect an older head task or,
+        # if pointed at the whole transcript, duplicate a protected task into
+        # generated output.  Leave generated-head repair to the seam validator
+        # and preserve the suffix as the sole latest-human evidence.
+        if not _protected_tail_snapshot:
+            _refresh_active_task_contract(_compression_input, compressed)
+            _ensure_compressed_has_user_turn(_compression_input, compressed)
         if _protected_tail_snapshot:
             # The protected suffix is appended byte-for-byte before admission
             # and before the sole SessionDB publication.  Never run sequence

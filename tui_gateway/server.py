@@ -5115,7 +5115,21 @@ def _compress_session_history(
                 defer_context_engine_notification=True,
                 protected_tail=tail if partial and tail else None,
             )
-    except Exception:
+    except Exception as exc:
+        from agent.conversation_compression import (
+            CompressionCommittedPostpublicationError,
+        )
+        if isinstance(exc, CompressionCommittedPostpublicationError):
+            authoritative = exc.load_authoritative_transcript(agent)
+            with session["history_lock"]:
+                session["history"] = authoritative
+                session["history_version"] = max(
+                    int(session.get("history_version", 0)), history_version + 1
+                )
+            agent.session_id = exc.session_id
+            finalize_context_engine_compression_notification(agent, committed=True)
+            setattr(agent, "_last_compression_postcommit_warning", str(exc.cause))
+            return len(history) - len(authoritative), _get_usage(agent)
         finalize_context_engine_compression_notification(agent, committed=False)
         raise
     finally:
@@ -13742,6 +13756,14 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _lines = [_fb["headline"], _fb["token_line"]]
             if _fb.get("note"):
                 _lines.append(_fb["note"])
+            _postcommit_warning = vars(agent).pop(
+                "_last_compression_postcommit_warning", None
+            )
+            if _postcommit_warning:
+                _lines.append(
+                    "Compression committed; recovered after a postcommit "
+                    f"synchronization error: {_postcommit_warning}"
+                )
             finalize_context_engine_compression_notification(
                 agent,
                 committed=True,

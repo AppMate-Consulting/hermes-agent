@@ -845,7 +845,8 @@ class SessionSchemaMixin:
                 effect_disposition, finish_reason, reasoning, reasoning_content,
                 reasoning_details, codex_reasoning_items, codex_message_items,
                 observed, active, compacted, api_content,
-                autonomous_completion_provenance ON messages
+                autonomous_completion_provenance,
+                active_task_contract_provenance ON messages
             WHEN OLD.session_id = NEW.session_id BEGIN
                 UPDATE sessions SET transcript_generation =
                     COALESCE(transcript_generation, 0) + 1

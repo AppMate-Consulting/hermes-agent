@@ -12628,6 +12628,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     print(f"     {summary['note']}")
 
             except Exception as e:
+                from agent.conversation_compression import (
+                    CompressionCommittedPostpublicationError,
+                )
+                if isinstance(e, CompressionCommittedPostpublicationError):
+                    try:
+                        self.conversation_history = e.load_authoritative_transcript(
+                            self.agent
+                        )
+                        self.agent.session_id = e.session_id
+                        self.session_id = e.session_id
+                        self._pending_title = None
+                        finalize_context_engine_compression_notification(
+                            self.agent, committed=True
+                        )
+                        print(
+                            "  ⚠️ Compression committed, but host synchronization "
+                            f"needed recovery: {e.cause}"
+                        )
+                    except Exception as reconcile_error:
+                        finalize_context_engine_compression_notification(
+                            self.agent, committed=True
+                        )
+                        print(
+                            "  ⚠️ Compression committed, but durable host "
+                            f"reconciliation failed: {reconcile_error}"
+                        )
+                    return
                 finalize_context_engine_compression_notification(
                     self.agent,
                     committed=False,

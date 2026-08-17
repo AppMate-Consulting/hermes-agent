@@ -165,6 +165,55 @@ class _CompressionPublicationCancelled(Exception):
     """Commit admission was revoked after candidate preparation."""
 
 
+class CompressionCommittedPostpublicationError(RuntimeError):
+    """A compression committed durably but host synchronization failed."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        transcript: Optional[list],
+        candidate_transcript: Optional[list] = None,
+        in_place: bool,
+        cause: BaseException,
+    ) -> None:
+        self.session_id = session_id
+        self.transcript = copy.deepcopy(transcript) if transcript is not None else None
+        self.candidate_transcript = (
+            copy.deepcopy(candidate_transcript)
+            if candidate_transcript is not None
+            else None
+        )
+        self.in_place = bool(in_place)
+        self.cause = cause
+        mode = "in-place" if self.in_place else "rotation"
+        super().__init__(
+            f"Compression committed ({mode}) but postpublication synchronization failed: {cause}"
+        )
+
+    def load_authoritative_transcript(self, agent: Any) -> list:
+        """Return the committed transcript, retrying the authoritative store."""
+        if self.transcript is not None:
+            return copy.deepcopy(self.transcript)
+        session_db = getattr(agent, "_session_db", None)
+        if session_db is None:
+            raise RuntimeError("Committed compression has no authoritative SessionDB")
+        try:
+            rows = session_db.get_messages_as_conversation(self.session_id)
+        except Exception:
+            if self.candidate_transcript is not None:
+                return copy.deepcopy(self.candidate_transcript)
+            raise
+        if not isinstance(rows, list) or not rows or not all(
+            isinstance(row, dict) for row in rows
+        ):
+            if self.candidate_transcript is not None:
+                return copy.deepcopy(self.candidate_transcript)
+            raise RuntimeError("Committed compression durable reconciliation read unusable")
+        self.transcript = copy.deepcopy(rows)
+        return rows
+
+
 def _is_outer_terminal_compression_outcome(value: Any) -> bool:
     return isinstance(value, str) and (
         value in _OUTER_TERMINAL_COMPRESSION_OUTCOMES
@@ -2213,6 +2262,8 @@ _ACTIVE_TASK_CONTRACT_BRIDGE_CONTENTS = frozenset({
     ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
 })
 
+ACTIVE_TASK_TRUST_MARKER = "_active_task_contract_trusted"
+
 
 def _is_active_task_contract_bridge(message: Any) -> bool:
     """Recognize only exact Hermes bridge rows, including DB projections."""
@@ -2220,6 +2271,7 @@ def _is_active_task_contract_bridge(message: Any) -> bool:
         isinstance(message, dict)
         and message.get("role") == "assistant"
         and message.get("content") in _ACTIVE_TASK_CONTRACT_BRIDGE_CONTENTS
+        and message.get(ACTIVE_TASK_TRUST_MARKER) is True
     )
 
 
@@ -2238,6 +2290,7 @@ def _latest_active_human_task_row(messages: list) -> Optional[dict]:
         projected_contract = (
             index > 0
             and _is_active_task_contract_bridge(messages[index - 1])
+            and message.get(ACTIVE_TASK_TRUST_MARKER) is True
             and messages[index - 1].get("content")
             == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
             and ContextCompressor.parse_active_task_contract(
@@ -2519,6 +2572,7 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
         projected_contract = (
             index > 0
             and _is_active_task_contract_bridge(compressed[index - 1])
+            and message.get(ACTIVE_TASK_TRUST_MARKER) is True
             and compressed[index - 1].get("content")
             == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
             and ContextCompressor.parse_active_task_contract(
@@ -2565,6 +2619,7 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
             "role": "assistant",
             "content": ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
             "_active_task_contract_bridge": True,
+            ACTIVE_TASK_TRUST_MARKER: True,
         })
         insert_at += 1
     compressed.insert(
@@ -2578,6 +2633,7 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
             "role": "assistant",
             "content": ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
             "_active_task_contract_bridge": True,
+            ACTIVE_TASK_TRUST_MARKER: True,
         })
 
 
@@ -3427,6 +3483,7 @@ def compress_context(
                             "reasoning", "reasoning_content", "reasoning_details",
                             "codex_reasoning_items", "codex_message_items", "observed",
                             "_autonomous_completion_bridge",
+                            ACTIVE_TASK_TRUST_MARKER,
                         )
                         return all(left.get(key) == right.get(key) for key in keys)
                     for overlap in range(min(len(live_tail), len(durable_parent)), 0, -1):
@@ -3775,12 +3832,13 @@ def compress_context(
     _commit_fence_entered = False
     _caller_publication_authoritative = False
     _host_claim_exception: Optional[BaseException] = None
+    _postpublication_error: Optional[CompressionCommittedPostpublicationError] = None
 
     def _publish_session_db(
         operation: Callable[[], None], *, active_session_id: str
     ) -> None:
         """Fence exactly one SessionDB publication and promptly free its lease."""
-        nonlocal compressed, _commit_fence_entered, _host_claim_exception
+        nonlocal compressed, _commit_fence_entered, _host_claim_exception, _postpublication_error
         # A host whose transcript has an independent in-memory generation may
         # claim that generation immediately before the durable transaction.
         # The claim returns an optional release callback so the host can hold
@@ -3819,21 +3877,30 @@ def compress_context(
             # persisted representation, so comparing the readback byte-for-byte
             # with speculative rows here would turn a successful commit into a
             # false rollback.
-            durable = agent._session_db.get_messages_as_conversation(
-                active_session_id
-            )
-            if (
-                not isinstance(durable, list)
-                or not durable
-                or not all(isinstance(row, dict) for row in durable)
-            ):
-                raise RuntimeError("Compression publication durable readback unusable")
-            compressed = durable
-            _adopt_host_publication = getattr(
-                agent, "_adopt_compression_host_publication", None
-            )
-            if callable(_adopt_host_publication):
-                _adopt_host_publication(copy.deepcopy(compressed))
+            try:
+                durable = agent._session_db.get_messages_as_conversation(
+                    active_session_id
+                )
+                if (
+                    not isinstance(durable, list)
+                    or not durable
+                    or not all(isinstance(row, dict) for row in durable)
+                ):
+                    raise RuntimeError("Compression publication durable readback unusable")
+                compressed = durable
+                _adopt_host_publication = getattr(
+                    agent, "_adopt_compression_host_publication", None
+                )
+                if callable(_adopt_host_publication):
+                    _adopt_host_publication(copy.deepcopy(compressed))
+            except BaseException as exc:
+                _postpublication_error = CompressionCommittedPostpublicationError(
+                    session_id=active_session_id,
+                    transcript=(durable if "durable" in locals() and isinstance(durable, list) else None),
+                    candidate_transcript=compressed,
+                    in_place=in_place,
+                    cause=exc,
+                )
         finally:
             # Publication success/failure is now authoritative.  Neither the
             # fence nor the durable lease may cover provider or bookkeeping
@@ -4809,11 +4876,18 @@ def compress_context(
             commit_status=_commit_status,
             split_status=split_status,
             failure_class=(
-                "session_split_failed"
-                if split_status in {"failed_not_indexed", "aborted"}
-                else None
+                f"postcommit:{type(_postpublication_error.cause).__name__}"
+                if _postpublication_error is not None
+                else (
+                    "session_split_failed"
+                    if split_status in {"failed_not_indexed", "aborted"}
+                    else None
+                )
             ),
         )
+        if _postpublication_error is not None:
+            _set_compression_outcome("committed_postpublication_sync_error")
+            raise _postpublication_error from _postpublication_error.cause
         return compressed, new_system_prompt
     except BaseException:
         # Candidate preparation and persistence form a transaction from the

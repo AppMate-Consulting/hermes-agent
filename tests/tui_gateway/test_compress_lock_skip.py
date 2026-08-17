@@ -170,3 +170,29 @@ def test_mirror_slash_side_effects_reports_lock_skip():
     assert "live session sync failed" not in output
 
 
+def test_committed_postpublication_error_adopts_tui_history():
+    from agent.conversation_compression import (
+        CompressionCommittedPostpublicationError,
+    )
+    from tui_gateway.server import _compress_session_history
+
+    history = _make_history()
+    authoritative = [{"role": "user", "content": "committed summary"}]
+    agent = _make_lock_skip_agent(None)
+    agent.session_id = "child"
+    agent._compress_context.side_effect = CompressionCommittedPostpublicationError(
+        session_id="child",
+        transcript=authoritative,
+        in_place=False,
+        cause=RuntimeError("host adoption failed"),
+    )
+    session = _make_session(agent, history)
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        removed, _usage = _compress_session_history(session)
+
+    assert removed == len(history) - len(authoritative)
+    assert session["history"] == authoritative
+    assert session["history_version"] == 2
+    assert agent._last_compression_postcommit_warning == "host adoption failed"
+

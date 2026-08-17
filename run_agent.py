@@ -2291,6 +2291,9 @@ class AIAgent:
                     "_autonomous_completion_bridge": (
                         msg.get("_autonomous_completion_bridge") is True
                     ),
+                    "_active_task_contract_trusted": (
+                        msg.get("_active_task_contract_trusted") is True
+                    ),
                 })
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8

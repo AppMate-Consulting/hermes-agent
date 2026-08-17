@@ -122,3 +122,33 @@ def test_focus_still_works(capsys):
     call = shell.agent._compress_context.call_args
     assert call.args[0] == history
     assert call.kwargs.get("focus_topic") == "database schema"
+
+
+def test_committed_postpublication_error_reconciles_cli_state(capsys):
+    from agent.conversation_compression import (
+        CompressionCommittedPostpublicationError,
+    )
+
+    shell = _make_cli()
+    history = _make_history()
+    authoritative = [{"role": "user", "content": "committed summary"}]
+    _wire_agent(shell, authoritative)
+    shell.conversation_history = history
+    shell.session_id = "parent"
+    shell.agent.session_id = "child"
+    shell.agent._compress_context.side_effect = CompressionCommittedPostpublicationError(
+        session_id="child",
+        transcript=authoritative,
+        in_place=False,
+        cause=RuntimeError("host adoption failed"),
+    )
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress")
+
+    assert shell.session_id == "child"
+    assert shell.agent.session_id == "child"
+    assert shell.conversation_history == authoritative
+    output = capsys.readouterr().out
+    assert "Compression committed" in output
+    assert "Compression failed" not in output

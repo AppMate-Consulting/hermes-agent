@@ -216,7 +216,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -343,7 +343,8 @@ CREATE TABLE IF NOT EXISTS messages (
     api_content TEXT,
     display_kind TEXT,
     display_metadata TEXT,
-    autonomous_completion_provenance INTEGER NOT NULL DEFAULT 0
+    autonomous_completion_provenance INTEGER NOT NULL DEFAULT 0,
+    active_task_contract_provenance INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (

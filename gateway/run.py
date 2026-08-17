@@ -19187,9 +19187,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # hook) BEFORE the host unwinds so the
                                         # worker can never commit later.
                                         from agent.conversation_compression import (
+                                            CompressionCommittedPostpublicationError,
                                             _publish_compression_outcome,
                                         )
                                         if isinstance(
+                                            _hyg_wrapper_exc,
+                                            CompressionCommittedPostpublicationError,
+                                        ):
+                                            _compressed = (
+                                                _hyg_wrapper_exc.load_authoritative_transcript(
+                                                    _hyg_agent
+                                                )
+                                            )
+                                            _hyg_agent.session_id = _hyg_wrapper_exc.session_id
+                                            logger.warning(
+                                                "Session hygiene compression committed but "
+                                                "required postcommit reconciliation: %s",
+                                                _hyg_wrapper_exc.cause,
+                                            )
+                                            _publish_compression_outcome(
+                                                _hyg_agent,
+                                                "committed_postpublication_sync_error",
+                                            )
+                                            _hyg_wrapper_exc = None
+                                        if _hyg_wrapper_exc is None:
+                                            pass
+                                        elif isinstance(
                                             _hyg_wrapper_exc,
                                             (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
                                         ):
@@ -19209,7 +19232,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 else "wrapper_exception_"
                                                 f"{type(_hyg_wrapper_exc).__name__}"
                                             )
-                                        _publish_compression_outcome(
+                                        if _hyg_wrapper_exc is not None:
+                                            _publish_compression_outcome(
                                             _hyg_agent,
                                             _outer_outcome,
                                             outer_terminal=(
@@ -19219,7 +19243,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 )
                                             ),
                                         )
-                                        if (
+                                        if _hyg_wrapper_exc is not None and (
                                             _outer_outcome.startswith(
                                                 ("wrapper_exception_", "compression_exception_")
                                             )
@@ -19233,15 +19257,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _outer_outcome,
                                             )
                                             _hyg_failure_recorded = True
-                                        _hyg_commit_fence.revoke_commit_admission()
-                                        if not _hyg_cleanup_deferred:
+                                        if _hyg_wrapper_exc is not None:
+                                            _hyg_commit_fence.revoke_commit_admission()
+                                        if _hyg_wrapper_exc is not None and not _hyg_cleanup_deferred:
                                             self._defer_agent_cleanup_until_future_done(
                                                 _hyg_future,
                                                 _hyg_agent,
                                                 context="session hygiene unwind",
                                             )
                                             _hyg_cleanup_deferred = True
-                                        raise
+                                        if _hyg_wrapper_exc is not None:
+                                            raise _hyg_wrapper_exc
 
                                     # _compress_context ends the old session and creates
                                     # a new session_id.  Write compressed messages into
@@ -19301,36 +19327,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # conversation silently vanishes. Persist the child
                                     # transcript first; only then rebind the live entry.
                                     if _hyg_rotated:
-                                        if not await self.async_session_store.rewrite_transcript(
-                                            _hyg_new_sid, _compressed
-                                        ):
-                                            logger.error(
-                                                "Session hygiene: failed to persist "
-                                                "compressed transcript for rotated "
-                                                "session %s → %s; keeping the live "
-                                                "entry on the original session so the "
-                                                "conversation is not dropped",
-                                                session_entry.session_id,
-                                                _hyg_new_sid,
-                                            )
-                                            # Fail closed: treat like no rotation.
-                                            _hyg_rotated = False
-                                            _hyg_in_place = False
-                                        else:
-                                            session_entry.session_id = _hyg_new_sid
-                                            # The held turn lease follows the
-                                            # rotation so an alias key resolving
-                                            # the fresh child still serializes
-                                            # against this turn (#64934).
-                                            self._rebind_turn_lease(
-                                                _quick_key, run_generation, _hyg_new_sid
-                                            )
-                                            await self.async_session_store._save()
-                                            await asyncio.to_thread(
-                                                self._sync_telegram_topic_binding,
-                                                source, session_entry,
-                                                reason="hygiene-compression",
-                                            )
+                                        # _compress_context already published the
+                                        # authoritative child transcript atomically.
+                                        # Reconcile routing only; never publish it twice.
+                                        session_entry.session_id = _hyg_new_sid
+                                        self._rebind_turn_lease(
+                                            _quick_key, run_generation, _hyg_new_sid
+                                        )
+                                        await self.async_session_store._save()
+                                        await asyncio.to_thread(
+                                            self._sync_telegram_topic_binding,
+                                            source, session_entry,
+                                            reason="hygiene-compression",
+                                        )
 
                                     if _hyg_rotated:
                                         # Reset stored token count — transcript rewritten

@@ -18,6 +18,7 @@ from agent.context_compressor import (
 from agent.conversation_compression import (
     ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
     ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+    ACTIVE_TASK_TRUST_MARKER,
     PRESERVED_HUMAN_TASK_BRIDGE,
     _ensure_compressed_has_user_turn,
     _insert_real_user_anchor,
@@ -498,6 +499,36 @@ def test_contract_parser_rejects_tampering_and_metadata_disagreement():
     assert ContextCompressor.parse_active_task_contract(disagreeing) is None
     assert payload["type"] == ACTIVE_TASK_CONTRACT_TYPE
     assert payload["instruction"] == ACTIVE_TASK_CONTRACT_INSTRUCTION
+
+
+def test_active_task_trust_survives_close_reopen_and_rotation(tmp_path):
+    path = tmp_path / "active-task-trust.db"
+    db = SessionDB(db_path=path)
+    parent = "trusted-parent"
+    child = "trusted-child"
+    db.create_session(parent, source="gateway", model="test/model")
+    contract = {"content": TASK, "sha256": hashlib.sha256(TASK.encode()).hexdigest()}
+    rows = [
+        {"role": "assistant", "content": ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+         ACTIVE_TASK_TRUST_MARKER: True},
+        ContextCompressor.make_active_task_contract_message(contract),
+    ]
+    db.replace_messages(parent, rows)
+    db.close()
+
+    db = SessionDB(db_path=path)
+    replay = db.get_messages_as_conversation(parent)
+    assert all(row.get(ACTIVE_TASK_TRUST_MARKER) is True for row in replay)
+    assert ContextCompressor._active_task_contract(replay) == contract
+    db.create_session(child, source="gateway", model="test/model", parent_session_id=parent)
+    db.replace_messages(child, replay)
+    db.close()
+
+    db = SessionDB(db_path=path)
+    rotated = db.get_messages_as_conversation(child)
+    assert ContextCompressor._active_task_contract(rotated) == contract
+    assert all(row.get(ACTIVE_TASK_TRUST_MARKER) is True for row in rotated)
+    db.close()
 
 
 def test_contract_refresh_requires_summary_and_removes_stale_bridges():

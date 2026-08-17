@@ -517,7 +517,10 @@ def test_host_claim_exception_releases_lease_before_commit_fence(durable_case):
 
 def test_postcommit_host_adoption_failure_preserves_rotated_authority(durable_case):
     """A host failure after SQLite commit cannot resurrect the durable parent."""
-    from agent.conversation_compression import CompressionCommitFence
+    from agent.conversation_compression import (
+        CompressionCommitFence,
+        CompressionCommittedPostpublicationError,
+    )
 
     db, parent, source = durable_case
     agent = _agent(db, parent, in_place=False, seen=[])
@@ -535,7 +538,10 @@ def test_postcommit_host_adoption_failure_preserves_rotated_authority(durable_ca
     ) as publish, patch(
         "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
         side_effect=[100_000, 1_000],
-    ), pytest.raises(RuntimeError, match="postcommit adoption failure"):
+    ), pytest.raises(
+        CompressionCommittedPostpublicationError,
+        match="postcommit adoption failure",
+    ) as caught:
         agent._compress_context(
             source,
             None,
@@ -546,6 +552,10 @@ def test_postcommit_host_adoption_failure_preserves_rotated_authority(durable_ca
         )
 
     child = agent.session_id
+    assert caught.value.session_id == child
+    assert caught.value.transcript == db.get_messages_as_conversation(child)
+    assert caught.value.in_place is False
+    assert isinstance(caught.value.cause, RuntimeError)
     assert child != parent
     assert agent._compression_durable_commit_occurred is True
     assert db.get_session(child)["parent_session_id"] == parent
@@ -557,6 +567,40 @@ def test_postcommit_host_adoption_failure_preserves_rotated_authority(durable_ca
     host_release.assert_called_once_with()
     assert fence.commit_in_flight is False
     assert db.get_compression_lock_holder(parent) is None
+
+
+def test_postcommit_readback_failure_is_typed_and_retriable(durable_case):
+    from agent.conversation_compression import (
+        CompressionCommittedPostpublicationError,
+    )
+
+    db, sid, source = durable_case
+    agent = _agent(db, sid, in_place=True, seen=[])
+    real_read = db.get_messages_as_conversation
+    calls = 0
+
+    def fail_once(session_id, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected durable readback failure")
+        return real_read(session_id, *args, **kwargs)
+
+    with patch.object(db, "archive_and_compact", wraps=db.archive_and_compact) as publish, \
+         patch.object(db, "get_messages_as_conversation", side_effect=fail_once), \
+         patch(
+             "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+             side_effect=[100_000, 1_000],
+         ), pytest.raises(CompressionCommittedPostpublicationError) as caught:
+        agent._compress_context(source, None, approx_tokens=100_000, force=True)
+
+    assert caught.value.in_place is True
+    assert caught.value.session_id == sid
+    assert caught.value.transcript is None
+    assert caught.value.load_authoritative_transcript(agent) == real_read(sid)
+    assert agent._last_compression_outcome == "committed_postpublication_sync_error"
+    publish.assert_called_once()
+    assert db.get_compression_lock_holder(sid) is None
 
 
 def test_begin_commit_cancel_after_host_claim_releases_once(durable_case):

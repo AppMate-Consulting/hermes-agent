@@ -4271,17 +4271,28 @@ class GatewaySlashCommandsMixin:
                 # the compressor's aux-client provider resolution would then
                 # read credentials unscoped and fail closed under
                 # multiplexing.
-                compressed, _ = await self._run_in_executor_with_context(
-                    lambda: tmp_agent._compress_context(
-                        msgs,
-                        "",
-                        approx_tokens=approx_tokens,
-                        focus_topic=focus_topic,
-                        force=True,
-                        defer_context_engine_notification=True,
-                        protected_tail=tail if partial and tail else None,
+                _postcommit_warning = None
+                try:
+                    compressed, _ = await self._run_in_executor_with_context(
+                        lambda: tmp_agent._compress_context(
+                            msgs,
+                            "",
+                            approx_tokens=approx_tokens,
+                            focus_topic=focus_topic,
+                            force=True,
+                            defer_context_engine_notification=True,
+                            protected_tail=tail if partial and tail else None,
+                        )
                     )
-                )
+                except Exception as exc:
+                    from agent.conversation_compression import (
+                        CompressionCommittedPostpublicationError,
+                    )
+                    if not isinstance(exc, CompressionCommittedPostpublicationError):
+                        raise
+                    compressed = exc.load_authoritative_transcript(tmp_agent)
+                    tmp_agent.session_id = exc.session_id
+                    _postcommit_warning = str(exc.cause)
 
                 # If _compress_context returned unchanged because a
                 # concurrent compression lock is held, tell the user
@@ -4430,6 +4441,11 @@ class GatewaySlashCommandsMixin:
                         model=_aux_fail_model,
                         error=(_aux_fail_err or "unknown error"),
                     )
+                )
+            if _postcommit_warning:
+                lines.append(
+                    "⚠️ Compression committed; recovered after a postcommit "
+                    f"synchronization error: {_postcommit_warning}"
                 )
             return "\n".join(lines)
         except Exception as e:

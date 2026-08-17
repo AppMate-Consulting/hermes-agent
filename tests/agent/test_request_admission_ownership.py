@@ -213,11 +213,10 @@ def test_real_compression_admission_dispatches_exact_finalized_payload():
 
     assert result["completed"] is True
     assert compressor.compress.call_count == 1
-    # The live projection, before-admission sizing, and candidate-admission
-    # projection are all legitimate selector owners.  What matters is that
-    # the last finalized candidate flows directly to its first dispatch with
-    # no selector or middleware reconstruction in between.
-    assert compressor.select_context.call_count == 3
+    # Candidate construction and the compression handoff each select context.
+    # Prove the finalized handoff then flows directly to dispatch without
+    # depending on obsolete context-free projection totals.
+    assert compressor.select_context.call_count == 2
     assert len(admitted) == 1
     dispatch_index = next(i for i, event in enumerate(events) if event[0] == "dispatch")
     admission_index = max(
@@ -281,5 +280,5 @@ def test_tool_iteration_cannot_consume_stale_admission():
     assert calls[1].kwargs["messages"][-1]["role"] == "tool"
     assert admitted[0] == admitted_snapshots[0]
     assert len(middleware_calls) == 5
-    assert len(agent.context_compressor.compression_checks) == 5
+    assert agent.context_compressor.compression_checks == [63, 0]
     assert "_admitted_provider_request" not in vars(agent)

@@ -253,7 +253,7 @@ def test_standalone_preflight_default_is_preserved_but_can_be_deferred(
         patch("agent.turn_context.estimate_request_tokens_rough", return_value=50),
         patch("agent.turn_context.automatic_compaction_status_message", return_value=""),
     ):
-        _build(
+        ctx = _build(
             agent,
             conversation_history=[
                 {"role": "user", "content": "old"},
@@ -263,6 +263,7 @@ def test_standalone_preflight_default_is_preserved_but_can_be_deferred(
         )
 
     assert agent._compress_context.call_count == expected_calls
+    assert ctx.deferred_preflight_pending is defer_automatic_preflight
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────

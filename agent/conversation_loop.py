@@ -33,6 +33,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
@@ -2077,6 +2078,7 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _deferred_preflight_pending = _ctx.deferred_preflight_pending
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -2611,11 +2613,20 @@ def run_conversation(
                 compression_attempts,
                 max_compression_attempts,
             )
+            _automatic_compression_phase = (
+                "preflight" if _deferred_preflight_pending else "pre_api"
+            )
+            _automatic_compression_template = (
+                PREFLIGHT_COMPRESSION_STATUS_TEMPLATE
+                if _deferred_preflight_pending
+                else PRE_API_COMPRESSION_STATUS_TEMPLATE
+            )
             _pre_api_status = automatic_compaction_status_message(
                 _compressor,
-                phase="pre_api",
-                default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=request_pressure_tokens
+                phase=_automatic_compression_phase,
+                default_message=_automatic_compression_template.format(
+                    tokens=request_pressure_tokens,
+                    threshold=_preflight_threshold,
                 ),
                 approx_tokens=request_pressure_tokens,
                 threshold_tokens=int(
@@ -3450,6 +3461,7 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                _deferred_preflight_pending = False
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":

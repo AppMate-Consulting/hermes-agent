@@ -1144,6 +1144,21 @@ class TestPreflightCompression:
         )
         assert result["completed"] is True
         assert result["final_response"] == "After preflight"
+        live = mock_compress.call_args_list[0].kwargs["live_request_context"]
+        assert "admission_handoff" in live
+        assert live["current_turn_identity"] == "hello"
+        assert live["incoming_message"]["role"] == "user"
+        assert live["incoming_message"]["content"] == "hello"
+        assert live["external_prefetch"] == ""
+        assert live["plugin_user_context"] == ""
+        assert live["tools"] == agent.tools
+        assert live["sanitize_model"] == agent.model
+        assert live["current_turn_suffix"] is None
+        assert live["moa_prepared_request"] is None
+        assert live["user_initiated_turn"] is True
+        assert live["middleware_context"]["turn_id"]
+        assert live["middleware_context"]["api_request_id"]
+        assert live["middleware_context"]["api_mode"] == agent.api_mode
         assert any(
             ev == "lifecycle" and "Preflight compression" in msg
             for ev, msg in status_messages
@@ -1173,8 +1188,7 @@ class TestPreflightCompression:
             return 114_000 if _rough_calls["n"] == 1 else 40_000
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", side_effect=_rough_estimate),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1224,8 +1238,7 @@ class TestPreflightCompression:
             return 114_000 if _rough_calls["n"] == 1 else 40_000
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", side_effect=_rough_estimate),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1282,8 +1295,7 @@ class TestPreflightCompression:
             return 125_000 if _rough_calls["n"] == 1 else 40_000
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", side_effect=_rough_estimate),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1462,7 +1474,7 @@ class TestPreflightCompression:
         speculative display snapshot.
         """
         agent.compression_enabled = True
-        agent._interrupt_requested = True
+        agent._interrupt_requested = False
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
         agent.context_compressor.last_prompt_tokens = 74_400
@@ -1479,10 +1491,11 @@ class TestPreflightCompression:
             agent.context_compressor.compression_count += 1
             agent.context_compressor._ineffective_compression_count = 2
             agent.context_compressor._last_compression_savings_pct = 0.0
+            agent._interrupt_requested = True
             return msgs, agent._cached_system_prompt
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", return_value=144_669),
+            patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=144_669),
             patch.object(agent.context_compressor, "should_compress", return_value=True),
             patch.object(agent, "_compress_context", side_effect=_fake_preflight_compress),
             patch.object(agent, "_persist_session"),

@@ -427,6 +427,11 @@ class TurnContext:
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
+    # Automatic preflight was deliberately deferred to the complete live
+    # request boundary.  The loop consumes this semantic marker after the
+    # first provider response; it must not infer preflight ownership from an
+    # incidental API-call count.
+    deferred_preflight_pending: bool = False
 
 
 def build_turn_context(
@@ -1424,4 +1429,5 @@ def build_turn_context(
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
+        deferred_preflight_pending=defer_automatic_preflight,
     )

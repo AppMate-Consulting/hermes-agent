@@ -249,6 +249,16 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
     db, sid, source_rows = durable_case
     seen: list[list[dict]] = []
     prepared = _agent(db, sid, in_place=in_place, seen=seen)
+    prepared.provider = "openrouter"
+    prepared._use_prompt_caching = False
+    prepared._build_api_kwargs = lambda api_messages, tools_for_api=None: {
+        "model": prepared.model,
+        "messages": copy.deepcopy(api_messages),
+        "tools": copy.deepcopy(tools_for_api if tools_for_api is not None else prepared.tools),
+    }
+    prepared._reapply_reasoning_echo_for_provider = lambda api_messages: 0
+    prepared._sanitize_api_messages = lambda messages: copy.deepcopy(messages)
+    prepared._drop_thinking_only_and_merge_users = lambda messages, **_kwargs: copy.deepcopy(messages)
     prepared.context_compressor.select_context.side_effect = (
         _select_transcript_dependent_context
     )
@@ -283,6 +293,8 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
         result = real_finalize(*args, **kwargs)
         actual_payloads.append(copy.deepcopy(result["payload"]))
         return result
+    def identity_redecorate(_agent, api_messages, *, moa_prepared=None, tools_for_api=None, **_kwargs):
+        return copy.deepcopy(api_messages), moa_prepared, copy.deepcopy(tools_for_api or [])
     expected_rows = [{"role": "assistant", "content": SUMMARY}] + copy.deepcopy(
         source_rows[4:]
     )
@@ -324,6 +336,9 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
     ), patch(
         "agent.conversation_loop.finalize_provider_request",
         side_effect=capture_finalize,
+    ), patch(
+        "agent.conversation_loop._redecorate_prompt_cache_for_provider",
+        side_effect=identity_redecorate,
     ), patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100_000), patch(
         "agent.manual_compression_feedback.summarize_manual_compression",
         return_value={"headline": "ok", "token_line": "small", "note": "", "noop": False},

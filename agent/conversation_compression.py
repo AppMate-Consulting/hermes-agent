@@ -3186,6 +3186,38 @@ def compress_context(
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
+
+    def _cancelled_commit_fence_result() -> Tuple[list, str]:
+        """Roll back a fence cancellation that won before publication."""
+        nonlocal _activity_heartbeat
+        _restore_compressor_attempt_state(
+            agent.context_compressor,
+            _compressor_attempt_snapshot,
+            durable_cooldown_authoritative=_durable_cooldown_authoritative,
+            durable_cooldown_state=_durable_cooldown_state,
+        )
+        _restore_uncommitted_input()
+        if _activity_heartbeat is not None:
+            _activity_heartbeat.stop("context compression cancelled")
+            _activity_heartbeat = None
+        logger.info(
+            "Compression commit cancelled before session mutation "
+            "(session=%s).",
+            agent.session_id or "none",
+        )
+        agent._last_compression_attempt_in_place = None
+        agent._last_compaction_in_place = False
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="commit_fence_cancelled",
+        )
+        _set_compression_outcome("cancelled_commit_fence")
+        _release_lock()
+        return messages, _rollback_prompt()
+
     try:
         if _lock_holder is not None:
             _candidate_refresher = _CompressionLockLeaseRefresher(
@@ -3414,6 +3446,11 @@ def compress_context(
             _system_prompt_before_compression = agent._build_system_prompt(
                 system_message
             )
+        # Prompt construction may block on files, plugins, or remote state.
+        # A host cancellation that wins while it is running is a truthful
+        # precommit cancellation, not an unchanged/no-progress candidate.
+        if commit_fence is not None and commit_fence.is_cancelled:
+            return _cancelled_commit_fence_result()
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -3483,6 +3520,8 @@ def compress_context(
                         and _hard_cancel_event.is_set()
                     ):
                         raise AuxiliaryExplicitCancellation()
+                    if commit_fence is not None and commit_fence.is_cancelled:
+                        return _cancelled_commit_fence_result()
         finally:
             if commit_fence is not None:
                 try:
@@ -3574,6 +3613,12 @@ def compress_context(
             _release_lock_holder_only()
 
     try:
+        # Cancellation can also win after the provider unwinds but before the
+        # candidate is classified.  It must take precedence over summary,
+        # policy, empty-transcript, and no-progress outcomes.
+        if commit_fence is not None and commit_fence.is_cancelled:
+            return _cancelled_commit_fence_result()
+
         # Capture boundary quality before session-rotation callbacks run. Built-in
         # and plugin lifecycle hooks may reset per-session compressor fields while
         # rebinding to the child id; the completed attempt's verdict must survive
@@ -3875,6 +3920,13 @@ def compress_context(
             _restore_uncommitted_input()
             _release_lock()
             return messages, _system_prompt_before_compression
+
+        # Exact checkpoint after request sizing and material-admission, before
+        # begin_commit() can admit the sole SessionDB transaction.  Candidate
+        # preparation above remains cancellable without widening the commit
+        # fence over callbacks or bookkeeping.
+        if commit_fence is not None and commit_fence.is_cancelled:
+            return _cancelled_commit_fence_result()
 
         _session_commit_succeeded = False
         split_status = "not_applicable"

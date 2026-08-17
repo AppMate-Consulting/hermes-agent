@@ -578,7 +578,7 @@ def test_blocked_postcommit_provider_is_bounded_and_releases_lease(
 
 
 def test_prepublication_prompt_work_remains_cancellable(
-    monkeypatch, tmp_path, request
+    monkeypatch, tmp_path, request, caplog
 ):
     from agent.conversation_compression import CompressionCommitFence
     from hermes_state import SessionDB
@@ -599,6 +599,14 @@ def test_prepublication_prompt_work_remains_cancellable(
     agent.compression_in_place = True
     agent.commit_memory_session = MagicMock()
     original = _messages()
+    original_copy = copy.deepcopy(original)
+    agent._cached_system_prompt = None
+    agent._cached_system_prompt_static = "stable-prefix"
+    agent._persist_user_message_idx = 3
+    agent._persist_user_message_override = {"sentinel": [1, 2]}
+    persistence_before = copy.deepcopy(agent._persist_user_message_override)
+    compressor._summary_failure_cooldown_until = 12345.0
+    cooldown_before = compressor._summary_failure_cooldown_until
     fence = CompressionCommitFence()
 
     def blocked_prompt(_message):
@@ -628,9 +636,84 @@ def test_prepublication_prompt_work_remains_cancellable(
 
     assert not worker.is_alive()
     assert result[0][0] is original
+    assert original == original_copy
     assert agent._last_compression_outcome == "cancelled_commit_fence"
+    assert '"failure_class":"commit_fence_cancelled"' in caplog.text
+    assert '"commit_status":"aborted"' in caplog.text
+    assert compressor._summary_failure_cooldown_until == cooldown_before
+    assert agent._cached_system_prompt is None
+    assert agent._cached_system_prompt_static == "stable-prefix"
+    assert agent._persist_user_message_idx == 3
+    assert agent._persist_user_message_override == persistence_before
     assert db.get_messages_as_conversation(sid)[0]["content"] == "durable original"
     assert db.get_compression_lock_holder(sid) is None
+    assert db.try_acquire_compression_lock(sid, "later-attempt", ttl_seconds=30)
+    db.release_compression_lock(sid, "later-attempt")
     assert fence.commit_in_flight is False
+    compressor.compress.assert_not_called()
     agent._memory_manager.on_pre_compress.assert_not_called()
+    agent._memory_manager.on_session_switch.assert_not_called()
+    agent.commit_memory_session.assert_not_called()
+
+
+def test_materially_admitted_candidate_honors_precommit_fence_cancel(
+    monkeypatch, tmp_path, request, caplog
+):
+    from agent.conversation_compression import CompressionCommitFence
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    request.addfinalizer(db.close)
+    sid = "cancel-after-material-admission"
+    db.create_session(sid, "cli", model="test/model")
+    db.append_message(sid, "user", "durable original")
+    manager = MagicMock()
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "materially smaller candidate"}
+    ]
+    _configure_engine_state(compressor)
+    compressor._summary_failure_cooldown_until = 67890.0
+    agent = _make_agent(manager, compressor)
+    agent._session_db = db
+    agent.session_id = sid
+    agent.compression_in_place = True
+    agent.commit_memory_session = MagicMock()
+    original = _messages()
+    original_copy = copy.deepcopy(original)
+    fence = CompressionCommitFence()
+
+    class CancelOnAdmission(int):
+        def __sub__(self, other):
+            result = int(self) - int(other)
+            assert result >= 4_096
+            assert fence.cancel_before_commit() is True
+            return result
+
+    estimates = iter((CancelOnAdmission(100_000), 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+
+    returned, _ = agent._compress_context(
+        original,
+        "sys",
+        approx_tokens=100_000,
+        force=True,
+        commit_fence=fence,
+    )
+
+    assert returned is original
+    assert original == original_copy
+    assert agent._last_compression_outcome == "cancelled_commit_fence"
+    assert '"failure_class":"commit_fence_cancelled"' in caplog.text
+    assert compressor._summary_failure_cooldown_until == 67890.0
+    assert db.get_messages_as_conversation(sid)[0]["content"] == "durable original"
+    assert db.get_compression_lock_holder(sid) is None
+    assert db.try_acquire_compression_lock(sid, "later-attempt", ttl_seconds=30)
+    db.release_compression_lock(sid, "later-attempt")
+    assert fence.commit_in_flight is False
+    manager.on_pre_compress.assert_not_called()
+    manager.on_session_switch.assert_not_called()
     agent.commit_memory_session.assert_not_called()

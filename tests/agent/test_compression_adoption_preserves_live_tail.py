@@ -104,29 +104,34 @@ def test_identical_tail_text_with_opposite_provenance_is_not_overlap(
 ) -> None:
     """Trust-bearing model semantics participate in live-tail identity."""
     from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
         AUTONOMOUS_COMPLETION_BRIDGE_USER,
         _latest_active_human_task_row,
     )
 
     db = SessionDB(db_path=tmp_path / f"provenance-{in_place}-{durable_trusted}.db")
     sid = "PROVENANCE_PARENT"
-    text = (
-        AUTONOMOUS_COMPLETION_BRIDGE_USER
-        if durable_trusted
-        else "[ASYNC DELEGATION COMPLETE child=exact-provenance-regression]"
-    )
+    completion_text = "[ASYNC DELEGATION COMPLETE child=exact-provenance-regression]"
+    sequence = [
+        ("user", AUTONOMOUS_COMPLETION_BRIDGE_USER),
+        ("assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT),
+        ("user", completion_text),
+    ]
     db.create_session(sid, source="desktop")
-    db.append_message(
-        sid, "user", text,
-        autonomous_completion_provenance=durable_trusted,
-    )
+    for role, content in sequence:
+        db.append_message(
+            sid, role, content,
+            autonomous_completion_provenance=durable_trusted,
+        )
     messages = db.get_messages_as_conversation(sid)
-    caller = {"role": "user", "content": text}
-    if caller_trusted:
-        caller["_autonomous_completion_bridge"] = True
-    messages.append(caller)
+    durable_count = len(messages)
+    for role, content in sequence:
+        caller: dict[str, object] = {"role": role, "content": content}
+        if caller_trusted:
+            caller["_autonomous_completion_bridge"] = True
+        messages.append(caller)
     agent = _build_agent_with_db(db, sid, in_place=in_place)
-    agent._persist_user_message_idx = 1
+    agent._persist_user_message_idx = durable_count
     seen = []
 
     def compress(rows, **_kwargs):
@@ -140,22 +145,23 @@ def test_identical_tail_text_with_opposite_provenance_is_not_overlap(
     ):
         returned, _ = agent._compress_context(messages, "sys", approx_tokens=100_000)
 
-    matching = [row for row in seen[0] if row.get("content") == text]
+    matching = [row for row in seen[0] if row.get("content") == completion_text]
     assert len(matching) == 2
     assert [row.get("_autonomous_completion_bridge", False) for row in matching] == [
         durable_trusted, caller_trusted
     ]
     human = _latest_active_human_task_row(seen[0])
-    assert human is not None and human["content"] == text
+    assert human is not None and human["content"] == completion_text
+    assert human.get("_autonomous_completion_bridge") is not True
     active = db.get_messages_as_conversation(agent.session_id)
-    matching_active = [row for row in active if row.get("content") == text]
+    matching_active = [row for row in active if row.get("content") == completion_text]
     assert len(matching_active) == 2
     assert [row.get("_autonomous_completion_bridge", False) for row in matching_active] == [
         durable_trusted, caller_trusted
     ]
     durable_matching = [
         row for row in db.get_messages(agent.session_id, include_inactive=False)
-        if row.get("content") == text
+        if row.get("content") == completion_text
     ]
     assert len(durable_matching) == 2
     assert [
@@ -163,9 +169,10 @@ def test_identical_tail_text_with_opposite_provenance_is_not_overlap(
         for row in durable_matching
     ] == [durable_trusted, caller_trusted]
     active_human = _latest_active_human_task_row(active)
-    assert active_human is not None and active_human["content"] == text
+    assert active_human is not None and active_human["content"] == completion_text
     assert active_human.get("_autonomous_completion_bridge") is not True
-    assert _contents(returned).count(text) == 2
+    for _role, content in sequence:
+        assert _contents(returned).count(content) == 2
 
 
 def test_empty_transcript_records_one_truthful_terminal_rejection(tmp_path: Path) -> None:

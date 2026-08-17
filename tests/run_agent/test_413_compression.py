@@ -1159,6 +1159,10 @@ class TestPreflightCompression:
         assert live["middleware_context"]["turn_id"]
         assert live["middleware_context"]["api_request_id"]
         assert live["middleware_context"]["api_mode"] == agent.api_mode
+        assert live["frozen_finalized_request"] is not None
+        assert "request_middleware_preview_pre" in live
+        assert "request_middleware_preview_post" in live
+        assert "request_middleware_nontransactional" in live
         assert any(
             ev == "lifecycle" and "Preflight compression" in msg
             for ev, msg in status_messages

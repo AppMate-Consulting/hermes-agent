@@ -2998,17 +2998,17 @@ def compress_context(
                 _request_middleware_post_old
             )
             _request_middleware_state_restored = True
-            # The old middleware transition is now the committed one.  Carry
-            # its already-finalized request to the caller so dispatch cannot
-            # consume the callback a second time after an aborted candidate.
-            _old_handoff_target = (live_request_context or {}).get(
-                "admission_handoff"
-            )
-            if (
-                isinstance(_old_handoff_target, dict)
-                and _old_finalized_handoff is not None
-            ):
-                _old_handoff_target["request"] = _old_finalized_handoff
+        # The old middleware transition is now the committed one.  Carry its
+        # already-finalized request even for nontransactional middleware, for
+        # which there is deliberately no restorable token.
+        _old_handoff_target = (live_request_context or {}).get(
+            "admission_handoff"
+        )
+        if (
+            isinstance(_old_handoff_target, dict)
+            and _old_finalized_handoff is not None
+        ):
+            _old_handoff_target["request"] = _old_finalized_handoff
         if _caller_messages != _caller_rollback_snapshot:
             _caller_messages[:] = copy.deepcopy(_caller_rollback_snapshot)
         # Adoption rebinds the working transcript.  Abort paths must return
@@ -4427,17 +4427,35 @@ def compress_context(
             "current_turn_suffix": _live.get("current_turn_suffix"),
             "middleware_context": dict(_admission_middleware_context),
         }
-        try:
-            _request_middleware_pre = (
-                snapshot_llm_request_middleware_preview_state()
+        _frozen_finalized = _live.get("frozen_finalized_request")
+        if _frozen_finalized is not None:
+            # The live loop owns the old transition and captured these tokens
+            # at its true boundary.  Never snapshot or invoke callbacks here
+            # merely to rediscover whether that transition was transactional.
+            _request_middleware_pre = _live.get(
+                "request_middleware_preview_pre", _missing_cache_field
             )
-            _middleware_transaction_error = None
-        except NonTransactionalRequestMiddlewareError as exc:
-            # Do not invoke an unknown callback speculatively.  The rejected
-            # compression path leaves the ordinary caller to apply it exactly
-            # once to the frozen old request before dispatch.
-            _request_middleware_pre = None
-            _middleware_transaction_error = f"{type(exc).__name__}: {exc}"
+            _middleware_transaction_error = _live.get(
+                "request_middleware_nontransactional"
+            )
+            _request_middleware_post_old = (
+                _live.get("request_middleware_preview_post", _missing_cache_field)
+                if _middleware_transaction_error is None
+                else _missing_cache_field
+            )
+            _old_finalized_handoff = _frozen_finalized
+        else:
+            try:
+                _request_middleware_pre = (
+                    snapshot_llm_request_middleware_preview_state()
+                )
+                _middleware_transaction_error = None
+            except NonTransactionalRequestMiddlewareError as exc:
+                # Standalone compression has no already-finalized request to
+                # dispatch, but still must not invoke an unknown callback
+                # speculatively.
+                _request_middleware_pre = None
+                _middleware_transaction_error = f"{type(exc).__name__}: {exc}"
 
         # A standalone/manual call has no old frozen projection.  Snapshot the
         # post-compressor engine state so its old projection can be rolled back
@@ -4458,28 +4476,37 @@ def compress_context(
             dict(_admission_middleware_context)
             if _middleware_transaction_error is None else None
         )
-        _finalized_in = finalize_provider_request(
-            agent,
-            _authoritative_pre_compression_snapshot,
-            system_message=_system_prompt_before_compression or "",
-            current_turn_user_idx=_live.get("current_turn_user_idx"),
-            incoming_message=_live.get("incoming_message"),
-            static_system_prefix=(
-                _cached_static_before_compression
-                if isinstance(_cached_static_before_compression, str)
-                else None
-            ),
-            _frozen_projection=_live.get("frozen_projection"),
-            moa_prepared_request=_live.get("moa_prepared_request"),
-            user_initiated_turn=_live.get("user_initiated_turn"),
-            **{**_common_live, "middleware_context": _preview_middleware_context},
-        )
+        if _frozen_finalized is not None:
+            _finalized_in = _frozen_finalized
+        else:
+            _finalized_in = finalize_provider_request(
+                agent,
+                _authoritative_pre_compression_snapshot,
+                system_message=_system_prompt_before_compression or "",
+                current_turn_user_idx=_live.get("current_turn_user_idx"),
+                incoming_message=_live.get("incoming_message"),
+                static_system_prefix=(
+                    _cached_static_before_compression
+                    if isinstance(_cached_static_before_compression, str)
+                    else None
+                ),
+                _frozen_projection=_live.get("frozen_projection"),
+                moa_prepared_request=_live.get("moa_prepared_request"),
+                user_initiated_turn=_live.get("user_initiated_turn"),
+                **{**_common_live, "middleware_context": _preview_middleware_context},
+            )
         _provider_request_in = _finalized_in["payload"]
-        if _middleware_transaction_error is None:
+        if _frozen_finalized is None and _middleware_transaction_error is None:
             _request_middleware_post_old = (
                 snapshot_llm_request_middleware_preview_state()
             )
             _old_finalized_handoff = _finalized_in
+            restore_llm_request_middleware_preview_state(
+                _request_middleware_pre
+            )
+        elif _frozen_finalized is not None and _middleware_transaction_error is None:
+            # Replace the already-consumed old transition with exactly one
+            # candidate transition.  Abort paths restore post-old instead.
             restore_llm_request_middleware_preview_state(
                 _request_middleware_pre
             )
@@ -4505,16 +4532,20 @@ def compress_context(
             and 0 <= _candidate_turn_idx < len(compressed)
             else None
         )
-        _finalized_out = finalize_provider_request(
-            agent,
-            compressed,
-            system_message=new_system_prompt or "",
-            current_turn_user_idx=_candidate_turn_idx,
-            incoming_message=_candidate_incoming,
-            moa_prepared_request=_live.get("moa_prepared_request"),
-            user_initiated_turn=_live.get("user_initiated_turn"),
-            **{**_common_live, "middleware_context": _preview_middleware_context},
-        )
+        if _middleware_transaction_error is None:
+            _finalized_out = finalize_provider_request(
+                agent,
+                compressed,
+                system_message=new_system_prompt or "",
+                current_turn_user_idx=_candidate_turn_idx,
+                incoming_message=_candidate_incoming,
+                moa_prepared_request=_live.get("moa_prepared_request"),
+                user_initiated_turn=_live.get("user_initiated_turn"),
+                **{**_common_live, "middleware_context": _preview_middleware_context},
+            )
+        else:
+            # Fail closed before another callback invocation or publication.
+            _finalized_out = _finalized_in
         _finalized_out["_consumes_user_initiator"] = bool(
             _live.get("user_initiated_turn") and agent._is_copilot_url()
         )

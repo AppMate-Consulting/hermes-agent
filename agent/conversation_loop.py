@@ -2505,6 +2505,73 @@ def run_conversation(
             if _moa_prepared_request is not None:
                 api_messages = _moa_prepared_request["messages"]
 
+        # Finalize the ordinary old request exactly once, before compression
+        # can become speculative.  Request middleware is a state transition in
+        # the same sense as context selection, so automatic admission receives
+        # opaque tokens from both sides of this live transition.  Unknown
+        # callbacks still get their one ordinary invocation; the refusal token
+        # merely prevents compression from invoking them again.
+        from hermes_cli.middleware import snapshot_llm_request_middleware_preview_state
+
+        _request_middleware_nontransactional = None
+        try:
+            _request_middleware_preview_pre = (
+                snapshot_llm_request_middleware_preview_state()
+            )
+        except Exception as exc:
+            _request_middleware_preview_pre = None
+            _request_middleware_nontransactional = f"{type(exc).__name__}: {exc}"
+        _live_middleware_context = {
+            "task_id": effective_task_id,
+            "turn_id": turn_id,
+            "api_request_id": f"{turn_id}:api:{api_call_count}",
+            "session_id": agent.session_id or "",
+            "platform": agent.platform or "",
+            "model": agent.model,
+            "provider": agent.provider,
+            "base_url": agent.base_url,
+            "api_mode": agent.api_mode,
+            "api_call_count": api_call_count,
+        }
+        _old_finalized_request = finalize_provider_request(
+            agent,
+            messages,
+            system_message=effective_system,
+            tools=agent.tools or [],
+            current_turn_user_idx=current_turn_user_idx,
+            external_prefetch=_ext_prefetch_cache,
+            plugin_user_context=_plugin_user_context,
+            incoming_message=_incoming,
+            sanitize_model=_sanitize_model,
+            current_turn_suffix=_moa_context,
+            _frozen_projection=_provider_request,
+            moa_prepared_request=_moa_prepared_request,
+            middleware_context=_live_middleware_context,
+            user_initiated_turn=bool(
+                getattr(agent, "_is_user_initiated_turn", False)
+            ),
+        )
+        _old_finalized_request["_consumes_user_initiator"] = bool(
+            getattr(agent, "_is_user_initiated_turn", False)
+            and agent._is_copilot_url()
+        )
+        if _request_middleware_nontransactional is None:
+            try:
+                _request_middleware_preview_post = (
+                    snapshot_llm_request_middleware_preview_state()
+                )
+            except Exception as exc:
+                _request_middleware_preview_post = None
+                _request_middleware_nontransactional = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+        else:
+            _request_middleware_preview_post = None
+        # Unless compression replaces it with an admitted candidate, this
+        # exact object owns dispatch (including retry) and middleware is never
+        # replayed.
+        _admitted_request = _old_finalized_request
+
         # One image-stripped message estimate feeds both figures. Was: a
         # str(msg) char walk (re-serialized base64 every call) + a second
         # messages walk inside estimate_request_tokens_rough. Tools added
@@ -2673,8 +2740,14 @@ def run_conversation(
                 live_request_context={
                         "admission_handoff": _admission_handoff,
                         "frozen_projection": _provider_request,
+                        "frozen_finalized_request": _old_finalized_request,
                         "selector_preview_pre": _selector_preview_pre,
                         "selector_preview_post": _selector_preview_post,
+                        "request_middleware_preview_pre": _request_middleware_preview_pre,
+                        "request_middleware_preview_post": _request_middleware_preview_post,
+                        "request_middleware_nontransactional": (
+                            _request_middleware_nontransactional
+                        ),
                         "current_turn_user_idx": current_turn_user_idx,
                         "current_turn_identity": copy.deepcopy(
                             messages[current_turn_user_idx].get("content")
@@ -2693,18 +2766,7 @@ def run_conversation(
                         "user_initiated_turn": bool(
                             getattr(agent, "_is_user_initiated_turn", False)
                         ),
-                        "middleware_context": {
-                            "task_id": effective_task_id,
-                            "turn_id": turn_id,
-                            "api_request_id": f"{turn_id}:api:{api_call_count}",
-                            "session_id": agent.session_id or "",
-                            "platform": agent.platform or "",
-                            "model": agent.model,
-                            "provider": agent.provider,
-                            "base_url": agent.base_url,
-                            "api_mode": agent.api_mode,
-                            "api_call_count": api_call_count,
-                        },
+                        "middleware_context": _live_middleware_context,
                 },
             )
             _admitted_request = _admission_handoff.pop("request", None)

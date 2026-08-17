@@ -1215,7 +1215,10 @@ class TestPreflightCompression:
 
         def _custom_status(**kwargs):
             assert kwargs["phase"] == "preflight"
-            assert kwargs["approx_tokens"] == 114_000
+            # The deferred gate measures the complete finalized request, so
+            # this includes the 15-token system/request overhead rather than
+            # the old message-only prologue estimate.
+            assert kwargs["approx_tokens"] == 114_015
             assert kwargs["threshold_tokens"] == 100_000
             return "🔧 LCM context maintenance: preparing compacted context."
 

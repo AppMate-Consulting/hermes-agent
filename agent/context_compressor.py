@@ -17,6 +17,7 @@ Improvements over v2:
 """
 
 import hashlib
+import copy
 import json
 import logging
 import sqlite3
@@ -1609,6 +1610,97 @@ class ContextCompressor(ContextEngine):
     @property
     def name(self) -> str:
         return "compressor"
+
+    _ATTEMPT_STATE_VALUE_TYPES = (
+        str, bytes, int, float, bool, type(None), dict, list, set, tuple
+    )
+
+    def snapshot_compression_attempt_state(self) -> Dict[str, Any]:
+        """Snapshot compressor-owned value state without copying resources.
+
+        ContextCompressor owns its scalar/container attributes.  Opaque
+        resources such as ``_session_db`` and provider clients fall outside
+        this explicit value-type boundary and retain their identity.  Original
+        mutable objects are retained in the token so rollback can repair them
+        in place rather than invalidating legitimate aliases.
+        """
+        values = vars(self)
+        owned = {
+            name: value
+            for name, value in values.items()
+            if isinstance(value, self._ATTEMPT_STATE_VALUE_TYPES)
+        }
+        return {
+            "original_keys": frozenset(values),
+            "original_objects": owned.copy(),
+            # One aggregate deepcopy preserves aliases between owned fields.
+            "values": copy.deepcopy(owned),
+        }
+
+    def restore_compression_attempt_state(self, snapshot: Any) -> None:
+        """Exactly restore compressor-owned attempt state and its aliases."""
+        if not isinstance(snapshot, dict):
+            return
+        original_keys = snapshot.get("original_keys", frozenset())
+        original_objects = snapshot.get("original_objects", {})
+        saved_values = copy.deepcopy(snapshot.get("values", {}))
+        live = vars(self)
+
+        saved_to_original = {
+            id(saved_values[name]): original
+            for name, original in original_objects.items()
+            if name in saved_values and isinstance(original, (dict, list, set))
+        }
+
+        def materialize(value: Any) -> Any:
+            """Reattach saved graph edges that pointed at owned originals."""
+            original = saved_to_original.get(id(value))
+            if original is not None:
+                return original
+            if isinstance(value, dict):
+                return {
+                    materialize(key): materialize(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [materialize(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(materialize(item) for item in value)
+            if isinstance(value, set):
+                return {materialize(item) for item in value}
+            return copy.deepcopy(value)
+
+        restored_mutables: set[int] = set()
+        for name, original in original_objects.items():
+            saved = saved_values[name]
+            original_id = id(original)
+            if original_id not in restored_mutables:
+                if isinstance(original, dict):
+                    original.clear()
+                    original.update(
+                        (materialize(key), materialize(value))
+                        for key, value in saved.items()
+                    )
+                    restored_mutables.add(original_id)
+                elif isinstance(original, list):
+                    original[:] = [materialize(value) for value in saved]
+                    restored_mutables.add(original_id)
+                elif isinstance(original, set):
+                    original.clear()
+                    original.update(materialize(value) for value in saved)
+                    restored_mutables.add(original_id)
+            # Rebind fields to their pre-attempt object. This also repairs an
+            # attempt that replaced a container rather than mutating it.
+            if isinstance(original, (dict, list, set)):
+                live[name] = original
+            else:
+                live[name] = saved
+
+        # Only value-state fields are owned by this contract. A newly-created
+        # client/lock/resource is intentionally outside it and remains intact.
+        for name in set(live) - set(original_keys):
+            if isinstance(live[name], self._ATTEMPT_STATE_VALUE_TYPES):
+                live.pop(name, None)
 
     def on_session_reset(self) -> None:
         """Reset all per-session state for /new or /reset."""

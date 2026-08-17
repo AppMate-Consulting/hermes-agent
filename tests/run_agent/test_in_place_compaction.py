@@ -13,6 +13,8 @@ import os
 import copy
 import json
 import tempfile
+import types
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -731,6 +733,153 @@ class TestInPlaceConfigDefault:
         from hermes_cli.config import DEFAULT_CONFIG
 
         assert DEFAULT_CONFIG["compression"].get("in_place") is True
+
+
+class TestCompressionAttemptStateContract:
+    def _agent(self, tmp_path, suffix="attempt-state"):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / f"{suffix}.db")
+        sid = suffix
+        _seed(db, sid, suffix)
+        return db, _make_agent(db, sid, in_place=True)
+
+    def test_rejection_restores_aliased_containers_in_place(self, tmp_path):
+        from agent.conversation_compression import compress_context
+
+        _db, agent = self._agent(tmp_path, "aliased-rejection")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        shared_list = ["control"]
+        shared_dict = {"cursor": 0, "items": shared_list}
+        dict_alias = shared_dict
+        list_alias = shared_list
+        agent.context_compressor.selector_state = shared_dict
+        agent.context_compressor.selector_items = shared_list
+        opaque = object()
+        agent.context_compressor.selector_client = opaque
+
+        def reject(candidate, **_kwargs):
+            agent.context_compressor.selector_state["cursor"] = 9
+            agent.context_compressor.selector_items.append("speculative")
+            agent.context_compressor.speculative_owned_field = ["remove me"]
+            return candidate
+
+        agent.context_compressor.compress = reject
+        returned, _ = compress_context(
+            agent, messages, "sys", approx_tokens=100_000, force=True
+        )
+
+        assert returned is messages
+        assert agent.context_compressor.selector_state is dict_alias
+        assert agent.context_compressor.selector_items is list_alias
+        assert dict_alias == {"cursor": 0, "items": ["control"]}
+        assert list_alias == ["control"]
+        assert dict_alias["items"] is list_alias
+        assert not hasattr(agent.context_compressor, "speculative_owned_field")
+        assert agent.context_compressor.selector_client is opaque
+        assert (dict_alias["cursor"], list(list_alias)) == (0, ["control"])
+
+    def test_custom_dataclass_hook_restores_identity_and_selection(self, tmp_path):
+        from agent.conversation_compression import compress_context
+
+        @dataclass
+        class RouterState:
+            cursor: int
+            topics: list[str]
+
+        _db, agent = self._agent(tmp_path, "custom-state-rejection")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        state = RouterState(0, ["control"])
+        external_alias = state
+        agent.context_compressor.router_state = state
+
+        def snapshot(engine):
+            return (engine.router_state, copy.deepcopy(engine.router_state))
+
+        def restore(engine, token):
+            original, saved = token
+            original.cursor = saved.cursor
+            original.topics[:] = saved.topics
+            engine.router_state = original
+            vars(engine).pop("attempt_route", None)
+
+        agent.context_compressor.snapshot_compression_attempt_state = types.MethodType(
+            snapshot, agent.context_compressor
+        )
+        agent.context_compressor.restore_compression_attempt_state = types.MethodType(
+            restore, agent.context_compressor
+        )
+
+        def reject(candidate, **_kwargs):
+            state.cursor = 4
+            state.topics.append("speculative")
+            agent.context_compressor.attempt_route = "owned"
+            return candidate
+
+        agent.context_compressor.compress = reject
+        control_selection = (state.cursor, tuple(state.topics))
+        compress_context(agent, messages, "sys", approx_tokens=100_000, force=True)
+
+        assert agent.context_compressor.router_state is external_alias
+        assert (state.cursor, tuple(state.topics)) == control_selection
+        assert not hasattr(agent.context_compressor, "attempt_route")
+
+    @pytest.mark.parametrize("exit_kind", ["cancel", "exception"])
+    def test_cancellation_and_exception_restore_hook_once(self, tmp_path, exit_kind):
+        from agent.auxiliary_client import AuxiliaryExplicitCancellation
+        from agent.conversation_compression import compress_context
+
+        _db, agent = self._agent(tmp_path, f"restore-once-{exit_kind}")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        original_restore = agent.context_compressor.restore_compression_attempt_state
+        restore = MagicMock(side_effect=original_restore)
+        agent.context_compressor.restore_compression_attempt_state = restore
+
+        error = (
+            AuxiliaryExplicitCancellation()
+            if exit_kind == "cancel"
+            else RuntimeError("selector failed")
+        )
+
+        def fail(_candidate, **_kwargs):
+            raise error
+
+        agent.context_compressor.compress = fail
+        if exit_kind == "cancel":
+            compress_context(agent, messages, "sys", approx_tokens=100_000, force=True)
+        else:
+            with pytest.raises(RuntimeError, match="selector failed"):
+                compress_context(
+                    agent, messages, "sys", approx_tokens=100_000, force=True
+                )
+        assert restore.call_count == 1
+
+    def test_successful_publication_does_not_restore_committed_state(self, tmp_path):
+        from agent.conversation_compression import compress_context
+
+        _db, agent = self._agent(tmp_path, "successful-state-publication")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        original_restore = agent.context_compressor.restore_compression_attempt_state
+        restore = MagicMock(side_effect=original_restore)
+        agent.context_compressor.restore_compression_attempt_state = restore
+        state = {"cursor": 0}
+        agent.context_compressor.selector_state = state
+
+        def commit(_candidate, **_kwargs):
+            state["cursor"] = 1
+            return [
+                {"role": "user", "content": "summary"},
+                {"role": "assistant", "content": "tail"},
+            ]
+
+        agent.context_compressor.compress = commit
+        compressed, _ = compress_context(
+            agent, messages, "sys", approx_tokens=100_000, force=True
+        )
+
+        assert compressed is not messages
+        assert state == {"cursor": 1}
+        restore.assert_not_called()
 
 
 class TestInPlaceAntiGrowthGuard:

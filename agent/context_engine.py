@@ -278,6 +278,43 @@ class ContextEngine(ABC):
         """
         return None
 
+    # -- Optional: compression-attempt transaction state -----------------
+
+    def snapshot_compression_attempt_state(self) -> Any:
+        """Return an opaque token for rolling back one compression attempt.
+
+        ``compress_context()`` calls this at the true pre-attempt boundary,
+        before selection/compression code can mutate engine state.  If the
+        candidate is not published it passes the token exactly once to
+        :meth:`restore_compression_attempt_state`; a published candidate is
+        never restored.
+
+        Engines should include only mutable state they own for selection or
+        compression attempts (for example routing cursors, topic state, and
+        attempt diagnostics).  They must not snapshot clients, locks, provider
+        handles, database connections, or other unrelated runtime resources.
+        An engine that owns aliased mutable objects is responsible for
+        restoring their contents *in place* so external aliases remain valid,
+        and may remove fields created by the attempt only when those fields
+        are explicitly within its owned snapshot contract.
+
+        The default token is ``None`` and the default restore is a no-op.  This
+        is deliberately safe for older engines: the host does not guess which
+        of their arbitrary attributes are transactional or copy resources it
+        does not own.  Engines with custom objects/dataclasses should override
+        both hooks to provide exact rollback for their owned state.
+        """
+        return None
+
+    def restore_compression_attempt_state(self, snapshot: Any) -> None:
+        """Restore a token returned by ``snapshot_compression_attempt_state``.
+
+        The default implementation is a compatibility no-op.  Overrides must
+        restore only engine-owned selection/compression-attempt state and
+        should treat ``snapshot`` as opaque to the host.
+        """
+        return None
+
     def on_turn_complete(
         self,
         messages: List[Dict[str, Any]],

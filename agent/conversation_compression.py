@@ -2929,65 +2929,31 @@ def compress_context(
             "_pending_cli_user_message",
         )
     }
-    _selector_state_snapshot: Optional[tuple[set[str], dict[str, Any]]] = None
-
-    def _copyable_selector_values(values: dict[str, Any]) -> dict[str, Any]:
-        copied: dict[str, Any] = {}
-        for name, value in values.items():
-            if not isinstance(
-                value, (str, bytes, int, float, bool, type(None), dict, list, set, tuple)
-            ):
-                continue
-            try:
-                copied[name] = copy.deepcopy(value)
-            except Exception:
-                continue
-        return copied
-
-    # Selector and compressor attempt state share the same object.  Snapshot
-    # selector-owned copyable values at the actual transaction boundary,
-    # before ``compress()`` can mutate attempt counters or diagnostics.  A
-    # later policy rejection may first perform the targeted compressor
-    # rollback and then the general uncommitted-input rollback; both must
-    # restore the same pre-attempt values rather than resurrecting a
-    # speculative post-compress snapshot.  Opaque clients and locks remain
-    # excluded by ``_copyable_selector_values``.
-    try:
-        _selector_values = vars(agent.context_compressor)
-        _selector_state_snapshot = (
-            set(_selector_values),
-            _copyable_selector_values(_selector_values),
-        )
-    except TypeError:
-        _selector_state_snapshot = (set(), {})
+    # The engine owns the definition of transactional selector/compressor
+    # state. Take its opaque token at the true boundary, before any attempt
+    # bookkeeping or selection can mutate it. Older engines inherit a safe
+    # no-op instead of having the host deepcopy arbitrary runtime resources.
+    _attempt_state_restored = False
+    _attempt_state_snapshotter = getattr(
+        agent.context_compressor, "snapshot_compression_attempt_state", None
+    )
+    _attempt_state_snapshot = (
+        _attempt_state_snapshotter()
+        if callable(_attempt_state_snapshotter)
+        else None
+    )
 
     def _restore_selector_state() -> None:
         """Undo selector-owned mutations when candidate admission aborts."""
-        nonlocal _selector_state_snapshot
-        if _selector_state_snapshot is None:
+        nonlocal _attempt_state_restored
+        if _attempt_state_restored:
             return
-        original_keys, copied_values = _selector_state_snapshot
-        try:
-            live_values = vars(agent.context_compressor)
-        except TypeError:
-            _selector_state_snapshot = None
-            return
-        for name, value in copied_values.items():
-            live_values[name] = copy.deepcopy(value)
-        # Only remove newly-created fields whose current value is safely
-        # copyable.  Opaque locks/clients are never touched by this rollback.
-        for name in set(live_values) - original_keys:
-            if not isinstance(
-                live_values[name],
-                (str, bytes, int, float, bool, type(None), dict, list, set, tuple),
-            ):
-                continue
-            try:
-                copy.deepcopy(live_values[name])
-            except Exception:
-                continue
-            live_values.pop(name, None)
-        _selector_state_snapshot = None
+        _attempt_state_restored = True
+        restorer = getattr(
+            agent.context_compressor, "restore_compression_attempt_state", None
+        )
+        if callable(restorer):
+            restorer(_attempt_state_snapshot)
 
     def _restore_uncommitted_input() -> None:
         """Restore all caller-visible input state on a non-commit path."""
@@ -3061,6 +3027,7 @@ def compress_context(
             isinstance(pending_notifications, collections.deque)
             and pending_notifications
         ):
+            _restore_uncommitted_input()
             raise RuntimeError("a compression notification is already pending")
 
     # ``conversation_history_after_compression()`` needs the latest attempt's
@@ -3117,7 +3084,7 @@ def compress_context(
                 _set_compression_outcome("cancelled_commit_fence")
                 return messages, _rollback_prompt()
         try:
-            return _compress_context_via_codex_app_server(
+            result = _compress_context_via_codex_app_server(
                 agent,
                 messages,
                 system_message,
@@ -3125,6 +3092,14 @@ def compress_context(
                 task_id=task_id,
                 force=force,
             )
+            if str(getattr(agent, "_last_compression_outcome", "")).startswith(
+                "skipped_"
+            ):
+                _restore_uncommitted_input()
+            return result
+        except BaseException:
+            _restore_uncommitted_input()
+            raise
         finally:
             if _codex_fence_entered:
                 commit_fence.finish_commit()
@@ -3156,7 +3131,11 @@ def compress_context(
         # session), leaving the flag unset is harmless; a non-fatal
         # transient failure is swallowed inside the function so the flag
         # is set normally on the next successful pass.
-        check_compression_model_feasibility(agent)
+        try:
+            check_compression_model_feasibility(agent)
+        except BaseException:
+            _restore_uncommitted_input()
+            raise
         agent._compression_feasibility_checked = True
 
     _pre_msg_count = len(messages)
@@ -3569,7 +3548,6 @@ def compress_context(
             durable_cooldown_authoritative=_durable_cooldown_authoritative,
             durable_cooldown_state=_durable_cooldown_state,
         )
-        _restore_uncommitted_input()
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None
@@ -3963,11 +3941,10 @@ def compress_context(
             split_status="aborted",
             failure_class="explicit_interrupt",
         )
-        _restore_compressor_attempt_state(
-            agent.context_compressor,
-            _compressor_attempt_snapshot,
-            durable_cooldown_authoritative=False,
-        )
+        # The targeted bookkeeping snapshot was already restored above. The
+        # engine hook must be the final in-memory restore so its original
+        # aliased containers are not replaced by a second deepcopy.
+        _restore_uncommitted_input()
         _set_compression_outcome("cancelled_explicit_interrupt")
         _existing_sp = _rollback_prompt()
         return messages, _existing_sp
@@ -3978,6 +3955,7 @@ def compress_context(
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
             _activity_heartbeat = None
+        _rollback_rejected_compressor_state(preserve_current_cooldown=True)
         _restore_uncommitted_input()
         _release_lock()
         _emit_compression_attempt_telemetry(
@@ -3987,7 +3965,6 @@ def compress_context(
             split_status="aborted",
             failure_class=f"exception:{type(_compress_exc).__name__}",
         )
-        _rollback_rejected_compressor_state(preserve_current_cooldown=True)
         _set_compression_outcome(
             f"compression_exception_{type(_compress_exc).__name__}"
         )
@@ -4861,13 +4838,13 @@ def compress_context(
         _committed_new_session_id = agent.session_id or ""
 
         if not _session_commit_succeeded:
-            _restore_uncommitted_input()
             _restore_compressor_attempt_state(
                 agent.context_compressor,
                 _compressor_attempt_snapshot,
                 durable_cooldown_authoritative=_durable_cooldown_authoritative,
                 durable_cooldown_state=_durable_cooldown_state,
             )
+            _restore_uncommitted_input()
             agent._last_compression_attempt_in_place = None
             agent._last_compaction_in_place = False
             return messages, _rollback_prompt()
@@ -5124,13 +5101,13 @@ def compress_context(
             # the complete in-memory boundary returns restores the entire
             # speculative state; extension callbacks are scheduled only after
             # that boundary completes.
-            _restore_uncommitted_input()
             _restore_compressor_attempt_state(
                 agent.context_compressor,
                 _compressor_attempt_snapshot,
                 durable_cooldown_authoritative=_durable_cooldown_authoritative,
                 durable_cooldown_state=_durable_cooldown_state,
             )
+            _restore_uncommitted_input()
             agent._last_compression_attempt_in_place = None
             agent._last_compaction_in_place = False
         raise

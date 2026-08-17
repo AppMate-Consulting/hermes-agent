@@ -2444,6 +2444,17 @@ def run_conversation(
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
+        # Context selection is a real per-request state transition.  Preserve
+        # opaque tokens on both sides of this first (old-request) projection so
+        # compression can replace it transactionally with exactly one candidate
+        # transition, or retain it when the old request remains authoritative.
+        _selector_preview_snapshotter = getattr(
+            agent.context_compressor, "snapshot_compression_attempt_state", None
+        )
+        _selector_preview_pre = (
+            _selector_preview_snapshotter()
+            if callable(_selector_preview_snapshotter) else None
+        )
         _provider_request = (
             {"messages": copy.deepcopy(_admitted_request["messages"]),
              "tools": copy.deepcopy(_admitted_request["tools"])}
@@ -2460,6 +2471,10 @@ def run_conversation(
                 sanitize_model=_sanitize_model,
                 current_turn_suffix=_moa_context,
             )
+        )
+        _selector_preview_post = (
+            _selector_preview_snapshotter()
+            if callable(_selector_preview_snapshotter) else None
         )
         api_messages = _provider_request["messages"]
         tools_for_api = _provider_request["tools"]
@@ -2658,6 +2673,8 @@ def run_conversation(
                 live_request_context={
                         "admission_handoff": _admission_handoff,
                         "frozen_projection": _provider_request,
+                        "selector_preview_pre": _selector_preview_pre,
+                        "selector_preview_post": _selector_preview_post,
                         "current_turn_user_idx": current_turn_user_idx,
                         "current_turn_identity": copy.deepcopy(
                             messages[current_turn_user_idx].get("content")

@@ -2942,6 +2942,9 @@ def compress_context(
         if callable(_attempt_state_snapshotter)
         else None
     )
+    _request_middleware_post_old = _missing_cache_field
+    _request_middleware_state_restored = False
+    _old_finalized_handoff = None
 
     def _restore_selector_state() -> None:
         """Undo selector-owned mutations when candidate admission aborts."""
@@ -2955,10 +2958,57 @@ def compress_context(
         if callable(restorer):
             restorer(_attempt_state_snapshot)
 
+    # Automatic admission arrives after the live loop has projected the old
+    # request once.  Replace that transition with the candidate transition by
+    # rewinding to the token captured immediately before projection.  The
+    # ordinary abort helper above retains the post-old token, because on every
+    # noncommit path the caller will dispatch that frozen old request.
+    _selector_preview_pre = (live_request_context or {}).get(
+        "selector_preview_pre", _missing_cache_field
+    )
+    _selector_preview_post = (live_request_context or {}).get(
+        "selector_preview_post", _missing_cache_field
+    )
+    if (
+        (live_request_context or {}).get("frozen_projection") is not None
+        and _selector_preview_pre is not _missing_cache_field
+        and _selector_preview_post is not _missing_cache_field
+    ):
+        _selector_preview_restorer = getattr(
+            agent.context_compressor,
+            "restore_compression_attempt_state",
+            None,
+        )
+        if callable(_selector_preview_restorer):
+            _selector_preview_restorer(_selector_preview_pre)
+
     def _restore_uncommitted_input() -> None:
         """Restore all caller-visible input state on a non-commit path."""
-        nonlocal messages
+        nonlocal messages, _request_middleware_state_restored
         _restore_selector_state()
+        if (
+            _request_middleware_post_old is not _missing_cache_field
+            and not _request_middleware_state_restored
+        ):
+            from hermes_cli.middleware import (
+                restore_llm_request_middleware_preview_state,
+            )
+
+            restore_llm_request_middleware_preview_state(
+                _request_middleware_post_old
+            )
+            _request_middleware_state_restored = True
+            # The old middleware transition is now the committed one.  Carry
+            # its already-finalized request to the caller so dispatch cannot
+            # consume the callback a second time after an aborted candidate.
+            _old_handoff_target = (live_request_context or {}).get(
+                "admission_handoff"
+            )
+            if (
+                isinstance(_old_handoff_target, dict)
+                and _old_finalized_handoff is not None
+            ):
+                _old_handoff_target["request"] = _old_finalized_handoff
         if _caller_messages != _caller_rollback_snapshot:
             _caller_messages[:] = copy.deepcopy(_caller_rollback_snapshot)
         # Adoption rebinds the working transcript.  Abort paths must return
@@ -4339,8 +4389,12 @@ def compress_context(
         # of their respective complete requests: prompt growth is real request
         # growth and must not be hidden merely to isolate transcript reclaim.
         from agent.conversation_loop import (
-            _apply_finalized_request_middleware,
             finalize_provider_request,
+        )
+        from hermes_cli.middleware import (
+            NonTransactionalRequestMiddlewareError,
+            restore_llm_request_middleware_preview_state,
+            snapshot_llm_request_middleware_preview_state,
         )
 
         # Middleware comparison uses one documented frozen synthetic context
@@ -4373,6 +4427,37 @@ def compress_context(
             "current_turn_suffix": _live.get("current_turn_suffix"),
             "middleware_context": dict(_admission_middleware_context),
         }
+        try:
+            _request_middleware_pre = (
+                snapshot_llm_request_middleware_preview_state()
+            )
+            _middleware_transaction_error = None
+        except NonTransactionalRequestMiddlewareError as exc:
+            # Do not invoke an unknown callback speculatively.  The rejected
+            # compression path leaves the ordinary caller to apply it exactly
+            # once to the frozen old request before dispatch.
+            _request_middleware_pre = None
+            _middleware_transaction_error = f"{type(exc).__name__}: {exc}"
+
+        # A standalone/manual call has no old frozen projection.  Snapshot the
+        # post-compressor engine state so its old projection can be rolled back
+        # before the sole candidate projection without discarding compression
+        # bookkeeping.  Automatic admission already projected old before this
+        # transaction and therefore uses the frozen body without selection.
+        _manual_selector_before_old = None
+        if _live.get("frozen_projection") is None:
+            _manual_selector_snapshotter = getattr(
+                agent.context_compressor,
+                "snapshot_compression_attempt_state",
+                None,
+            )
+            if callable(_manual_selector_snapshotter):
+                _manual_selector_before_old = _manual_selector_snapshotter()
+
+        _preview_middleware_context = (
+            dict(_admission_middleware_context)
+            if _middleware_transaction_error is None else None
+        )
         _finalized_in = finalize_provider_request(
             agent,
             _authoritative_pre_compression_snapshot,
@@ -4387,9 +4472,25 @@ def compress_context(
             _frozen_projection=_live.get("frozen_projection"),
             moa_prepared_request=_live.get("moa_prepared_request"),
             user_initiated_turn=_live.get("user_initiated_turn"),
-            **_common_live,
+            **{**_common_live, "middleware_context": _preview_middleware_context},
         )
         _provider_request_in = _finalized_in["payload"]
+        if _middleware_transaction_error is None:
+            _request_middleware_post_old = (
+                snapshot_llm_request_middleware_preview_state()
+            )
+            _old_finalized_handoff = _finalized_in
+            restore_llm_request_middleware_preview_state(
+                _request_middleware_pre
+            )
+        if _manual_selector_before_old is not None:
+            _manual_selector_restorer = getattr(
+                agent.context_compressor,
+                "restore_compression_attempt_state",
+                None,
+            )
+            if callable(_manual_selector_restorer):
+                _manual_selector_restorer(_manual_selector_before_old)
         from agent.turn_context import reanchor_current_turn_user_idx
 
         _turn_identity = _live.get("current_turn_identity")
@@ -4412,22 +4513,12 @@ def compress_context(
             incoming_message=_candidate_incoming,
             moa_prepared_request=_live.get("moa_prepared_request"),
             user_initiated_turn=_live.get("user_initiated_turn"),
-            **_common_live,
+            **{**_common_live, "middleware_context": _preview_middleware_context},
         )
         _finalized_out["_consumes_user_initiator"] = bool(
             _live.get("user_initiated_turn") and agent._is_copilot_url()
         )
         _provider_request_out = _finalized_out["payload"]
-        _finalized_in_replay = _apply_finalized_request_middleware(
-            _finalized_in,
-            middleware_context=dict(_admission_middleware_context),
-        )
-        _finalized_out_replay = _apply_finalized_request_middleware(
-            _finalized_out,
-            middleware_context=dict(_admission_middleware_context),
-        )
-        _middleware_in_replay = _finalized_in_replay["payload"]
-        _middleware_out_replay = _finalized_out_replay["payload"]
         _request_in = estimate_finalized_payload_tokens_rough(_provider_request_in)
         _request_out = estimate_finalized_payload_tokens_rough(_provider_request_out)
         _threshold = int(
@@ -4438,19 +4529,15 @@ def compress_context(
         _rejection = None
         if not _protected_seam_valid:
             _rejection = "invalid_protected_tail_seam"
+        elif _middleware_transaction_error is not None:
+            _rejection = "nontransactional_middleware"
         elif any(
             result.get("middleware_error")
             for result in (
-                _finalized_in, _finalized_out, _finalized_in_replay,
-                _finalized_out_replay,
+                _finalized_in, _finalized_out,
             )
         ):
             _rejection = "middleware_unavailable"
-        elif (
-            _middleware_in_replay != _provider_request_in
-            or _middleware_out_replay != _provider_request_out
-        ):
-            _rejection = "nondeterministic_middleware"
         elif _provider_request_out == _provider_request_in:
             _rejection = "no_progress"
         elif _request_out > _request_in:

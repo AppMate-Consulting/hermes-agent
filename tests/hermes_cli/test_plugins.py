@@ -25,10 +25,13 @@ from hermes_cli.plugins import (
     _portable_skill_namespace,
 )
 from hermes_cli.middleware import (
+    NonTransactionalRequestMiddlewareError,
     VALID_MIDDLEWARE,
     apply_llm_request_middleware,
     apply_tool_request_middleware,
     run_tool_execution_middleware,
+    restore_llm_request_middleware_preview_state,
+    snapshot_llm_request_middleware_preview_state,
 )
 
 
@@ -310,6 +313,59 @@ class TestPluginDiscovery:
         assert tool_result.trace == []
         assert run_tool_execution_middleware("terminal", args, lambda payload: payload) is args
         assert has_middleware("tool_request") is False
+
+
+    def test_request_middleware_preview_state_restores_exact_callback_state(
+        self, monkeypatch
+    ):
+        class StatefulRequestMiddleware:
+            def __init__(self):
+                self.state = ["committed"]
+                self.snapshots = 0
+                self.restores = 0
+
+            def __call__(self, **kwargs):
+                self.state.append("preview")
+                return {"request": kwargs["request"]}
+
+            def snapshot_preview_state(self):
+                self.snapshots += 1
+                return list(self.state)
+
+            def restore_preview_state(self, token):
+                self.restores += 1
+                self.state[:] = token
+
+        callback = StatefulRequestMiddleware()
+        manager = types.SimpleNamespace(
+            _middleware={"llm_request": [callback]}
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager", lambda: manager
+        )
+
+        state = snapshot_llm_request_middleware_preview_state()
+        state_identity = callback.state
+        callback(request={"messages": []})
+        restore_llm_request_middleware_preview_state(state)
+
+        assert callback.state is state_identity
+        assert callback.state == ["committed"]
+        assert callback.snapshots == 1
+        assert callback.restores == 1
+
+
+    def test_request_middleware_preview_rejects_unknown_state(self, monkeypatch):
+        callback = lambda **kwargs: {"request": kwargs["request"]}
+        manager = types.SimpleNamespace(
+            _middleware={"llm_request": [callback]}
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager", lambda: manager
+        )
+
+        with pytest.raises(NonTransactionalRequestMiddlewareError):
+            snapshot_llm_request_middleware_preview_state()
 
 
 

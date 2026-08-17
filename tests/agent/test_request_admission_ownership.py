@@ -322,6 +322,59 @@ def test_admitted_execution_in_place_mutation_fails_closed_before_dispatch():
     assert payload["extra_headers"] is identities["extra_headers"]
 
 
+def test_admitted_execution_mutate_then_raise_restores_without_dispatch():
+    agent, _ = _agent()
+    admitted, snapshots, middleware_calls = [], [], []
+    identities = {}
+
+    def mutate_then_raise(request, next_call, **_context):
+        identities["payload"] = request
+        identities["messages"] = request["messages"]
+        identities["first"] = request["messages"][0]
+        request["messages"][0]["content"] = "changed before exception"
+        request["messages"].append({"role": "user", "content": "injected"})
+        raise RuntimeError("wrapper failed")
+
+    result = _run(
+        agent, [_response()], admitted=admitted, admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        execution_callbacks=[mutate_then_raise],
+    )
+
+    assert result["failed"] is True
+    assert "mutated the immutable admitted request" in result["error"]
+    agent.client.chat.completions.create.assert_not_called()
+    assert admitted[0] == snapshots[0]
+    payload = admitted[0]["payload"]
+    assert payload is identities["payload"]
+    assert payload["messages"] is identities["messages"]
+    assert payload["messages"][0] is identities["first"]
+
+
+def test_admitted_execution_mutate_then_raise_after_dispatch_never_duplicates():
+    agent, _ = _agent()
+    admitted, snapshots, middleware_calls = [], [], []
+
+    def dispatch_then_mutate_then_raise(request, next_call, **_context):
+        next_call()
+        request["messages"][0]["content"] = "changed after dispatch"
+        request["tools"].clear()
+        raise RuntimeError("post-dispatch wrapper failed")
+
+    result = _run(
+        agent, [_response()], admitted=admitted, admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        execution_callbacks=[dispatch_then_mutate_then_raise],
+    )
+
+    assert result["failed"] is True
+    assert "mutated the immutable admitted request" in result["error"]
+    assert agent.client.chat.completions.create.call_count == 1
+    dispatched = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatched == snapshots[0]["payload"]
+    assert admitted[0] == snapshots[0]
+
+
 def test_admitted_execution_wrapper_observes_exact_object_and_wraps_call():
     agent, _ = _agent()
     admitted, snapshots, middleware_calls, events = [], [], [], []
@@ -426,6 +479,9 @@ def test_tool_iteration_cannot_consume_stale_admission():
     assert calls[1].kwargs["tools"] is not admitted[0]["payload"]["tools"]
     assert calls[1].kwargs["messages"][-1]["role"] == "tool"
     assert admitted[0] == admitted_snapshots[0]
-    assert len(middleware_calls) == 5
+    # Old and candidate admission each run once; the later tool iteration is
+    # one ordinary provider request.  Determinism replay must not duplicate
+    # side effects.
+    assert len(middleware_calls) == 3
     assert agent.context_compressor.compression_checks == [63, 0]
     assert "_admitted_provider_request" not in vars(agent)

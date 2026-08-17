@@ -180,9 +180,11 @@ def test_compression_rejects_middleware_only_finalized_request_growth(
     assert agent._last_compression_outcome == "rejected_would_grow"
 
 
-def test_compression_rejects_nondeterministic_before_middleware(monkeypatch):
-    """The frozen before body must be replayed, not only the candidate body."""
-    from hermes_cli.middleware import RequestMiddlewareResult
+def test_compression_rejects_nontransactional_middleware_without_invoking_it(
+    monkeypatch,
+):
+    """Unknown stateful callbacks fail closed before speculative invocation."""
+    from hermes_cli.middleware import NonTransactionalRequestMiddlewareError
 
     compressor = MagicMock()
     compressor.compress.return_value = [{"role": "user", "content": "small"}]
@@ -193,25 +195,23 @@ def test_compression_rejects_nondeterministic_before_middleware(monkeypatch):
     def stateful(payload, **_context):
         nonlocal calls
         calls += 1
-        shaped = copy.deepcopy(payload)
-        if calls == 1:
-            shaped["one_time_inflation"] = "x" * 100_000
-        return RequestMiddlewareResult(
-            payload=shaped,
-            original_payload=copy.deepcopy(payload),
-            changed=shaped != payload,
-            trace=[],
-        )
+        return payload
 
     monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware", stateful)
+    monkeypatch.setattr(
+        "hermes_cli.middleware.snapshot_llm_request_middleware_preview_state",
+        lambda: (_ for _ in ()).throw(
+            NonTransactionalRequestMiddlewareError("missing preview hooks")
+        ),
+    )
     original = _messages()
     returned, _ = agent._compress_context(
         original, "sys", approx_tokens=100_000, force=True
     )
 
-    assert calls == 4
+    assert calls == 0
     assert returned is original
-    assert agent._last_compression_outcome == "rejected_nondeterministic_middleware"
+    assert agent._last_compression_outcome == "rejected_nontransactional_middleware"
 
 
 @pytest.mark.parametrize(

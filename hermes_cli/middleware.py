@@ -38,6 +38,63 @@ class ImmutableRequestMiddlewareError(RuntimeError):
     """Execution middleware violated an admitted-request ownership contract."""
 
 
+class NonTransactionalRequestMiddlewareError(RuntimeError):
+    """Request middleware cannot participate in speculative admission."""
+
+
+@dataclass(frozen=True)
+class RequestMiddlewarePreviewState:
+    """Opaque snapshots for one speculative llm-request middleware pass."""
+
+    entries: tuple[tuple[Callable, Any], ...]
+
+
+def snapshot_llm_request_middleware_preview_state() -> RequestMiddlewarePreviewState:
+    """Snapshot every stateful request callback, rejecting unknown state.
+
+    A callback is eligible for compression admission when it either exposes
+    ``snapshot_preview_state`` and ``restore_preview_state`` methods, or opts
+    into the side-effect-free contract with ``preview_safe = True``.  Normal
+    provider dispatch remains compatible with callbacks declaring neither.
+    """
+    entries: list[tuple[Callable, Any]] = []
+    for callback in _get_middleware_callbacks(LLM_REQUEST_MIDDLEWARE):
+        snapshotter = getattr(callback, "snapshot_preview_state", None)
+        restorer = getattr(callback, "restore_preview_state", None)
+        if callable(snapshotter) and callable(restorer):
+            entries.append((callback, snapshotter()))
+            continue
+        if bool(getattr(callback, "preview_safe", False)):
+            entries.append((callback, None))
+            continue
+        raise NonTransactionalRequestMiddlewareError(
+            "llm_request middleware callback "
+            f"{getattr(callback, '__name__', repr(callback))} must expose "
+            "snapshot_preview_state()/restore_preview_state() or explicitly "
+            "declare preview_safe=True before automatic compression"
+        )
+    return RequestMiddlewarePreviewState(tuple(entries))
+
+
+def restore_llm_request_middleware_preview_state(
+    snapshot: RequestMiddlewarePreviewState,
+) -> None:
+    """Restore a preview snapshot in reverse middleware order."""
+    current = _get_middleware_callbacks(LLM_REQUEST_MIDDLEWARE)
+    expected = [callback for callback, _token in snapshot.entries]
+    if len(current) != len(expected) or any(
+        callback is not registered
+        for callback, registered in zip(current, expected)
+    ):
+        raise NonTransactionalRequestMiddlewareError(
+            "llm_request middleware registrations changed during admission"
+        )
+    for callback, token in reversed(snapshot.entries):
+        restorer = getattr(callback, "restore_preview_state", None)
+        if callable(restorer):
+            restorer(token)
+
+
 @dataclass
 class RequestMiddlewareResult:
     """Result of applying request middleware to a mutable payload."""
@@ -433,6 +490,10 @@ def _run_execution_chain(
             restore_admitted_graph()
             raise
         except _DownstreamExecutionError as exc:
+            # A wrapper may mutate after a successful downstream dispatch and
+            # then raise.  Restore the admitted graph and report the immutable
+            # contract violation, but never issue a second provider call.
+            assert_admitted_unchanged(callback)
             raise exc.original
         except Exception as exc:
             logger.warning(
@@ -441,6 +502,9 @@ def _run_execution_chain(
                 getattr(callback, "__name__", repr(callback)),
                 exc,
             )
+            # Validate before generic fail-open continuation on *every* exit.
+            # This closes mutate-then-raise both before and after next_call().
+            assert_admitted_unchanged(callback)
             if next_succeeded:
                 return next_result
             if next_called:

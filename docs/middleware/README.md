@@ -93,6 +93,22 @@ Responses API `input`, model settings, tool definitions, stream options, and
 provider-specific options. Execution middleware receives the same effective
 request plus `next_call`.
 
+Automatic compression compares an old request with a candidate before it can
+publish the candidate. An `llm_request` callable that owns mutable state must
+therefore implement `snapshot_preview_state()` and
+`restore_preview_state(token)`. Hermes restores these opaque tokens around the
+comparison so only the request that can actually be dispatched commits one
+state transition. A callback that is genuinely pure and side-effect free may
+instead set `preview_safe = True`. Callbacks declaring neither continue to work
+for ordinary requests, but automatic compression fails closed before invoking
+them speculatively.
+
+For an admitted compressed request, `llm_execution` middleware is observational:
+it may wrap `next_call()` but may not mutate or replace the request. Hermes
+restores any in-place mutation and raises `ImmutableRequestMiddlewareError` on
+normal and exceptional exits. If downstream was already called, it is never
+called a second time.
+
 ### Tool Calls
 
 For each tool call, Hermes applies middleware in this order:

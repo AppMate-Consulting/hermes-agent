@@ -144,6 +144,50 @@ class TestF1CommitOverrunWhileHung:
         assert fence.commit_in_flight is False
 
 
+def test_in_memory_publication_claim_linearizes_both_race_outcomes():
+    cancelled = CompressionCommitFence()
+    assert cancelled.try_cancel_before_commit() is True
+    assert cancelled.claim_caller_publication() is False
+    assert cancelled.caller_publication_claimed is False
+
+    published = CompressionCommitFence()
+    assert published.claim_caller_publication() is True
+    assert published.caller_publication_claimed is True
+    assert published.try_cancel_before_commit() is False
+    assert published.commit_in_flight is False
+
+
+def test_postcommit_lane_serializes_blocked_chains_in_publication_order(monkeypatch):
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    order = []
+
+    class Agent:
+        pass
+
+    agent = Agent()
+    monkeypatch.setattr(cc, "_POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.02)
+
+    def first():
+        order.append("first-enter")
+        first_entered.set()
+        assert release_first.wait(timeout=5)
+        order.append("first-exit")
+
+    def second():
+        order.append("second-enter")
+        second_entered.set()
+
+    cc._run_postcommit_callbacks_bounded(agent, first, session_id="child-1")
+    assert first_entered.is_set()
+    cc._run_postcommit_callbacks_bounded(agent, second, session_id="child-2")
+    assert not second_entered.is_set()
+    release_first.set()
+    assert second_entered.wait(timeout=2)
+    assert order == ["first-enter", "first-exit", "second-enter"]
+
+
 class _KIOnFirstResultFuture:
     """Future proxy raising on the host's first result() call."""
 

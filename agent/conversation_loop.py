@@ -39,6 +39,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -1195,6 +1196,99 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
         am["tool_calls"] = new_tcs
 
 
+def _project_provider_history_message(agent, msg, *, model=None):
+    """Project one durable row into its provider-history representation."""
+    api_msg = _clone_message_for_send(msg)
+    api_content = api_msg.pop("api_content", None)
+    api_msg.pop("display_kind", None)
+    api_msg.pop("display_metadata", None)
+    api_msg.pop("_row_id", None)
+    for field in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+        api_msg.pop(field, None)
+    if (
+        isinstance(api_content, str)
+        and api_content
+        and msg.get("role") in ("user", "assistant")
+    ):
+        api_msg["content"] = api_content
+    agent._copy_reasoning_content_for_api(msg, api_msg)
+    api_msg.pop("reasoning", None)
+    api_msg.pop("finish_reason", None)
+    api_msg.pop("_length_continuation_fragment", None)
+    api_msg.pop("_length_continuation_nudge", None)
+    if agent._should_sanitize_tool_calls():
+        agent._sanitize_tool_calls_for_strict_api(
+            api_msg, model=model if model is not None else agent.model
+        )
+    return api_msg
+
+
+def project_provider_request(
+    agent,
+    messages,
+    *,
+    system_prompt: str = "",
+    tools=None,
+):
+    """Return the canonical, non-mutating provider-visible request projection.
+
+    This is the common projection owner for both compression admission and the
+    live send path.  It intentionally excludes turn-local injections (which
+    are already persisted in ``api_content`` when they must remain stable),
+    while applying every history transform that changes provider-visible
+    bytes: private/display field removal, reasoning echo, strict-tool shaping,
+    sequence repair, whitespace/tool-call normalization, and prompt-cache
+    decoration.  The returned messages and tools are private structural
+    copies; neither durable history nor the registry schemas are mutated.
+    """
+    api_messages = []
+    for msg in messages or []:
+        api_messages.append(_project_provider_history_message(agent, msg))
+
+    if system_prompt:
+        api_messages.insert(0, {"role": "system", "content": system_prompt})
+    api_messages = agent._sanitize_api_messages(api_messages)
+    api_messages = agent._drop_thinking_only_and_merge_users(
+        api_messages,
+        drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+    )
+    for api_msg in api_messages:
+        if isinstance(api_msg.get("content"), str):
+            api_msg["content"] = api_msg["content"].strip()
+    _canonicalize_api_tool_calls(api_messages)
+    _sanitize_messages_surrogates(api_messages)
+    # Transport adapters consume any provider-specific private state before
+    # emitting wire messages; arbitrary row provenance never reaches a
+    # provider. Admission has no transport call, so finish that projection
+    # explicitly here. Codex replay fields are intentionally non-underscored.
+    for api_msg in api_messages:
+        for key in tuple(api_msg):
+            if isinstance(key, str) and key.startswith("_"):
+                api_msg.pop(key, None)
+
+    projected_tools = _clone_message_for_send(tools or [])
+    if agent._use_prompt_caching and agent.provider != "moa":
+        plan = build_prompt_cache_plan(
+            api_messages,
+            projected_tools,
+            cache_ttl=effective_cache_ttl(
+                agent._cache_ttl, provider=agent.provider, model=agent.model
+            ),
+            native_anthropic=agent._use_native_cache_layout,
+            static_system_prefix=(
+                agent._cached_system_prompt_static
+                if isinstance(
+                    getattr(agent, "_cached_system_prompt_static", None), str
+                )
+                else None
+            ),
+            direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
+        )
+        api_messages = plan.messages
+        projected_tools = plan.tools
+    return {"messages": api_messages, "tools": projected_tools}
+
+
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     """Error-result content for a tool call whose name isn't a real tool.
 
@@ -2032,27 +2126,30 @@ def run_conversation(
             # cache decoration) must be unable to reach the persisted
             # history through shared nested containers. See
             # _clone_message_for_send.
-            api_msg = _clone_message_for_send(msg)
+            # Shared with compression admission: durable-row projection has
+            # one owner, so private/display fields and provider shaping cannot
+            # drift between the request we size and the request we send.
+            _sanitize_model = agent.model
+            if agent.provider == "moa":
+                if moa_config:
+                    _agg = moa_config.get("aggregator") or {}
+                    if _agg.get("model"):
+                        _sanitize_model = _agg["model"]
+                if _sanitize_model == agent.model:
+                    _moa_client = getattr(agent, "client", None)
+                    _agg_slot = getattr(_moa_client, "last_aggregator_slot", None)
+                    if _agg_slot and _agg_slot.get("model"):
+                        _sanitize_model = _agg_slot["model"]
+            api_msg = _project_provider_history_message(
+                agent, msg, model=_sanitize_model
+            )
 
             # api_content is the persistence sidecar carrying the exact bytes
             # sent to the API for this message when they differ from the clean
             # stored content (see compose_user_api_content in turn_context).
             # It is bookkeeping, never a provider field — pop it from EVERY
             # outgoing copy.
-            _api_content = api_msg.pop("api_content", None)
-
-            # Display-only timeline metadata. Never a provider field — strip
-            # from every outgoing copy so strict OpenAI-compatible backends
-            # don't reject the request after a model switch or resumed typed
-            # event row enters the live history.
-            api_msg.pop("display_kind", None)
-            api_msg.pop("display_metadata", None)
-
-            # Durable row identity stamped by _rows_to_conversation so the
-            # desktop can address a specific persisted message (reactions).
-            # Bookkeeping, never a provider field — only the chat-completions
-            # transport strips underscore keys, so drop it centrally here.
-            api_msg.pop("_row_id", None)
+            _api_content = msg.get("api_content")
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -2093,49 +2190,6 @@ def run_conversation(
                 # ``_flush_messages_to_session_db``).
                 api_msg["content"] = _api_content
 
-            # For ALL assistant messages, pass reasoning back to the API
-            # This ensures multi-turn reasoning context is preserved
-            agent._copy_reasoning_content_for_api(msg, api_msg)
-
-            # Remove 'reasoning' field - it's for trajectory storage only
-            # We've copied it to 'reasoning_content' for the API above
-            if "reasoning" in api_msg:
-                api_msg.pop("reasoning")
-            # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
-            if "finish_reason" in api_msg:
-                api_msg.pop("finish_reason")
-            # _thinking_prefill survives here intentionally: the drop pass below
-            # needs it. The transport strips all underscore keys before the wire.
-            # Strip length-continuation marks; not every transport drops underscore keys.
-            api_msg.pop("_length_continuation_fragment", None)
-            api_msg.pop("_length_continuation_nudge", None)
-            # Strip Codex Responses API fields (call_id, response_item_id) for
-            # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
-            # Uses new dicts so the internal messages list retains the fields
-            # for Codex Responses compatibility.
-            if agent._should_sanitize_tool_calls():
-                # In MoA mode, agent.model is the virtual preset name
-                # (e.g. "closed"), not the actual aggregator model.  Use
-                # the resolved aggregator model so Gemini aggregators
-                # correctly preserve thought_signature (extra_content).
-                _sanitize_model = agent.model
-                if agent.provider == "moa":
-                    if moa_config:
-                        _agg = moa_config.get("aggregator") or {}
-                        if _agg.get("model"):
-                            _sanitize_model = _agg["model"]
-                    if _sanitize_model == agent.model:
-                        # Virtual-provider mode: no moa_config is threaded
-                        # through run_conversation — the facade resolves the
-                        # preset internally. Ask the facade for the resolved
-                        # aggregator slot from the previous create() instead
-                        # (set before any history replay that could carry
-                        # thought_signature).
-                        _moa_client = getattr(agent, "client", None)
-                        _agg_slot = getattr(_moa_client, "last_aggregator_slot", None)
-                        if _agg_slot and _agg_slot.get("model"):
-                            _sanitize_model = _agg_slot["model"]
-                agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)

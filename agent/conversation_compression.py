@@ -111,6 +111,7 @@ _OUTER_TERMINAL_COMPRESSION_OUTCOMES = frozenset({
 # complete, then let the already-scheduled daemon continue best-effort.  The
 # durable publication and lease release always precede this work.
 _POSTCOMMIT_CALLBACK_WAIT_SECONDS = 1.0
+_POSTCOMMIT_LANE_INIT_LOCK = threading.Lock()
 
 
 class _CompressionPublicationCancelled(Exception):
@@ -178,9 +179,9 @@ def _emit_compaction_done(agent: Any) -> None:
 
 
 def _run_postcommit_callbacks_bounded(
-    callback: Callable[[], None], *, session_id: str
+    agent: Any, callback: Callable[[], None], *, session_id: str
 ) -> None:
-    """Schedule one ordered callback chain exactly once without unbounded wait."""
+    """Enqueue one exactly-once observer chain on the agent's FIFO lane."""
     finished = threading.Event()
 
     def _run() -> None:
@@ -196,12 +197,28 @@ def _run_postcommit_callbacks_bounded(
         finally:
             finished.set()
 
-    worker = threading.Thread(
-        target=_run,
-        name=f"compression-postcommit-{session_id or 'none'}",
-        daemon=True,
-    )
-    worker.start()
+    lane_lock = getattr(agent, "_compression_observer_lane_lock", None)
+    if lane_lock is None:
+        with _POSTCOMMIT_LANE_INIT_LOCK:
+            lane_lock = getattr(agent, "_compression_observer_lane_lock", None)
+            if lane_lock is None:
+                lane_lock = threading.Lock()
+                agent._compression_observer_lane_lock = lane_lock
+    with lane_lock:
+        predecessor = getattr(agent, "_compression_observer_lane_tail", None)
+
+        def _ordered_run() -> None:
+            if predecessor is not None:
+                predecessor.wait()
+            _run()
+
+        worker = threading.Thread(
+            target=_ordered_run,
+            name=f"compression-postcommit-{session_id or 'none'}",
+            daemon=True,
+        )
+        agent._compression_observer_lane_tail = finished
+        worker.start()
     if not finished.wait(_POSTCOMMIT_CALLBACK_WAIT_SECONDS):
         logger.warning(
             "postcommit compression callbacks exceeded %.1fs and remain "
@@ -564,6 +581,10 @@ class CompressionCommitFence:
         # flight" even while the commit itself is hung — which is exactly when
         # the overrun warning must be able to fire.
         self._commit_phase = threading.Event()
+        # Separate from the SessionDB transaction marker: no-DB publication
+        # needs an atomic cancellation/first-mutation linearization point, but
+        # must not be reported as a durable commit.
+        self._caller_publication_claimed = False
         # Lock-free admission revocation (#76354 review F2). Set by
         # :meth:`revoke_commit_admission` on ANY host unwind (KeyboardInterrupt,
         # cancellation, unexpected exception) without touching the fence lock,
@@ -608,7 +629,7 @@ class CompressionCommitFence:
         that case acquiring this lock waits until all session mutation finishes.
         """
         with self._lock:
-            if self._commit_started:
+            if self._commit_started or self._caller_publication_claimed:
                 if cancel_event is not None:
                     cancel_event.set()
                 return False
@@ -626,7 +647,7 @@ class CompressionCommitFence:
         if not self._lock.acquire(blocking=False):
             return None
         try:
-            if self._commit_started:
+            if self._commit_started or self._caller_publication_claimed:
                 return False
             self._cancelled = True
             return True
@@ -655,6 +676,23 @@ class CompressionCommitFence:
         # commit_in_flight=True for a commit that lost to cancellation.
         self._commit_phase.set()
         return True
+
+    def claim_caller_publication(self, cancel_event: Any = None) -> bool:
+        """Atomically claim authoritative in-memory caller-state publication."""
+        with self._lock:
+            if (
+                self._cancelled
+                or self._admission_revoked
+                or (cancel_event is not None and bool(cancel_event.is_set()))
+            ):
+                self._cancelled = True
+                return False
+            self._caller_publication_claimed = True
+            return True
+
+    @property
+    def caller_publication_claimed(self) -> bool:
+        return self._caller_publication_claimed
 
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
@@ -3451,6 +3489,7 @@ def compress_context(
         # precommit cancellation, not an unchanged/no-progress candidate.
         if commit_fence is not None and commit_fence.is_cancelled:
             return _cancelled_commit_fence_result()
+
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -3593,6 +3632,7 @@ def compress_context(
             _activity_heartbeat.stop("context compression completed")
 
     _commit_fence_entered = False
+    _caller_publication_authoritative = False
 
     def _publish_session_db(operation: Callable[[], None]) -> None:
         """Fence exactly one SessionDB publication and promptly free its lease."""
@@ -3853,18 +3893,33 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
-        # Request-size admission precedes every persistence and boundary side
-        # effect. Both sides use the identical tool schema and their exact
-        # system prompt bytes.
-        _request_in = estimate_request_tokens_rough(
+        # Admission compares canonical provider-visible request objects, not
+        # durable rows.  Import lazily to avoid the module-level compression ↔
+        # conversation-loop dependency. Both candidates deliberately use the
+        # same system bytes, cache policy, and registry schemas: only provider-
+        # visible conversation reclaim is allowed to earn admission.
+        from agent.conversation_loop import project_provider_request
+
+        _admission_system_prompt = _system_prompt_before_compression or ""
+        _provider_request_in = project_provider_request(
+            agent,
             _authoritative_pre_compression_snapshot,
-            system_prompt=_system_prompt_before_compression,
-            tools=agent.tools or None,
+            system_prompt=_admission_system_prompt,
+            tools=agent.tools or [],
+        )
+        _provider_request_out = project_provider_request(
+            agent,
+            compressed,
+            system_prompt=_admission_system_prompt,
+            tools=agent.tools or [],
+        )
+        _request_in = estimate_request_tokens_rough(
+            _provider_request_in["messages"],
+            tools=_provider_request_in["tools"] or None,
         )
         _request_out = estimate_request_tokens_rough(
-            compressed,
-            system_prompt=new_system_prompt or "",
-            tools=agent.tools or None,
+            _provider_request_out["messages"],
+            tools=_provider_request_out["tools"] or None,
         )
         _threshold = int(
             getattr(agent.context_compressor, "threshold_tokens", 0) or 0
@@ -3872,7 +3927,9 @@ def compress_context(
         _minimum_reclaim = max(4_096, int(_threshold * 0.05))
         _reclaimed = _request_in - _request_out
         _rejection = None
-        if _request_out > _request_in:
+        if _provider_request_out == _provider_request_in:
+            _rejection = "no_progress"
+        elif _request_out > _request_in:
             _rejection = "would_grow"
         elif _request_out == _request_in:
             _rejection = "no_progress"
@@ -3927,6 +3984,19 @@ def compress_context(
         # fence over callbacks or bookkeeping.
         if commit_fence is not None and commit_fence.is_cancelled:
             return _cancelled_commit_fence_result()
+
+        # With no durable transaction, atomically linearize cancellation
+        # against the first shared-agent publication. This comes only after
+        # canonical material admission; all preceding speculative state is
+        # restored when cancellation wins.
+        if (
+            not agent._session_db
+            and commit_fence is not None
+            and not commit_fence.claim_caller_publication(_hard_cancel_event)
+        ):
+            return _cancelled_commit_fence_result()
+        if not agent._session_db:
+            _caller_publication_authoritative = True
 
         _session_commit_succeeded = False
         split_status = "not_applicable"
@@ -4216,7 +4286,7 @@ def compress_context(
 
         if not agent._session_db:
             _session_commit_succeeded = True
-            agent._compression_durable_commit_occurred = True
+            agent._compression_durable_commit_occurred = False
             _set_compression_outcome("committed_in_memory")
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
@@ -4229,6 +4299,7 @@ def compress_context(
             bool(_old_sid) or compacted_in_place
         )
         _boundary_parent = _old_sid or agent.session_id or ""
+        _committed_new_session_id = agent.session_id or ""
 
         if not _session_commit_succeeded:
             _restore_uncommitted_input()
@@ -4246,11 +4317,29 @@ def compress_context(
         # post-lease. Schedule their semantically ordered chain exactly once;
         # a blocking provider may continue on the daemon after the bounded wait
         # without retaining commit authority or preventing another compaction.
+        # Freeze every observer input and callable before scheduling.  The
+        # agent may rotate again while this chain waits behind its predecessor.
+        _observer_parent_snapshot = copy.deepcopy(
+            _authoritative_pre_compression_snapshot
+        )
+        _observer_old_session_id = str(_boundary_parent)
+        _observer_new_session_id = str(_committed_new_session_id)
+        _observer_memory_manager = agent._memory_manager
+        _observer_commit_memory = agent.commit_memory_session
+        _observer_event_callback = getattr(agent, "event_callback", None)
+        _observer_event_payload = {
+            "platform": agent.platform or "",
+            "session_id": _observer_new_session_id,
+            "old_session_id": _old_sid or "",
+            "in_place": in_place,
+            "compression_count": agent.context_compressor.compression_count,
+        }
+
         def _postcommit_observer_chain() -> None:
-            if agent._memory_manager:
+            if _observer_memory_manager:
                 try:
-                    _maybe_ctx = agent._memory_manager.on_pre_compress(
-                        copy.deepcopy(_authoritative_pre_compression_snapshot)
+                    _maybe_ctx = _observer_memory_manager.on_pre_compress(
+                        copy.deepcopy(_observer_parent_snapshot)
                     )
                     if isinstance(_maybe_ctx, str):
                         sanitize_memory_context(_maybe_ctx)
@@ -4259,9 +4348,23 @@ def compress_context(
                         "memory on_pre_compress callback failed", exc_info=True
                     )
             try:
-                agent.commit_memory_session(
-                    copy.deepcopy(_authoritative_pre_compression_snapshot)
-                )
+                _commit_memory = _observer_commit_memory
+                _commit_signature = inspect.signature(_commit_memory)
+                if (
+                    "old_session_id" in _commit_signature.parameters
+                    or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in _commit_signature.parameters.values()
+                    )
+                ):
+                    _commit_memory(
+                        copy.deepcopy(_observer_parent_snapshot),
+                        old_session_id=_observer_old_session_id,
+                    )
+                else:
+                    # Compatibility for legacy embedders/test doubles. The
+                    # production API above always receives the explicit ID.
+                    _commit_memory(copy.deepcopy(_observer_parent_snapshot))
             except Exception:
                 logger.debug("memory boundary extraction failed", exc_info=True)
 
@@ -4269,21 +4372,21 @@ def compress_context(
                 if defer_context_engine_notification:
                     _queue_context_engine_compression_notification(
                         agent,
-                        new_session_id=agent.session_id or "",
-                        old_session_id=_boundary_parent,
+                        new_session_id=_observer_new_session_id,
+                        old_session_id=_observer_old_session_id,
                     )
                 else:
                     _notify_context_engine_compression_complete(
                         agent,
-                        new_session_id=agent.session_id or "",
-                        old_session_id=_boundary_parent,
+                        new_session_id=_observer_new_session_id,
+                        old_session_id=_observer_old_session_id,
                     )
 
             try:
-                if _is_boundary and agent._memory_manager:
-                    agent._memory_manager.on_session_switch(
-                        agent.session_id or "",
-                        parent_session_id=_boundary_parent,
+                if _is_boundary and _observer_memory_manager:
+                    _observer_memory_manager.on_session_switch(
+                        _observer_new_session_id,
+                        parent_session_id=_observer_old_session_id,
                         reset=False,
                         reason="compression",
                     )
@@ -4292,8 +4395,20 @@ def compress_context(
                     "memory manager on_session_switch (compression): %s", _me_err
                 )
 
+            if _observer_event_callback:
+                try:
+                    _observer_event_callback(
+                        "session:compress", copy.deepcopy(_observer_event_payload)
+                    )
+                except Exception:
+                    logger.debug(
+                        "event_callback error on session:compress", exc_info=True
+                    )
+
         _run_postcommit_callbacks_bounded(
-            _postcommit_observer_chain, session_id=agent.session_id or ""
+            agent,
+            _postcommit_observer_chain,
+            session_id=_observer_new_session_id,
         )
 
         # Clear stale activity labels separately from arbitrary providers. This
@@ -4330,22 +4445,6 @@ def compress_context(
             )
             agent._compression_warning = _cc_msg
             agent._emit_status(_cc_msg)
-
-        # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
-        # the completed old session before its details are lost. In in-place mode
-        # there is no old id (same session); ``in_place=True`` tells hooks the
-        # transcript was compacted on the same id rather than rotated.
-        if getattr(agent, "event_callback", None):
-            try:
-                agent.event_callback("session:compress", {
-                    "platform": agent.platform or "",
-                    "session_id": agent.session_id,
-                    "old_session_id": _old_sid or "",
-                    "in_place": in_place,
-                    "compression_count": agent.context_compressor.compression_count,
-                })
-            except Exception as e:
-                logger.debug("event_callback error on session:compress: %s", e)
 
         # Surface the compaction mode to the caller (run_conversation / gateway)
         # via a rotation-independent flag. The gateway uses this — NOT an
@@ -4419,7 +4518,10 @@ def compress_context(
         # caller's perspective. Restore every speculative mutation unless the
         # durable boundary is already authoritative; post-commit callbacks are
         # best-effort and must never masquerade as a database rollback.
-        if not getattr(agent, "_compression_durable_commit_occurred", False):
+        if not (
+            getattr(agent, "_compression_durable_commit_occurred", False)
+            or _caller_publication_authoritative
+        ):
             _restore_uncommitted_input()
             _restore_compressor_attempt_state(
                 agent.context_compressor,

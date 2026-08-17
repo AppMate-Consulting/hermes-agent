@@ -46,6 +46,58 @@ def _configure_engine_state(engine):
     engine._last_aux_model_failure_error = None
 
 
+@pytest.mark.parametrize("provider", ["openrouter", "anthropic"])
+def test_non_wire_only_reclaim_is_rejected_by_provider_projection(
+    monkeypatch, provider
+):
+    """Arbitrarily large private/display fields cannot earn admission."""
+    compressor = MagicMock()
+    original = _messages()
+    for index, message in enumerate(original):
+        message.update({
+            "display_kind": "hidden",
+            "display_metadata": {"padding": "x" * 100_000},
+            "_row_id": index,
+            "_private_provenance": "y" * 100_000,
+        })
+    compressor.compress.return_value = [
+        {"role": row["role"], "content": row["content"]} for row in original
+    ]
+    _configure_engine_state(compressor)
+    agent = _make_agent(None, compressor)
+    agent.provider = provider
+    agent._use_prompt_caching = False
+
+    returned, _ = agent._compress_context(
+        original, "sys", approx_tokens=100_000, force=True
+    )
+
+    assert returned is original
+    assert agent._last_compression_outcome == "rejected_no_progress"
+    assert original[0]["display_metadata"]["padding"] == "x" * 100_000
+
+
+def test_provider_visible_reclaim_control_is_admitted(monkeypatch):
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "genuinely smaller provider input"}
+    ]
+    _configure_engine_state(compressor)
+    agent = _make_agent(None, compressor)
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+
+    returned, _ = agent._compress_context(
+        _messages(), "sys", approx_tokens=100_000, force=True
+    )
+
+    assert returned != _messages()
+    assert agent._last_compression_outcome == "committed_in_memory"
+
+
 def test_on_pre_compress_runs_after_engine_and_does_not_influence_summary(monkeypatch):
     manager = MagicMock()
     manager.on_pre_compress.return_value = "Checkpoint id: ctx-orchestrator"

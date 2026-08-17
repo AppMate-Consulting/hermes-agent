@@ -173,7 +173,7 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
     monkeypatch, mode
 ):
     """run_conversation consumes the canonical complete request verbatim."""
-    from agent.conversation_loop import _project_provider_request
+    from agent.conversation_loop import finalize_provider_request
 
     compressor = MagicMock()
     _configure_engine_state(compressor)
@@ -227,28 +227,29 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
             usage=None,
         )
 
+    live_rows = history + [{"role": "user", "content": " current "}]
+    expected = finalize_provider_request(
+        agent,
+        live_rows,
+        system_message="stable system",
+        tools=agent.tools,
+        current_turn_user_idx=len(history),
+        incoming_message=live_rows[-1],
+    )
+    expected_payload = copy.deepcopy(expected["payload"])
+    compressor.select_context.reset_mock()
+
     agent.client = MagicMock()
     agent.client.chat.completions.create.side_effect = create
     agent.run_conversation(" current ", conversation_history=history)
-    live_rows = history + [{"role": "user", "content": " current "}]
-    expected = _project_provider_request(
-        agent,
-        live_rows,
-        system_prompt="stable system",
-        tools=agent.tools,
-        current_turn_user_idx=len(history),
-        apply_context_selection=True,
-        incoming_message=live_rows[-1],
-    )
 
-    assert sent["messages"] == expected["messages"]
-    assert sent["tools"] == expected["tools"]
+    assert sent == expected_payload
     assert (
         history, agent.prefill_messages, agent.tools,
         agent._cached_system_prompt,
         getattr(agent, "_cached_system_prompt_static", None),
     ) == before
-    assert compressor.select_context.call_count >= 2
+    assert compressor.select_context.call_count == 1
 
 
 def test_in_memory_publication_cancel_and_claim_are_linearized(monkeypatch):

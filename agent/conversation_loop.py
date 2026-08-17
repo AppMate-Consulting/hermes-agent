@@ -1453,31 +1453,61 @@ def finalize_provider_request(
         headers["x-initiator"] = "user"
         payload["extra_headers"] = headers
         agent._is_user_initiated_turn = False
-    middleware_trace = []
-    middleware_error = None
-    original_payload = copy.deepcopy(payload)
-    if middleware_context is not None:
-        try:
-            from hermes_cli.middleware import apply_llm_request_middleware
-
-            mw = apply_llm_request_middleware(payload, **middleware_context)
-            payload = mw.payload
-            original_payload = mw.original_payload
-            middleware_trace = list(mw.trace)
-        except Exception as exc:
-            # Live behavior remains best-effort. Admission inspects this field
-            # and fails closed because it cannot compare a body whose normal
-            # middleware shaping was unavailable.
-            middleware_error = f"{type(exc).__name__}: {exc}"
-    return {
+    # This snapshot is the completed provider projection: selection, provider
+    # shaping and transport preflight have all happened exactly once.  Keep it
+    # private from middleware so determinism checks can replay *only* the
+    # middleware stage without re-running stateful selectors or preflight.
+    pre_middleware_payload = copy.deepcopy(payload)
+    result = {
         "payload": payload,
         "messages": api_messages,
         "tools": tools_for_api,
         "moa_prepared_request": moa_prepared_request,
-        "original_payload": original_payload,
-        "middleware_trace": middleware_trace,
-        "middleware_error": middleware_error,
+        "_pre_middleware_payload": pre_middleware_payload,
+        "original_payload": copy.deepcopy(payload),
+        "middleware_trace": [],
+        "middleware_error": None,
     }
+    return _apply_finalized_request_middleware(
+        result, middleware_context=middleware_context
+    )
+
+
+def _apply_finalized_request_middleware(
+    finalized_request: Dict[str, Any],
+    *,
+    middleware_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply middleware to a private clone of one completed projection.
+
+    This is intentionally not a stage-skipping builder API.  Its sole caller
+    outside ``finalize_provider_request`` is compression admission's
+    determinism replay, which must use the exact same immutable pre-middleware
+    body without repeating context selection, provider shaping, or preflight.
+    """
+    result = dict(finalized_request)
+    frozen = copy.deepcopy(finalized_request["_pre_middleware_payload"])
+    payload = copy.deepcopy(frozen)
+    result.update(
+        payload=payload,
+        original_payload=copy.deepcopy(frozen),
+        middleware_trace=[],
+        middleware_error=None,
+    )
+    if middleware_context is None:
+        return result
+    try:
+        from hermes_cli.middleware import apply_llm_request_middleware
+
+        mw = apply_llm_request_middleware(payload, **middleware_context)
+        result["payload"] = mw.payload
+        result["original_payload"] = mw.original_payload
+        result["middleware_trace"] = list(mw.trace)
+    except Exception as exc:
+        # Live behavior remains best-effort. Admission inspects this field and
+        # fails closed when normal middleware shaping was unavailable.
+        result["middleware_error"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:

@@ -211,7 +211,10 @@ def test_deferred_notification_claims_then_waits_fifo_with_frozen_identity(monke
         cc,
         "_notify_context_engine_compression_complete",
         lambda _agent, **kwargs: (
-            order.append("b"), calls.append(kwargs), delivered.set(), True
+            order.append("b"),
+            calls.append((kwargs, threading.current_thread().name)),
+            delivered.set(),
+            True,
         )[-1],
     )
 
@@ -223,7 +226,8 @@ def test_deferred_notification_claims_then_waits_fifo_with_frozen_identity(monke
 
     cc._run_postcommit_callbacks_bounded(agent, first, session_id="child-a")
     assert first_entered.is_set()
-    agent.context_compressor.on_session_start = object()
+    frozen_callback = object()
+    agent.context_compressor.on_session_start = frozen_callback
     cc._queue_context_engine_compression_notification(
         agent, new_session_id="child-b", old_session_id="parent-b"
     )
@@ -239,10 +243,13 @@ def test_deferred_notification_claims_then_waits_fifo_with_frozen_identity(monke
     assert delivered.wait(timeout=2)
     assert order == ["a-enter", "a-exit", "b"]
     assert len(calls) == 1
-    assert calls[0]["new_session_id"] == "child-b"
-    assert calls[0]["old_session_id"] == "parent-b"
-    assert calls[0]["platform"] == "old-platform"
-    assert calls[0]["conversation_id"] == ("old", "conversation")
+    delivered_kwargs, delivery_thread = calls[0]
+    assert delivered_kwargs["new_session_id"] == "child-b"
+    assert delivered_kwargs["old_session_id"] == "parent-b"
+    assert delivered_kwargs["platform"] == "old-platform"
+    assert delivered_kwargs["conversation_id"] == ("old", "conversation")
+    assert delivered_kwargs["callback"] is frozen_callback
+    assert delivery_thread == "compression-postcommit-child-b"
 
     # No detached work can reinstall stale state; a subsequent record is
     # independently claimable and discarded exactly once.
@@ -261,6 +268,47 @@ def test_finalized_payload_estimator_charges_late_fields_and_binary_safely(monke
     grown = {**base, "instructions": "x" * 4000, "binary": b"z" * 4000}
     assert cc.estimate_finalized_payload_tokens_rough(base) == 10
     assert cc.estimate_finalized_payload_tokens_rough(grown) > 1900
+
+
+def test_middleware_replay_uses_frozen_final_body_without_repeating_shaping(
+    monkeypatch,
+):
+    """Replay is middleware-only and cannot mutate its frozen input."""
+    from types import SimpleNamespace
+
+    from agent.conversation_loop import _apply_finalized_request_middleware
+
+    frozen = {
+        "messages": [{"role": "user", "content": "selected once"}],
+        "tools": [{"type": "function", "function": {"name": "immutable"}}],
+        "late": {"value": 1},
+    }
+    calls = []
+
+    def apply(payload, **context):
+        calls.append((payload, context))
+        payload["late"]["value"] = 2
+        return SimpleNamespace(
+            payload=payload,
+            original_payload=copy.deepcopy(frozen),
+            trace=["late"],
+        )
+
+    import copy
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware", apply)
+    finalized = {
+        "payload": {"irrelevant": True},
+        "_pre_middleware_payload": copy.deepcopy(frozen),
+        "messages": frozen["messages"],
+        "tools": frozen["tools"],
+    }
+    first = _apply_finalized_request_middleware(finalized, middleware_context={})
+    replay = _apply_finalized_request_middleware(finalized, middleware_context={})
+
+    assert first["payload"] == replay["payload"]
+    assert finalized["_pre_middleware_payload"] == frozen
+    assert calls[0][0] is not calls[1][0]
 
 
 class _KIOnFirstResultFuture:

@@ -63,6 +63,7 @@ import tempfile
 import time
 import uuid
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -2588,6 +2589,18 @@ _PENDING_CONTEXT_ENGINE_NOTIFICATION_LOCK = (
 )
 
 
+@dataclass(frozen=True)
+class _DeferredContextEngineNotification:
+    """Immutable publication-time identity for one deferred observer call."""
+
+    callback: Any
+    platform: str
+    conversation_id: Any
+    old_session_id: str
+    new_session_id: str
+    lane_session_id: str
+
+
 def _notify_context_engine_compression_complete(
     agent: Any,
     *,
@@ -2648,19 +2661,16 @@ def _queue_context_engine_compression_notification(
     it finalizes the first; each finalization atomically claims the oldest
     record and detached work can neither overwrite nor reinstall it.
     """
-    callback = getattr(agent.context_compressor, "on_session_start", None)
-    platform = str(getattr(agent, "platform", None) or "cli")
-    conversation_id = copy.deepcopy(getattr(agent, "_gateway_session_key", None))
-
-    def _notify() -> bool:
-        return _notify_context_engine_compression_complete(
-            agent,
-            new_session_id=new_session_id,
-            old_session_id=old_session_id,
-            callback=callback,
-            platform=platform,
-            conversation_id=conversation_id,
-        )
+    pending_record = _DeferredContextEngineNotification(
+        callback=getattr(agent.context_compressor, "on_session_start", None),
+        platform=str(getattr(agent, "platform", None) or "cli"),
+        conversation_id=copy.deepcopy(
+            getattr(agent, "_gateway_session_key", None)
+        ),
+        old_session_id=str(old_session_id),
+        new_session_id=str(new_session_id),
+        lane_session_id=str(new_session_id),
+    )
     lock = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION_LOCK, None)
     if lock is None:
         with _POSTCOMMIT_LANE_INIT_LOCK:
@@ -2673,7 +2683,7 @@ def _queue_context_engine_compression_notification(
         if not isinstance(pending, collections.deque):
             pending = collections.deque()
             setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, pending)
-        pending.append(_notify)
+        pending.append(pending_record)
 
 
 def finalize_context_engine_compression_notification(
@@ -2694,13 +2704,23 @@ def finalize_context_engine_compression_notification(
         pending = queue.popleft() if isinstance(queue, collections.deque) and queue else None
         if isinstance(queue, collections.deque) and not queue:
             setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
-    if not callable(pending):
+    if not isinstance(pending, _DeferredContextEngineNotification):
         return False
     if not committed:
         return False
-    frozen_session_id = str(getattr(agent, "session_id", None) or "")
+
+    def _notify() -> bool:
+        return _notify_context_engine_compression_complete(
+            agent,
+            new_session_id=pending.new_session_id,
+            old_session_id=pending.old_session_id,
+            callback=pending.callback,
+            platform=pending.platform,
+            conversation_id=copy.deepcopy(pending.conversation_id),
+        )
+
     _run_postcommit_callbacks_bounded(
-        agent, pending, session_id=frozen_session_id
+        agent, _notify, session_id=pending.lane_session_id
     )
     return True
 
@@ -4035,7 +4055,10 @@ def compress_context(
         # conversation-loop dependency.  The old and rebuilt prompts are part
         # of their respective complete requests: prompt growth is real request
         # growth and must not be hidden merely to isolate transcript reclaim.
-        from agent.conversation_loop import finalize_provider_request
+        from agent.conversation_loop import (
+            _apply_finalized_request_middleware,
+            finalize_provider_request,
+        )
 
         # Middleware comparison uses one documented frozen synthetic context
         # for both bodies.  IDs are deliberately equal: they are request
@@ -4074,11 +4097,8 @@ def compress_context(
             middleware_context=dict(_admission_middleware_context),
         )
         _provider_request_out = _finalized_out["payload"]
-        _finalized_replay = finalize_provider_request(
-            agent,
-            compressed,
-            system_message=new_system_prompt or "",
-            tools=agent.tools or [],
+        _finalized_replay = _apply_finalized_request_middleware(
+            _finalized_out,
             middleware_context=dict(_admission_middleware_context),
         )
         _middleware_replay = _finalized_replay["payload"]

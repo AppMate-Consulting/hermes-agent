@@ -21,6 +21,7 @@ fi
   tests/gateway/test_session_hygiene.py \
   tests/gateway/test_hygiene_failure_cooldown_ladder.py \
   tests/gateway/test_compress_command.py \
+  tests/cli/test_manual_compress.py \
   tests/cli/test_compress_here.py \
   tests/cli/test_compress_type_ahead.py \
   tests/tui_gateway/test_completion_provenance.py \

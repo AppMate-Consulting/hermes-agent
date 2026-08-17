@@ -1464,3 +1464,131 @@ async def test_hygiene_host_cancellation_wins_over_late_worker_outcome(
     finally:
         release.set()
         db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_place", [False, True], ids=["rotation", "in-place"])
+@pytest.mark.parametrize("reconciliation", ["embedded", "retry", "repeated-failure"])
+async def test_gateway_hygiene_reconciles_committed_postpublication_failure(
+    monkeypatch, tmp_path, in_place, reconciliation
+):
+    """Bind committed-postpublication recovery through a normal gateway turn."""
+    from agent.conversation_compression import (
+        CompressionCommittedPostpublicationError,
+    )
+    from hermes_state import SessionDB
+
+    parent = f"hygiene-parent-{in_place}-{reconciliation}"
+    child = parent if in_place else f"{parent}-child"
+    durable = _make_history(2, content_size=20)
+    db = SessionDB(db_path=tmp_path / f"{parent}.db")
+    db.create_session(parent, "telegram")
+    publications = 0
+    if in_place:
+        db.replace_messages(parent, durable)
+    else:
+        real_publish = db.publish_compression_child
+        assert db.try_acquire_compression_lock(parent, "proof-holder")
+
+        def publish_once(**kwargs):
+            nonlocal publications
+            publications += 1
+            return real_publish(**kwargs)
+
+        db.publish_compression_child = publish_once
+        db.publish_compression_child(
+            parent_session_id=parent,
+            child_session_id=child,
+            source="telegram",
+            messages=durable,
+            compression_lock_holder="proof-holder",
+        )
+
+    class CommittedAgent:
+        instance = None
+
+        def __init__(self, **kwargs):
+            type(self).instance = self
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = in_place
+            self._last_compression_outcome = "committed_materially_shrunk"
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_summary_error=None,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, *_args, **_kwargs):
+            self.session_id = child
+            raise CompressionCommittedPostpublicationError(
+                session_id=child,
+                transcript=durable if reconciliation == "embedded" else None,
+                candidate_transcript=[{"role": "user", "content": "speculative"}],
+                in_place=in_place,
+                cause=RuntimeError("host adoption failed"),
+            )
+
+    runner, adapter, event = _make_cooldown_runner(
+        monkeypatch, tmp_path, CommittedAgent, db, parent
+    )
+    entry = runner.session_store.get_or_create_session.return_value
+    runner._rebind_turn_lease = MagicMock()
+    runner._sync_telegram_topic_binding = MagicMock()
+    reads = 0
+    original_read = db.get_messages_as_conversation
+
+    def readback(session_id):
+        nonlocal reads
+        reads += 1
+        if reconciliation == "repeated-failure":
+            raise RuntimeError("durable reload still unavailable")
+        return original_read(session_id)
+
+    db.get_messages_as_conversation = readback
+    record_failure = MagicMock()
+    monkeypatch.setattr("gateway.run._record_hygiene_failure", record_failure)
+    try:
+        result = await runner._handle_message(event)
+        assert entry.session_id == child
+        runner.session_store.rewrite_transcript.assert_not_called()
+        record_failure.assert_not_called()
+        assert publications == (0 if in_place else 1)
+        assert original_read(child) == durable
+        assert all(row.get("content") != "speculative" for row in original_read(child))
+        if not in_place:
+            assert db._conn.execute(
+                "SELECT 1 FROM compression_locks WHERE session_id = ?", (parent,)
+            ).fetchone() is None
+        assert reads == (0 if reconciliation == "embedded" else 1)
+        assert db.get_hygiene_failure_streak(child) == 0
+        assert (
+            CommittedAgent.instance._last_compression_outcome
+            == "committed_postpublication_sync_error"
+        )
+        if in_place:
+            runner._rebind_turn_lease.assert_not_called()
+            runner.session_store._save.assert_not_called()
+            runner._sync_telegram_topic_binding.assert_not_called()
+        else:
+            runner._rebind_turn_lease.assert_called_once()
+            assert runner._rebind_turn_lease.call_args.args[2] == child
+            runner.session_store._save.assert_called_once()
+            runner._sync_telegram_topic_binding.assert_called_once()
+            assert runner._sync_telegram_topic_binding.call_args.args[1].session_id == child
+        if reconciliation == "repeated-failure":
+            assert result is None
+            runner._run_agent.assert_not_awaited()
+            assert any("reconciliation is required" in item["content"] for item in adapter.sent)
+        else:
+            assert result == "ok"
+            runner._run_agent.assert_awaited_once()
+            assert runner._run_agent.call_args.kwargs["history"] == durable
+            assert runner._run_agent.call_args.kwargs["session_id"] == child
+        parent_ended = db.get_session(parent)["ended_at"]
+        assert (parent_ended is None) if in_place else (parent_ended is not None)
+    finally:
+        db.close()

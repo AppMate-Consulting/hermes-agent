@@ -104,6 +104,7 @@ logger = logging.getLogger(__name__)
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+_PROVIDER_REQUEST_UNSET = object()
 
 
 def _restore_user_after_reference_handoff(
@@ -1229,24 +1230,96 @@ def project_provider_request(
     *,
     system_prompt: str = "",
     tools=None,
+    current_turn_user_idx: Optional[int] = None,
+    external_prefetch: Any = None,
+    plugin_user_context: Any = None,
+    prefill_messages: Optional[List[Dict[str, Any]]] = None,
+    apply_context_selection: bool = True,
+    incoming_message: Optional[Dict[str, Any]] = None,
+    sanitize_model: Optional[str] = None,
+    current_turn_suffix: Optional[str] = None,
+    static_system_prefix: Any = _PROVIDER_REQUEST_UNSET,
 ):
     """Return the canonical, non-mutating provider-visible request projection.
 
-    This is the common projection owner for both compression admission and the
-    live send path.  It intentionally excludes turn-local injections (which
-    are already persisted in ``api_content`` when they must remain stable),
-    while applying every history transform that changes provider-visible
-    bytes: private/display field removal, reasoning echo, strict-tool shaping,
-    sequence repair, whitespace/tool-call normalization, and prompt-cache
-    decoration.  The returned messages and tools are private structural
-    copies; neither durable history nor the registry schemas are mutated.
+    This is the common projection owner for compression admission and live
+    dispatch.  All deterministic request shaping belongs here; callers must
+    consume the returned objects rather than repeating transforms afterward.
+    The returned messages and tools are private structural copies, so neither
+    the transcript, prefill rows, nor registry schemas can be mutated.
     """
     api_messages = []
-    for msg in messages or []:
-        api_messages.append(_project_provider_history_message(agent, msg))
+    source_messages = [
+        msg
+        for msg in (messages or [])
+        if not (
+            msg.get("display_kind") == "hidden"
+            and msg.get("role") == "assistant"
+            and any(
+                isinstance(msg.get(field), str)
+                and msg[field].strip() == _INTERRUPT_SCAFFOLD_MARKER
+                for field in ("content", "api_content")
+            )
+        )
+    ]
+    for idx, msg in enumerate(source_messages):
+        api_msg = _project_provider_history_message(
+            agent, msg, model=sanitize_model
+        )
+        if idx == current_turn_user_idx and msg.get("role") == "user":
+            api_content = msg.get("api_content")
+            if isinstance(api_content, str) and api_content:
+                api_msg["content"] = api_content
+            else:
+                composed = compose_user_api_content(
+                    api_msg.get("content", ""),
+                    external_prefetch,
+                    plugin_user_context,
+                )
+                if composed is not None:
+                    api_msg["content"] = composed
+            if current_turn_suffix:
+                content = api_msg.get("content", "")
+                if isinstance(content, str):
+                    api_msg["content"] = content + "\n\n" + current_turn_suffix
+                elif isinstance(content, list):
+                    api_msg["content"] = [
+                        *content,
+                        {"type": "text", "text": "\n\n" + current_turn_suffix},
+                    ]
+        api_messages.append(api_msg)
 
-    if system_prompt:
-        api_messages.insert(0, {"role": "system", "content": system_prompt})
+    effective_system = system_prompt or ""
+    ephemeral_system = getattr(agent, "ephemeral_system_prompt", None)
+    if ephemeral_system:
+        effective_system = (effective_system + "\n\n" + ephemeral_system).strip()
+    if effective_system:
+        api_messages.insert(0, {"role": "system", "content": effective_system})
+    prefills = prefill_messages if prefill_messages is not None else getattr(
+        agent, "prefill_messages", None
+    )
+    if prefills:
+        system_offset = int(
+            bool(api_messages and api_messages[0].get("role") == "system")
+        )
+        for idx, prefill in enumerate(prefills):
+            api_messages.insert(
+                system_offset + idx, _clone_message_for_send(prefill)
+            )
+    # Sequence repair operates only on the private projection. The live
+    # transcript may also be repaired for durable hygiene, but request
+    # correctness and compression admission never depend on that mutation.
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    repair_message_sequence(agent, api_messages)
+    if apply_context_selection:
+        api_messages = _apply_context_engine_selection(
+            agent,
+            api_messages,
+            source_messages,
+            incoming_message,
+            logger=getattr(agent, "logger", None) or logger,
+        )
     api_messages = agent._sanitize_api_messages(api_messages)
     api_messages = agent._drop_thinking_only_and_merge_users(
         api_messages,
@@ -1276,11 +1349,15 @@ def project_provider_request(
             ),
             native_anthropic=agent._use_native_cache_layout,
             static_system_prefix=(
-                agent._cached_system_prompt_static
-                if isinstance(
-                    getattr(agent, "_cached_system_prompt_static", None), str
+                static_system_prefix
+                if static_system_prefix is not _PROVIDER_REQUEST_UNSET
+                else (
+                    agent._cached_system_prompt_static
+                    if isinstance(
+                        getattr(agent, "_cached_system_prompt_static", None), str
+                    )
+                    else None
                 )
-                else None
             ),
             direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
         )
@@ -2118,81 +2195,14 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
-        api_messages = []
-        for idx, msg in enumerate(messages):
-
-            # Structural clone, NOT msg.copy(): every in-place transform
-            # below (canonicalize/repair, surrogate + non-ASCII sanitizers,
-            # cache decoration) must be unable to reach the persisted
-            # history through shared nested containers. See
-            # _clone_message_for_send.
-            # Shared with compression admission: durable-row projection has
-            # one owner, so private/display fields and provider shaping cannot
-            # drift between the request we size and the request we send.
-            _sanitize_model = agent.model
-            if agent.provider == "moa":
-                if moa_config:
-                    _agg = moa_config.get("aggregator") or {}
-                    if _agg.get("model"):
-                        _sanitize_model = _agg["model"]
-                if _sanitize_model == agent.model:
-                    _moa_client = getattr(agent, "client", None)
-                    _agg_slot = getattr(_moa_client, "last_aggregator_slot", None)
-                    if _agg_slot and _agg_slot.get("model"):
-                        _sanitize_model = _agg_slot["model"]
-            api_msg = _project_provider_history_message(
-                agent, msg, model=_sanitize_model
-            )
-
-            # api_content is the persistence sidecar carrying the exact bytes
-            # sent to the API for this message when they differ from the clean
-            # stored content (see compose_user_api_content in turn_context).
-            # It is bookkeeping, never a provider field — pop it from EVERY
-            # outgoing copy.
-            _api_content = msg.get("api_content")
-
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated beyond the api_content stamp, so nothing leaks
-            # into the clean transcript content.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
-                if isinstance(_api_content, str) and _api_content:
-                    # Stamped by the prologue from the same composition —
-                    # reuse it so the persisted sidecar and the wire cannot
-                    # drift, and so every pass this turn sends identical
-                    # bytes (composed from msg["content"], never from a
-                    # previously-injected copy).
-                    api_msg["content"] = _api_content
-                else:
-                    # Callers that bypass the prologue stamping: compose live.
-                    _composed = compose_user_api_content(
-                        api_msg.get("content", ""),
-                        _ext_prefetch_cache,
-                        _plugin_user_context,
-                    )
-                    if _composed is not None:
-                        api_msg["content"] = _composed
-            elif (
-                isinstance(_api_content, str)
-                and _api_content
-                and msg.get("role") in ("user", "assistant")
-            ):
-                # Historical message: replay the exact bytes sent when it was
-                # live, so the provider prompt-cache prefix stays byte-stable
-                # instead of diverging at the injection point and
-                # re-prefilling everything after it. User rows carry the
-                # prefetch/plugin injection sidecar; user AND assistant rows
-                # can carry a sanitize-divergence sidecar (content that
-                # ``get_messages_as_conversation``'s sanitize_context/strip
-                # would rewrite on reload — see the capture in
-                # ``_flush_messages_to_session_db``).
-                api_msg["content"] = _api_content
-
-            # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
-            # The signature field helps maintain reasoning continuity
-            api_messages.append(api_msg)
+        _sanitize_model = agent.model
+        if agent.provider == "moa":
+            if moa_config:
+                _aggregator = moa_config.get("aggregator") or {}
+                _sanitize_model = _aggregator.get("model") or _sanitize_model
+            _aggregator_slot = getattr(agent.client, "last_aggregator_slot", None)
+            if _sanitize_model == agent.model and _aggregator_slot:
+                _sanitize_model = _aggregator_slot.get("model") or _sanitize_model
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
@@ -2210,15 +2220,29 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
+        # MoA guidance is the sole live-only dynamic transform. Produce it
+        # before canonical projection, then pass the resulting text into the
+        # current-turn composition below; compression never replays advisors.
+        api_messages = []
+        _moa_context = None
 
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
+
+                api_messages = project_provider_request(
+                    agent,
+                    messages,
+                    system_prompt=effective_system,
+                    tools=[],
+                    current_turn_user_idx=current_turn_user_idx,
+                    external_prefetch=_ext_prefetch_cache,
+                    plugin_user_context=_plugin_user_context,
+                    prefill_messages=[],
+                    apply_context_selection=False,
+                    sanitize_model=_sanitize_model,
+                )["messages"]
 
                 _moa_context = aggregate_moa_context(
                     user_prompt=(
@@ -2248,139 +2272,28 @@ def run_conversation(
                     ),
                     agent=agent,
                 )
-                if _moa_context:
-                    for _msg in reversed(api_messages):
-                        if _msg.get("role") == "user":
-                            _base = _msg.get("content", "")
-                            if isinstance(_base, str):
-                                _msg["content"] = _base + "\n\n" + _moa_context
-                            elif isinstance(_base, list):
-                                # Multimodal user turn (text + image parts):
-                                # append the MoA context as a trailing text
-                                # part instead of silently dropping it.
-                                _msg["content"] = [
-                                    *_base,
-                                    {"type": "text", "text": "\n\n" + _moa_context},
-                                ]
-                            break
             except Exception as _moa_exc:
                 logger.warning("MoA context aggregation failed: %s", _moa_exc)
 
-        # Inject ephemeral prefill messages right after the system prompt
-        # but before conversation history. Same API-call-time-only pattern.
-        if agent.prefill_messages:
-            sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
-            for idx, pfm in enumerate(agent.prefill_messages):
-                # Structural clone: the sanitizers below run over
-                # api_messages in place, and a shallow copy would let them
-                # write through into agent.prefill_messages' nested
-                # containers (same aliasing class as the history build).
-                api_messages.insert(sys_offset + idx, _clone_message_for_send(pfm))
-
-        # Per-turn context selection hook (additive, no-op by default).
-        # Lets a context engine select/replace which context enters the
-        # prompt for THIS call only — retrieval, topic routing, role/branch
-        # switching — distinct from compression and independent of
-        # should_compress(). Request-only: persisted history is untouched, so
-        # caching/sanitization below operate on whatever the engine selected.
-        # Fail-open (see _apply_context_engine_selection).
-        _sel_incoming = (
+        _incoming = (
             messages[current_turn_user_idx]
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        api_messages = _apply_context_engine_selection(
+        _provider_request = project_provider_request(
             agent,
-            api_messages,
             messages,
-            _sel_incoming,
-            logger=request_logger,
+            system_prompt=effective_system,
+            tools=agent.tools or [],
+            current_turn_user_idx=current_turn_user_idx,
+            external_prefetch=_ext_prefetch_cache,
+            plugin_user_context=_plugin_user_context,
+            incoming_message=_incoming,
+            sanitize_model=_sanitize_model,
+            current_turn_suffix=_moa_context,
         )
-
-        # Safety net: strip orphaned tool results / add stubs for missing
-        # results before sending to the API.  Runs unconditionally — not
-        # gated on context_compressor — so orphans from session loading or
-        # manual message manipulation are always caught.
-        api_messages = agent._sanitize_api_messages(api_messages)
-
-        # Drop thinking-only assistant turns (reasoning but no visible
-        # output and no tool_calls) and merge any adjacent user messages
-        # left behind. Prevents Anthropic 400s ("The final block in an
-        # assistant message cannot be `thinking`.") and equivalent errors
-        # from third-party Anthropic-compatible gateways that can't replay
-        # a thinking-only turn. Runs on the per-call copy only — the
-        # stored conversation history keeps the reasoning block for the
-        # UI transcript and session persistence.
-        api_messages = agent._drop_thinking_only_and_merge_users(
-            api_messages,
-            drop_codex_reasoning_items=agent.api_mode != "codex_responses",
-        )
-
-        # Normalize message whitespace and tool-call JSON for consistent
-        # prefix matching.  Ensures bit-perfect prefixes across turns,
-        # which enables KV cache reuse on local inference servers
-        # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
-        # cloud providers.  Operates on api_messages (the API copy) so
-        # the original conversation history in `messages` is untouched.
-        for am in api_messages:
-            if isinstance(am.get("content"), str):
-                am["content"] = am["content"].strip()
-        _canonicalize_api_tool_calls(api_messages)
-
-        # Proactively strip any surrogate characters before the API call.
-        # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
-        # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
-        # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
-        _sanitize_messages_surrogates(api_messages)
-
-        # NOTE (empty-content class fix): no send-time pad loop here.  The
-        # single owner for "never send a turn strict wire validation rejects
-        # as empty" is ``repair_empty_non_final_messages``, which runs inside
-        # ``_sanitize_api_messages`` above — the unconditional pre-send
-        # chokepoint shared with the summary path.  Its placeholder is
-        # non-whitespace, so it survives the whitespace-normalization pass
-        # regardless of ordering (a single-space pad here previously had to
-        # be sequenced after normalization to survive, forking the concept).
-
-        # Build the request-local cache sections only after every transcript
-        # mutation. The canonical tool registry stays undecorated.
-        #
-        # Runs LAST, after every message mutation above. Marking earlier
-        # defeats the prefix stability the mutations exist to create:
-        # ``_apply_cache_marker`` rewrites ``content`` from a plain string
-        # into a ``[{"type": "text", ...}]`` block, so the marked messages
-        # no longer match the ``isinstance(content, str)`` test in the
-        # whitespace-normalization pass and silently keep their raw
-        # leading/trailing whitespace. A tool result ending in "\n" is
-        # therefore sent unstripped while it sits in the last-3 window and
-        # stripped once it rolls out of it — the same message, different
-        # bytes on consecutive turns, which breaks the prefix match at
-        # exactly the point the breakpoints were meant to protect. Marking
-        # last also keeps breakpoints off messages that the orphan sweep or
-        # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
-        if agent._use_prompt_caching and agent.provider != "moa":
-            _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
-            _initial_cache_plan = build_prompt_cache_plan(
-                api_messages,
-                tools_for_api,
-                # Clamp per-destination: a configured 1h regresses to 5m on
-                # Qwen/Alibaba routes, whose context cache is 5m-only (#84733).
-                cache_ttl=effective_cache_ttl(
-                    agent._cache_ttl,
-                    provider=agent.provider,
-                    model=agent.model,
-                ),
-                native_anthropic=agent._use_native_cache_layout,
-                static_system_prefix=(
-                    _static_system_prefix
-                    if isinstance(_static_system_prefix, str)
-                    else None
-                ),
-                direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
-            )
-            api_messages = _initial_cache_plan.messages
-            tools_for_api = _initial_cache_plan.tools
+        api_messages = _provider_request["messages"]
+        tools_for_api = _provider_request["tools"]
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it

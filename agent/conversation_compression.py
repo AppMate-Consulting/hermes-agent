@@ -3895,23 +3895,29 @@ def compress_context(
 
         # Admission compares canonical provider-visible request objects, not
         # durable rows.  Import lazily to avoid the module-level compression ↔
-        # conversation-loop dependency. Both candidates deliberately use the
-        # same system bytes, cache policy, and registry schemas: only provider-
-        # visible conversation reclaim is allowed to earn admission.
+        # conversation-loop dependency.  The old and rebuilt prompts are part
+        # of their respective complete requests: prompt growth is real request
+        # growth and must not be hidden merely to isolate transcript reclaim.
         from agent.conversation_loop import project_provider_request
 
-        _admission_system_prompt = _system_prompt_before_compression or ""
         _provider_request_in = project_provider_request(
             agent,
             _authoritative_pre_compression_snapshot,
-            system_prompt=_admission_system_prompt,
+            system_prompt=_system_prompt_before_compression or "",
             tools=agent.tools or [],
+            apply_context_selection=False,
+            static_system_prefix=(
+                _cached_static_before_compression
+                if isinstance(_cached_static_before_compression, str)
+                else None
+            ),
         )
         _provider_request_out = project_provider_request(
             agent,
             compressed,
-            system_prompt=_admission_system_prompt,
+            system_prompt=new_system_prompt or "",
             tools=agent.tools or [],
+            apply_context_selection=False,
         )
         _request_in = estimate_request_tokens_rough(
             _provider_request_in["messages"],
@@ -3989,6 +3995,13 @@ def compress_context(
         # against the first shared-agent publication. This comes only after
         # canonical material admission; all preceding speculative state is
         # restored when cancellation wins.
+        _before_publish = getattr(
+            agent, "_before_in_memory_compression_publication", None
+        )
+        if not agent._session_db and callable(_before_publish):
+            # Private deterministic race seam. It runs before the first
+            # authoritative shared-state write and has no production default.
+            _before_publish()
         if (
             not agent._session_db
             and commit_fence is not None
@@ -4518,10 +4531,12 @@ def compress_context(
         # caller's perspective. Restore every speculative mutation unless the
         # durable boundary is already authoritative; post-commit callbacks are
         # best-effort and must never masquerade as a database rollback.
-        if not (
-            getattr(agent, "_compression_durable_commit_occurred", False)
-            or _caller_publication_authoritative
-        ):
+        if not getattr(agent, "_compression_durable_commit_occurred", False):
+            # A no-DB publication claim linearizes cancellation, but it does
+            # not make a partially-mutated agent truthful. Any failure before
+            # the complete in-memory boundary returns restores the entire
+            # speculative state; extension callbacks are scheduled only after
+            # that boundary completes.
             _restore_uncommitted_input()
             _restore_compressor_attempt_state(
                 agent.context_compressor,

@@ -2058,6 +2058,13 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        # Normal provider turns must publish automatic compression only after
+        # the complete live request has been assembled.  Codex app-server
+        # modes retain their existing native/Hermes ownership decision in the
+        # turn prologue.
+        defer_automatic_preflight=(
+            getattr(agent, "api_mode", None) != "codex_app_server"
+        ),
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message

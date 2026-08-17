@@ -450,12 +450,16 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    defer_automatic_preflight: bool = False,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
     The callables/helpers the original prologue referenced from the
     ``conversation_loop`` module are passed in explicitly to keep this module
-    free of an import cycle with ``agent.conversation_loop``.
+    free of an import cycle with ``agent.conversation_loop``.  Standalone
+    callers retain turn-start automatic preflight by default.  Provider-loop
+    owners pass ``defer_automatic_preflight=True`` so publication occurs at
+    exact live-request admission instead.
     """
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
@@ -868,11 +872,15 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+    if (
+        not defer_automatic_preflight
+        and agent.compression_enabled
+        and _should_run_preflight_estimate(
+            messages,
+            agent.context_compressor.protect_first_n,
+            agent.context_compressor.protect_last_n,
+            agent.context_compressor.threshold_tokens,
+        )
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,

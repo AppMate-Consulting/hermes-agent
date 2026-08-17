@@ -4590,8 +4590,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         strict provider transcripts valid. The metadata/content checks prevent
         those synthetic transport rows from becoming evidence of a real user.
         """
-        for message in messages:
+        for index, message in enumerate(messages):
             if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            if cls._bridge_user_has_durable_provenance(messages, index):
+                continue
+            if cls._completion_has_durable_provenance(messages, index):
                 continue
             if cls._is_synthetic_compression_user_turn(message):
                 continue

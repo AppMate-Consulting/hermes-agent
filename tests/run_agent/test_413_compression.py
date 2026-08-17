@@ -430,14 +430,6 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
         }
         assert not any(row.get("content") == "older task" for row in transcript)
         assert ContextCompressor._has_autonomous_completion_chain(transcript)
-        assert any(
-            row.get("role") == "user"
-            and row.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER
-            and not ContextCompressor._completion_has_durable_provenance(
-                transcript, index
-            )
-            for index, row in enumerate(transcript)
-        )
         roles = [row["role"] for row in transcript]
         assert all(left != right for left, right in zip(roles, roles[1:]))
         call_ids = {

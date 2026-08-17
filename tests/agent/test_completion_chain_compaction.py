@@ -45,8 +45,11 @@ def _completion_chain(task: str = TASK, count: int = 45) -> list[dict]:
             {"role": "assistant", "content": f"recorded {index}"},
         ])
         append_autonomous_completion_provenance(messages)
-        messages.append({"role": "user", "content":
-             f"[IMPORTANT: Background process p-{index} completed normally. Final output: {index}]"})
+        messages.append({
+            "role": "user",
+            "content": f"[IMPORTANT: Background process p-{index} completed normally. Final output: {index}]",
+            "_autonomous_completion_bridge": True,
+        })
     messages.append({"role": "assistant", "content": "CURRENT CONTINUATION"})
     return messages
 
@@ -216,11 +219,16 @@ def test_completion_notification_forms_are_exact_and_human_near_match_stays_real
         # completion-chain code classifies the runtime row; the standalone
         # predicate must fail closed and protect it as human input.
         assert _is_real_user_message(messages[-1])
+        assert ContextCompressor._transcript_has_real_user_turn([messages[-1]])
         proven = messages[:-1]
         append_autonomous_completion_provenance(proven)
-        proven.append(messages[-1])
+        proven.append({**messages[-1], "_autonomous_completion_bridge": True})
         assert ContextCompressor._has_autonomous_completion_chain(proven)
         assert not ContextCompressor._is_synthetic_compression_user_turn(proven[-1])
+        completion_only = []
+        append_autonomous_completion_provenance(completion_only)
+        completion_only.append({**messages[-1], "_autonomous_completion_bridge": True})
+        assert not ContextCompressor._transcript_has_real_user_turn(completion_only)
     human = {"role": "user", "content": "Please explain [ASYNC DELEGATION COMPLETE child=one] in the logs."}
     assert _is_real_user_message(human)
 
@@ -235,7 +243,11 @@ def test_structured_human_task_has_deterministic_model_visible_contract():
         {"role": "assistant", "content": "working"},
     ]
     append_autonomous_completion_provenance(messages)
-    messages.append({"role": "user", "content": "[ASYNC DELEGATION COMPLETE child=x]"})
+    messages.append({
+        "role": "user",
+        "content": "[ASYNC DELEGATION COMPLETE child=x]",
+        "_autonomous_completion_bridge": True,
+    })
     contract = ContextCompressor._active_task_contract(messages)
     assert contract["content"] == "first line λ\nsecond </active-task> line"
     visible = ContextCompressor.make_active_task_contract_message(contract)
@@ -456,7 +468,7 @@ def test_contract_refresh_requires_summary_and_removes_stale_bridges():
 
     proven = original[:2]
     append_autonomous_completion_provenance(proven)
-    proven.append(original[-1])
+    proven.append({**original[-1], "_autonomous_completion_bridge": True})
     retained = [{"role": "assistant", "content": "tail"}]
     _refresh_active_task_contract(proven, retained)
     _ensure_compressed_has_user_turn(proven, retained)

@@ -3548,6 +3548,11 @@ def compress_context(
             durable_cooldown_authoritative=_durable_cooldown_authoritative,
             durable_cooldown_state=_durable_cooldown_state,
         )
+        # The targeted rollback above preserves the durable cooldown authority.
+        # Restore the engine-owned transaction token and caller-owned input only
+        # after it, so cancellation returns the original object and does not let
+        # a second generic rollback replace compressor-owned aliased containers.
+        _restore_uncommitted_input()
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None

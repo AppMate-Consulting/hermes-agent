@@ -272,16 +272,97 @@ def _run_execution_chain(
     payload_key = "request" if "request" in kwargs else "args"
     immutable_payload = bool(kwargs.pop("immutable_payload", False))
     admitted_payload = kwargs[payload_key]
-    admitted_snapshot = _safe_copy(admitted_payload) if immutable_payload else None
+    admitted_snapshot = deepcopy(admitted_payload) if immutable_payload else None
+    admitted_graph: List[tuple[Any, Any]] = []
+    if immutable_payload:
+        seen: set[int] = set()
+
+        def snapshot_mutable_graph(value: Any) -> None:
+            """Record mutable containers and their original graph edges."""
+            value_id = id(value)
+            if value_id in seen:
+                return
+            seen.add(value_id)
+            if isinstance(value, dict):
+                items = list(value.items())
+                admitted_graph.append((value, items))
+                for key, child in items:
+                    snapshot_mutable_graph(key)
+                    snapshot_mutable_graph(child)
+            elif isinstance(value, list):
+                items = list(value)
+                admitted_graph.append((value, items))
+                for child in items:
+                    snapshot_mutable_graph(child)
+            elif isinstance(value, set):
+                items = set(value)
+                admitted_graph.append((value, items))
+                for child in items:
+                    snapshot_mutable_graph(child)
+            elif isinstance(value, (tuple, frozenset)):
+                for child in value:
+                    snapshot_mutable_graph(child)
+
+        snapshot_mutable_graph(admitted_payload)
+
+    def restore_admitted_graph() -> None:
+        """Restore contents and aliases without replacing admitted objects."""
+        for container, contents in admitted_graph:
+            if isinstance(container, dict):
+                container.clear()
+                container.update(contents)
+            elif isinstance(container, list):
+                container[:] = contents
+            else:
+                container.clear()
+                container.update(contents)
+
+    def admitted_graph_unchanged() -> bool:
+        """Compare values and mutable-container edges to the admitted graph."""
+        mutable_types = (dict, list, set)
+
+        def same_edge(current: Any, original: Any) -> bool:
+            if isinstance(original, mutable_types):
+                return current is original
+            try:
+                return current == original
+            except Exception:
+                return False
+
+        for container, contents in admitted_graph:
+            if isinstance(container, dict):
+                current_items = list(container.items())
+                if len(current_items) != len(contents):
+                    return False
+                if any(
+                    not same_edge(current_key, original_key)
+                    or not same_edge(current_value, original_value)
+                    for (current_key, current_value), (original_key, original_value)
+                    in zip(current_items, contents)
+                ):
+                    return False
+            elif isinstance(container, list):
+                if len(container) != len(contents) or any(
+                    not same_edge(current, original)
+                    for current, original in zip(container, contents)
+                ):
+                    return False
+            elif container != contents:
+                return False
+        return True
 
     def assert_admitted_unchanged(callback: Callable) -> None:
         if not immutable_payload:
             return
         try:
-            unchanged = admitted_payload == admitted_snapshot
+            unchanged = (
+                admitted_payload == admitted_snapshot
+                and admitted_graph_unchanged()
+            )
         except Exception:
             unchanged = False
         if not unchanged:
+            restore_admitted_graph()
             raise ImmutableRequestMiddlewareError(
                 f"Middleware '{kind}' callback "
                 f"{getattr(callback, '__name__', repr(callback))} mutated the "
@@ -321,6 +402,7 @@ def _run_execution_chain(
                 except Exception:
                     replacement_changed = True
                 if replacement_changed:
+                    restore_admitted_graph()
                     raise ImmutableRequestMiddlewareError(
                         f"Middleware '{kind}' callback "
                         f"{getattr(callback, '__name__', repr(callback))} tried "
@@ -348,6 +430,7 @@ def _run_execution_chain(
             assert_admitted_unchanged(callback)
             return result
         except ImmutableRequestMiddlewareError:
+            restore_admitted_graph()
             raise
         except _DownstreamExecutionError as exc:
             raise exc.original

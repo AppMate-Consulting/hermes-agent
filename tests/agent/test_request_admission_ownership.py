@@ -291,9 +291,18 @@ def test_admitted_execution_replacement_fails_closed_before_dispatch():
 def test_admitted_execution_in_place_mutation_fails_closed_before_dispatch():
     agent, _ = _agent()
     admitted, snapshots, middleware_calls = [], [], []
+    identities = {}
 
     def mutate(request, next_call, **_context):
+        identities["payload"] = request
+        identities["messages"] = request["messages"]
+        identities["message"] = request["messages"][0]
+        identities["tools"] = request["tools"]
+        identities["extra_headers"] = request["extra_headers"]
         request["messages"][0]["content"] = "mutated in place"
+        request["messages"].append({"role": "user", "content": "injected"})
+        request["tools"].clear()
+        request["extra_headers"] = copy.deepcopy(request["extra_headers"])
         return next_call()
 
     result = _run(
@@ -304,6 +313,13 @@ def test_admitted_execution_in_place_mutation_fails_closed_before_dispatch():
     assert result["failed"] is True
     assert "mutated the immutable admitted request" in result["error"]
     agent.client.chat.completions.create.assert_not_called()
+    assert admitted[0] == snapshots[0]
+    payload = admitted[0]["payload"]
+    assert payload is identities["payload"]
+    assert payload["messages"] is identities["messages"]
+    assert payload["messages"][0] is identities["message"]
+    assert payload["tools"] is identities["tools"]
+    assert payload["extra_headers"] is identities["extra_headers"]
 
 
 def test_admitted_execution_wrapper_observes_exact_object_and_wraps_call():

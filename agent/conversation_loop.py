@@ -4329,6 +4329,30 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
+                # An admitted request is an immutable transaction result.
+                # Execution middleware violations are deterministic local
+                # contract failures: retry/fallback, credential rotation, or
+                # transport recovery cannot make the same callback valid and
+                # must never expose a mutated payload to provider dispatch.
+                from hermes_cli.middleware import ImmutableRequestMiddlewareError
+
+                if isinstance(api_error, ImmutableRequestMiddlewareError):
+                    _middleware_error = agent._summarize_api_error(api_error)
+                    logger.error(
+                        "%sImmutable admitted request middleware violation: %s",
+                        agent.log_prefix,
+                        _middleware_error,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _middleware_error,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _middleware_error,
+                    }
+
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
                 #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste

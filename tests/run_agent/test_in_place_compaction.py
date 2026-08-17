@@ -790,10 +790,12 @@ class TestInPlaceAntiGrowthGuard:
             agent._cached_system_prompt_static = None
             agent._build_system_prompt = MagicMock(return_value="EXACT BUILT PROMPT")
             seen = []
+            messages_before = copy.deepcopy(messages)
+            tools_before = copy.deepcopy(agent.tools)
             estimates = iter((100_000, 80_000))
 
-            def estimate(candidate, *, system_prompt, tools=None):
-                seen.append((candidate, system_prompt, tools))
+            def estimate(candidate, *, tools=None):
+                seen.append((copy.deepcopy(candidate), copy.deepcopy(tools)))
                 return next(estimates)
 
             with patch(
@@ -802,12 +804,23 @@ class TestInPlaceAntiGrowthGuard:
             ):
                 compress_context(agent, messages, "sys", approx_tokens=100_000)
             assert len(seen) == 2
-            assert seen[0][0] is not messages
-            assert seen[0][0] == messages
-            assert seen[0][1] == "EXACT BUILT PROMPT"
-            assert seen[0][1] != ""
-            assert seen[1][1] == "EXACT BUILT PROMPT"
-            assert seen[0][2] is seen[1][2]
+            request_in, tools_in = seen[0]
+            request_out, tools_out = seen[1]
+            assert request_in[0] == {
+                "role": "system", "content": "EXACT BUILT PROMPT"
+            }
+            assert request_in[1:] == messages_before
+            assert request_out[0] == request_in[0]
+            assert request_out != request_in
+            assert sum(
+                row.get("content") == "EXACT BUILT PROMPT" for row in request_in
+            ) == 1
+            assert sum(
+                row.get("content") == "EXACT BUILT PROMPT" for row in request_out
+            ) == 1
+            assert tools_in == tools_out == tools_before
+            assert messages == messages_before
+            assert agent.tools == tools_before
 
     @pytest.mark.parametrize(
         ("request_out", "outcome"),
@@ -849,9 +862,10 @@ class TestInPlaceAntiGrowthGuard:
 
             agent.context_compressor.compress = mutate
             estimates = []
+            tools_before = copy.deepcopy(agent.tools)
 
-            def estimate(candidate, **_kwargs):
-                estimates.append(copy.deepcopy(candidate))
+            def estimate(candidate, *, tools=None):
+                estimates.append((copy.deepcopy(candidate), copy.deepcopy(tools)))
                 return 100_000 if len(estimates) == 1 else request_out
 
             with patch(
@@ -870,18 +884,32 @@ class TestInPlaceAntiGrowthGuard:
                 assert len(estimates) == 0
             else:
                 assert len(estimates) == 2
-                assert estimates[0] == original
-                assert estimates[1] != original
+                request_in, tools_in = estimates[0]
+                request_out_rows, tools_out = estimates[1]
+                assert request_in[0] == {"role": "system", "content": cached}
+                assert request_in[1:] == original
+                assert request_out_rows[0] == {
+                    "role": "system",
+                    "content": "deterministic external memory prompt",
+                }
+                assert request_out_rows != request_in
                 admitted_content = "\n".join(
-                    str(message.get("content", "")) for message in estimates[1]
+                    str(message.get("content", "")) for message in request_out_rows
                 )
                 assert "mutated candidate" in admitted_content
                 assert original[-2]["content"] in admitted_content
+                assert sum(row.get("content") == cached for row in request_in) == 1
+                assert sum(
+                    row.get("content") == "deterministic external memory prompt"
+                    for row in request_out_rows
+                ) == 1
+                assert tools_in == tools_out == tools_before
             assert returned is messages
             assert messages == original
             assert prompt == cached
             assert agent._cached_system_prompt == cached
             assert agent._cached_system_prompt_static == static
+            assert agent.tools == tools_before
             assert agent._last_compression_outcome == outcome
             agent.commit_memory_session.assert_not_called()
             agent._flush_messages_to_session_db.assert_not_called()

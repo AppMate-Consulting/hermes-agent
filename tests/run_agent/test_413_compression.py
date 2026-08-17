@@ -401,9 +401,11 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
     compacting_agent._cached_system_prompt = "stable system prompt"
 
     estimate_calls = []
+    replay_before = copy.deepcopy(replay)
+    tools_before = copy.deepcopy(compacting_agent.tools)
 
-    def _admitted_full_request_estimate(messages, *, system_prompt="", tools=None):
-        estimate_calls.append((list(messages), system_prompt, tools))
+    def _admitted_full_request_estimate(messages, *, tools=None):
+        estimate_calls.append((copy.deepcopy(messages), copy.deepcopy(tools)))
         return 20_000 if len(estimate_calls) == 1 else 1_000
 
     telemetry = []
@@ -467,9 +469,25 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
     assert bridge_counts[ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE] <= 1
     assert bridge_counts[ACTIVE_TASK_CONTRACT_BRIDGE_AFTER] <= 1
     assert len(estimate_calls) == 2
-    assert estimate_calls[0][0] == replay
-    assert all(system_prompt for _, system_prompt, _ in estimate_calls)
-    assert estimate_calls[0][2] == estimate_calls[1][2]
+    request_in, tools_in = estimate_calls[0]
+    request_out, tools_out = estimate_calls[1]
+    assert request_in[0] == {
+        "role": "system", "content": "stable system prompt"
+    }
+    assert [row.get("role") for row in request_in[1:]] == [
+        row.get("role") for row in replay
+    ]
+    assert [row.get("content") for row in request_in[1:]] == [
+        row.get("content") for row in replay
+    ]
+    projected_active = _latest_active_human_task_row(request_in[1:])
+    assert projected_active is not None
+    assert projected_active["content"] == AUTONOMOUS_COMPLETION_BRIDGE_USER
+    assert not projected_active.get("autonomous_completion_provenance", False)
+    assert request_out[0]["role"] == "system"
+    assert tools_in == tools_out == tools_before
+    assert replay == replay_before
+    assert compacting_agent.tools == tools_before
     assert commit.call_count == 1
     append.assert_not_called()
     persisted = db.get_messages(sid, include_inactive=True)

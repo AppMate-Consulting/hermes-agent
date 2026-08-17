@@ -368,9 +368,11 @@ def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
     )
     agent.commit_memory_session = lambda rows: memory_seen.append(("commit", rows))
     estimates = []
+    tools_before = copy.deepcopy(agent.tools)
+    caller_before = copy.deepcopy(caller)
 
-    def _estimate(rows, **_kw):
-        estimates.append(copy.deepcopy(rows))
+    def _estimate(rows, *, tools=None):
+        estimates.append((copy.deepcopy(rows), copy.deepcopy(tools)))
         return 20_000 if len(estimates) == 1 else 1_000
 
     with patch("agent.conversation_compression.estimate_request_tokens_rough", _estimate):
@@ -382,7 +384,18 @@ def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
         AUTONOMOUS_COMPLETION_BRIDGE_USER, AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
         "[ASYNC DELEGATION COMPLETE child=durable]", "runtime completion handled",
     ]
-    assert estimates[0] == adopted
+    assert len(estimates) == 2
+    request_in, tools_in = estimates[0]
+    request_out, tools_out = estimates[1]
+    assert request_in[0] == {"role": "system", "content": "sys"}
+    assert _contents(request_in[1:]) == _contents(adopted)
+    assert "NEWER AUTHORITATIVE TASK" in _contents(request_in[1:])
+    assert "stale caller task" in _contents(request_in[1:])
+    assert request_out[0]["role"] == "system"
+    assert request_out[0]["content"] == "deterministic memory prompt"
+    assert tools_in == tools_out == tools_before
+    assert caller == caller_before
+    assert agent.tools == tools_before
     assert all(snapshot == adopted for _, snapshot in memory_seen)
     assert all(snapshot is not adopted for _, snapshot in memory_seen)
     active = db.get_messages_as_conversation(sid)

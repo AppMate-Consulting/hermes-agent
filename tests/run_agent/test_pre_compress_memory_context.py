@@ -161,9 +161,11 @@ def test_projection_preserves_current_turn_identity_after_interrupt_ghost():
         for row in projected
     )
     users = [row["content"] for row in projected if row["role"] == "user"]
-    assert users[0] == "historical"
-    assert "fresh recall" not in users[0]
-    assert users[1].startswith("current") and "fresh recall" in users[1]
+    assert len(users) == 1
+    merged = users[0]
+    assert merged.index("historical") < merged.index("current") < merged.index(
+        "fresh recall"
+    )
 
 
 @pytest.mark.parametrize("mode", ["codex", "anthropic-native"])
@@ -315,7 +317,9 @@ def test_in_memory_publication_cancel_and_claim_are_linearized(monkeypatch):
             agent.commit_memory_session.assert_not_called()
             agent.event_callback.assert_not_called()
         else:
-            assert result[0][0][0]["content"] == "small committed candidate"
+            committed = result[0][0]
+            assert committed[0]["content"] == "message 5"
+            assert committed[-1]["content"] == "small committed candidate"
             assert agent._last_compression_outcome == "committed_in_memory"
 
 
@@ -355,7 +359,7 @@ def test_in_memory_exception_after_claim_restores_all_shared_state(monkeypatch):
 
     with pytest.raises(RuntimeError, match="injected after publication claim"):
         agent._compress_context(
-            original, "sys", 100_000, force=True, commit_fence=fence
+            original, "sys", approx_tokens=100_000, force=True, commit_fence=fence
         )
 
     assert original == original_copy
@@ -418,7 +422,8 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     )
 
     first, _ = agent._compress_context(
-        db.get_messages_as_conversation(sid), "sys", 100_000, force=True
+        db.get_messages_as_conversation(sid), "sys", approx_tokens=100_000,
+        force=True
     )
     child_b = agent.session_id
     assert child_b != sid and first_entered.is_set()
@@ -429,7 +434,7 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     second_input = copy.deepcopy(first)
     second_input[0]["content"] += " next " * 10_000
     second, _ = agent._compress_context(
-        second_input, "sys", 100_000, force=True
+        second_input, "sys", approx_tokens=100_000, force=True
     )
     child_c = agent.session_id
     assert child_c not in (sid, child_b)

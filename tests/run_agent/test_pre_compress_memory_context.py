@@ -87,8 +87,8 @@ def test_provider_visible_reclaim_control_is_admitted(monkeypatch):
     agent = _make_agent(None, compressor)
     estimates = iter((100_000, 1_000))
     monkeypatch.setattr(
-        "agent.conversation_compression.estimate_request_tokens_rough",
-        lambda *_args, **_kwargs: next(estimates),
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        lambda _payload: next(estimates),
     )
 
     returned, _ = agent._compress_context(
@@ -97,6 +97,87 @@ def test_provider_visible_reclaim_control_is_admitted(monkeypatch):
 
     assert returned != _messages()
     assert agent._last_compression_outcome == "committed_in_memory"
+
+
+@pytest.mark.parametrize(
+    ("finalized_sizes", "expected_outcome"),
+    [
+        ((100_000, 101_000), "rejected_would_grow"),
+        ((100_000, 97_000), "rejected_below_minimum_reclaim"),
+        ((100_000, 1_000), "committed_in_memory"),
+    ],
+)
+def test_compression_admission_uses_complete_finalized_payload_sizes(
+    monkeypatch, finalized_sizes, expected_outcome
+):
+    """Late provider fields, not obsolete transcript projections, decide admission."""
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "genuinely changed final body"}
+    ]
+    _configure_engine_state(compressor)
+    agent = _make_agent(None, compressor)
+    sizes = iter(finalized_sizes)
+    estimated_payloads = []
+
+    def estimate_complete_payload(payload):
+        estimated_payloads.append(copy.deepcopy(payload))
+        return next(sizes)
+
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        estimate_complete_payload,
+    )
+    original = _messages()
+    returned, _ = agent._compress_context(
+        original, "sys", approx_tokens=100_000, force=True
+    )
+
+    assert agent._last_compression_outcome == expected_outcome
+    assert len(estimated_payloads) == 2
+    assert all("messages" in payload for payload in estimated_payloads)
+    if expected_outcome.startswith("rejected_"):
+        assert returned is original
+    else:
+        assert returned is not original
+
+
+def test_compression_rejects_middleware_only_finalized_request_growth(
+    monkeypatch,
+):
+    """A smaller transcript cannot hide a provider field added after shaping."""
+    from hermes_cli.middleware import RequestMiddlewareResult
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "small middleware trigger"}
+    ]
+    _configure_engine_state(compressor)
+    agent = _make_agent(None, compressor)
+    original = [{"role": "user", "content": "ordinary original body " * 100}]
+
+    def grow_only_final_candidate(payload, **_context):
+        original_payload = copy.deepcopy(payload)
+        shaped = copy.deepcopy(payload)
+        if "small middleware trigger" in str(payload):
+            shaped["provider_preflight_extension"] = "late " * 50_000
+        return RequestMiddlewareResult(
+            payload=shaped,
+            original_payload=original_payload,
+            changed=shaped != original_payload,
+            trace=[{"middleware": "late-growth"}],
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        grow_only_final_candidate,
+    )
+    returned, _ = agent._compress_context(
+        original, "sys", approx_tokens=100_000, force=True
+    )
+
+    assert returned is original
+    assert agent._last_compression_outcome == "rejected_would_grow"
 
 
 def test_rebuilt_system_growth_outweighs_real_message_shrink():
@@ -168,7 +249,7 @@ def test_projection_preserves_current_turn_identity_after_interrupt_ghost():
     )
 
 
-@pytest.mark.parametrize("mode", ["codex", "anthropic-native"])
+@pytest.mark.parametrize("mode", ["openai-chat", "anthropic-native"])
 def test_complete_projection_matches_live_send_and_is_non_mutating(
     monkeypatch, mode
 ):
@@ -183,7 +264,10 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
     agent.ephemeral_system_prompt = "ephemeral system"
     agent.prefill_messages = [{"role": "assistant", "content": " prefill "}]
     agent.provider = "anthropic" if mode == "anthropic-native" else "openrouter"
-    agent.api_mode = "chat_completions"
+    agent.api_mode = (
+        "anthropic_messages" if mode == "anthropic-native"
+        else "chat_completions"
+    )
     agent._use_prompt_caching = mode == "anthropic-native"
     agent._use_native_cache_layout = mode == "anthropic-native"
     agent._cache_ttl = "5m"
@@ -218,6 +302,11 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
 
     def create(**kwargs):
         sent.update(copy.deepcopy(kwargs))
+        if mode == "anthropic-native":
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="done")],
+                stop_reason="end_turn", model=agent.model, usage=None,
+            )
         message = SimpleNamespace(
             content="done", tool_calls=None, reasoning_content=None, reasoning=None
         )
@@ -239,8 +328,17 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
     expected_payload = copy.deepcopy(expected["payload"])
     compressor.select_context.reset_mock()
 
-    agent.client = MagicMock()
-    agent.client.chat.completions.create.side_effect = create
+    if mode == "anthropic-native":
+        native_client = MagicMock()
+        native_client.messages.create.side_effect = create
+        monkeypatch.setattr(
+            agent,
+            "_create_request_anthropic_client",
+            lambda **_kwargs: native_client,
+        )
+    else:
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.side_effect = create
     agent.run_conversation(" current ", conversation_history=history)
 
     assert sent == expected_payload
@@ -250,6 +348,141 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
         getattr(agent, "_cached_system_prompt_static", None),
     ) == before
     assert compressor.select_context.call_count == 1
+
+
+def test_codex_responses_finalized_request_matches_real_transport_dispatch(
+    monkeypatch,
+):
+    """The real Responses transport preflights once, then dispatches verbatim."""
+    from agent.conversation_loop import finalize_provider_request
+    from hermes_cli import lifecycle
+    from hermes_cli.middleware import RequestMiddlewareResult
+
+    compressor = MagicMock()
+    _configure_engine_state(compressor)
+    compressor.select_context.side_effect = lambda rows, **_kwargs: [
+        copy.deepcopy(rows[0]), copy.deepcopy(rows[-1])
+    ]
+    agent = _make_agent(None, compressor)
+    agent.compression_enabled = False
+    agent.provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent._base_url_lower = agent.base_url
+    agent._base_url_hostname = "chatgpt.com"
+    agent.model = "gpt-5-codex"
+    agent._cached_system_prompt = "stable system"
+    agent._cached_system_prompt_static = "stable system"
+    agent._reapply_reasoning_echo_for_provider = lambda rows: rows[1].setdefault(
+        "reasoning_content", "fallback reasoning"
+    )
+    agent.tools = [{
+        "type": "function",
+        "function": {
+            "name": "demo",
+            "description": "immutable schema",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+            },
+        },
+    }]
+    history = [
+        {"role": "user", "content": "historical selection input"},
+        {"role": "assistant", "content": "prior answer"},
+    ]
+    live_rows = history + [{"role": "user", "content": "current request"}]
+    before = copy.deepcopy((history, agent.tools, agent._cached_system_prompt,
+                            agent._cached_system_prompt_static))
+
+    transport = agent._get_transport()
+    real_preflight = transport.preflight_kwargs
+    preflights = []
+    real_build_kwargs = agent._build_api_kwargs
+    shaping_calls = []
+
+    def counted_build_kwargs(rows, tools_for_api=None):
+        shaping_calls.append(copy.deepcopy((rows, tools_for_api)))
+        return real_build_kwargs(rows, tools_for_api=tools_for_api)
+
+    monkeypatch.setattr(agent, "_build_api_kwargs", counted_build_kwargs)
+
+    def counted_preflight(self, payload, **kwargs):
+        preflights.append(copy.deepcopy((payload, kwargs)))
+        return real_preflight(payload, **kwargs)
+
+    monkeypatch.setattr(type(transport), "preflight_kwargs", counted_preflight)
+
+    def add_provider_field(payload, **_context):
+        original = copy.deepcopy(payload)
+        shaped = copy.deepcopy(payload)
+        shaped["provider_extension"] = {"proof": "middleware"}
+        return RequestMiddlewareResult(
+            payload=shaped, original_payload=original, changed=True,
+            trace=[{"middleware": "proof"}],
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_request_middleware", add_provider_field
+    )
+    expected = finalize_provider_request(
+        agent,
+        live_rows,
+        system_message="stable system",
+        tools=agent.tools,
+        current_turn_user_idx=len(history),
+        incoming_message=live_rows[-1],
+        middleware_context={
+            "task_id": "default", "turn_id": "expected",
+            "api_request_id": "expected", "session_id": agent.session_id,
+            "platform": agent.platform or "", "model": agent.model,
+            "provider": agent.provider, "base_url": agent.base_url,
+            "api_mode": agent.api_mode, "api_call_count": 0,
+        },
+    )["payload"]
+    preflights.clear()
+    shaping_calls.clear()
+    compressor.select_context.reset_mock()
+
+    def mutate_every_legacy_alias(_name, **kwargs):
+        for key in ("request", "request_messages", "conversation_history"):
+            value = kwargs.get(key)
+            if isinstance(value, dict):
+                value.clear()
+                value["mutated"] = True
+            elif isinstance(value, list):
+                value.clear()
+                value.append({"role": "user", "content": "mutated"})
+        kwargs["system_prompt"] = "mutated"
+
+    monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "pre_api_request")
+    monkeypatch.setattr(lifecycle, "invoke_hook", mutate_every_legacy_alias)
+    dispatched = {}
+
+    def final_dispatch(payload, *, client, on_first_delta=None):
+        dispatched.update(copy.deepcopy(payload))
+        return SimpleNamespace(
+            output=[SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="done")],
+            )],
+            usage=None, status="completed", model=agent.model,
+        )
+
+    monkeypatch.setattr(agent, "_run_codex_stream", final_dispatch)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: MagicMock()
+    )
+    agent.run_conversation("current request", conversation_history=history)
+
+    # Request ids are middleware context, but this middleware is deliberately
+    # context-independent; the complete provider body must therefore match.
+    assert dispatched == expected
+    assert len(preflights) == 1
+    assert len(shaping_calls) == 1
+    assert compressor.select_context.call_count == 1
+    assert (history, agent.tools, agent._cached_system_prompt,
+            agent._cached_system_prompt_static) == before
 
 
 def test_in_memory_publication_cancel_and_claim_are_linearized(monkeypatch):
@@ -465,6 +698,149 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     assert events[3][2] == second_input
     assert events[1][2] == child_b and events[4][2] == child_c
     assert agent.event_callback is callback
+
+
+def test_real_compressions_deferred_notification_is_claimed_and_fifo_frozen(
+    monkeypatch, tmp_path, request
+):
+    """Real SessionDB publications prove deferred FIFO lifecycle end to end."""
+    from agent.conversation_compression import (
+        _PENDING_CONTEXT_ENGINE_NOTIFICATION,
+        finalize_context_engine_compression_notification,
+    )
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "real-deferred-fifo.db")
+    request.addfinalizer(db.close)
+    parent = "fifo-parent"
+    db.create_session(parent, "gateway-a", model="test/model")
+    db.append_message(parent, "user", "first task")
+    db.append_message(parent, "assistant", "large A " * 20_000)
+    db.append_message(parent, "user", "latest A")
+
+    compressor = MagicMock()
+    _configure_engine_state(compressor)
+    compressor.compression_count = 0
+
+    def compress_candidate(*_args, **_kwargs):
+        compressor.compression_count += 1
+        return [{"role": "user", "content": "small committed summary"}]
+
+    compressor.compress.side_effect = compress_candidate
+    agent = _make_agent(None, compressor)
+    agent._session_db = db
+    agent.session_id = parent
+    agent.platform = "gateway-a"
+    agent._gateway_session_key = ("gateway-a", "conversation-a")
+    agent.compression_in_place = False
+    agent.commit_memory_session = lambda *_args, **_kwargs: None
+    agent.event_callback = None
+
+    a_entered = threading.Event()
+    release_a = threading.Event()
+    request.addfinalizer(release_a.set)
+    delivered = threading.Event()
+    order = []
+    notifications = []
+
+    def frozen_callback(new_session_id, **kwargs):
+        record = (
+            new_session_id,
+            kwargs["old_session_id"],
+            kwargs["platform"],
+            copy.deepcopy(kwargs["conversation_id"]),
+            threading.current_thread().name,
+        )
+        notifications.append(record)
+        if len(notifications) == 1:
+            order.append("a-enter")
+            a_entered.set()
+            assert release_a.wait(timeout=5)
+            order.append("a-exit")
+        elif len(notifications) == 2:
+            order.append("b-notify")
+            delivered.set()
+        else:
+            order.append("c-notify")
+
+    compressor.on_session_start = frozen_callback
+
+    def status_callback(_kind, _message):
+        order.append("b-status")
+
+    agent.status_callback = status_callback
+    monkeypatch.setattr(
+        "agent.conversation_compression._POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.02
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        lambda payload: sum(len(str(value)) for value in payload.values()),
+    )
+
+    agent._compress_context(
+        db.get_messages_as_conversation(parent), "sys",
+        approx_tokens=100_000, force=True,
+    )
+    child_a = agent.session_id
+    assert a_entered.is_set()
+
+    db.append_message(child_a, "assistant", "large B " * 20_000)
+    db.append_message(child_a, "user", "latest B")
+    agent._compress_context(
+        db.get_messages_as_conversation(child_a), "sys",
+        approx_tokens=100_000, force=True,
+        defer_context_engine_notification=True,
+    )
+    child_b = agent.session_id
+    assert child_b not in (parent, child_a)
+    assert not delivered.is_set()
+    assert finalize_context_engine_compression_notification(agent, committed=True)
+    assert getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION) is None
+
+    # Every value below changes after synchronous claim. Delivery must still
+    # use the publication-time record and callable.
+    compressor.on_session_start = lambda *_args, **_kwargs: order.append("mutated")
+    agent.platform = "gateway-mutated"
+    agent._gateway_session_key = ("mutated", "conversation")
+    agent.session_id = "mutated-session-id"
+    agent.status_callback = lambda *_args: order.append("mutated-status")
+
+    release_a.set()
+    assert delivered.wait(timeout=2)
+    assert agent._compression_observer_lane_tail.wait(timeout=2)
+    assert notifications[:2] == [
+        (
+            child_a, parent, "gateway-a", ("gateway-a", "conversation-a"),
+            f"compression-postcommit-{child_a}",
+        ),
+        (
+            child_b, child_a, "gateway-a", ("gateway-a", "conversation-a"),
+            f"compression-postcommit-{child_b}",
+        ),
+    ]
+    assert order[:4] == ["a-enter", "a-exit", "b-status", "b-notify"]
+    assert notifications.count(notifications[1]) == 1
+
+    # A normal later deferred boundary neither sees nor restores B's record.
+    agent.session_id = child_b
+    agent.platform = "gateway-c"
+    agent._gateway_session_key = ("gateway-c", "conversation-c")
+    compressor.on_session_start = frozen_callback
+    db.append_message(child_b, "assistant", "large C " * 20_000)
+    db.append_message(child_b, "user", "latest C")
+    agent._compress_context(
+        db.get_messages_as_conversation(child_b), "sys",
+        approx_tokens=100_000, force=True,
+        defer_context_engine_notification=True,
+    )
+    child_c = agent.session_id
+    assert finalize_context_engine_compression_notification(agent, committed=True)
+    assert agent._compression_observer_lane_tail.wait(timeout=2)
+    assert getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION) is None
+    assert notifications[-1][:4] == (
+        child_c, child_b, "gateway-c", ("gateway-c", "conversation-c")
+    )
+    assert order.count("c-notify") == 1
 
 
 def test_on_pre_compress_runs_after_engine_and_does_not_influence_summary(monkeypatch):

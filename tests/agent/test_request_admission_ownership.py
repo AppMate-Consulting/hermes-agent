@@ -717,7 +717,7 @@ def test_tool_iteration_cannot_consume_stale_admission():
     # one ordinary provider request.  Determinism replay must not duplicate
     # side effects.
     assert len(middleware_calls) == 3
-    assert len(agent.context_compressor.compression_checks) == 2
+    assert agent.context_compressor.compression_checks == [100_000, 0, 1_000]
     assert (
         agent.context_compressor.compression_checks[0]
         > agent.context_compressor.compression_checks[1]

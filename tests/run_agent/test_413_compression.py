@@ -28,6 +28,8 @@ from agent.conversation_compression import (
     COMPACTION_STATUS,
     _compaction_terminal_status,
 )
+from agent.conversation_loop import finalize_provider_request
+from agent.turn_context import reanchor_current_turn_user_idx
 from run_agent import AIAgent
 import run_agent
 
@@ -95,6 +97,42 @@ def _materially_compressible_history() -> list[dict]:
         {"role": "assistant", "content": "old answer " + ("y" * 60_000)},
         {"role": "user", "content": "hello"},
     ]
+
+
+def _mock_compression_result(agent, messages, system_prompt, live, *, admitted):
+    """Return a mock compression result honoring the admission handoff."""
+    handoff = live["admission_handoff"]
+    if not admitted:
+        handoff["request"] = live["frozen_finalized_request"]
+        handoff["admitted"] = False
+        return messages, system_prompt
+
+    turn_idx = reanchor_current_turn_user_idx(
+        messages, live["current_turn_identity"]
+    )
+    incoming = messages[turn_idx] if turn_idx is not None else None
+    finalized = finalize_provider_request(
+        agent,
+        messages,
+        system_message=system_prompt,
+        tools=live["tools"],
+        current_turn_user_idx=turn_idx,
+        external_prefetch=live["external_prefetch"],
+        plugin_user_context=live["plugin_user_context"],
+        prefill_messages=live["prefill_messages"],
+        incoming_message=incoming,
+        sanitize_model=live["sanitize_model"],
+        current_turn_suffix=live["current_turn_suffix"],
+        moa_prepared_request=live["moa_prepared_request"],
+        middleware_context=live["middleware_context"],
+        user_initiated_turn=live["user_initiated_turn"],
+    )
+    finalized["_consumes_user_initiator"] = bool(
+        live["user_initiated_turn"] and agent._is_copilot_url()
+    )
+    handoff["request"] = finalized
+    handoff["admitted"] = True
+    return messages, system_prompt
 
 
 @pytest.fixture()
@@ -1074,15 +1112,20 @@ class TestPreflightCompression:
             # Keep the turn-prologue preflight quiet-by-size so only the
             # in-loop pre-API pressure gate fires.
             patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
                 return_value=144_669,
             ),
             patch.object(
                 agent,
                 "_compress_context",
-                side_effect=lambda msgs, *a, **k: (msgs, agent._cached_system_prompt),
+                side_effect=lambda msgs, *a, **k: _mock_compression_result(
+                    agent,
+                    msgs,
+                    agent._cached_system_prompt,
+                    k["live_request_context"],
+                    admitted=False,
+                ),
             ) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1185,23 +1228,28 @@ class TestPreflightCompression:
         status_messages = []
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
-        _rough_calls = {"n": 0}
+        finalized_estimates = iter([114_000, 40_000])
 
-        def _rough_estimate(*_args, **_kwargs):
-            _rough_calls["n"] += 1
-            return 114_000 if _rough_calls["n"] == 1 else 40_000
+        def _compress(msgs, *_args, **kwargs):
+            candidate = [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
+            return _mock_compression_result(
+                agent,
+                candidate,
+                "new system prompt",
+                kwargs["live_request_context"],
+                admitted=True,
+            )
 
         with (
-            patch("agent.conversation_loop.estimate_messages_tokens_rough", side_effect=_rough_estimate),
-            patch.object(agent, "_compress_context") as mock_compress,
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=lambda *_a, **_k: next(finalized_estimates),
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
-                "new system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_called_once()
@@ -1238,23 +1286,28 @@ class TestPreflightCompression:
         status_messages = []
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
-        _rough_calls = {"n": 0}
+        finalized_estimates = iter([114_015, 40_000])
 
-        def _rough_estimate(*_args, **_kwargs):
-            _rough_calls["n"] += 1
-            return 114_000 if _rough_calls["n"] == 1 else 40_000
+        def _compress(msgs, *_args, **kwargs):
+            candidate = [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
+            return _mock_compression_result(
+                agent,
+                candidate,
+                "new system prompt",
+                kwargs["live_request_context"],
+                admitted=True,
+            )
 
         with (
-            patch("agent.conversation_loop.estimate_messages_tokens_rough", side_effect=_rough_estimate),
-            patch.object(agent, "_compress_context") as mock_compress,
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=lambda *_a, **_k: next(finalized_estimates),
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
-                "new system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_called_once()
@@ -1295,23 +1348,28 @@ class TestPreflightCompression:
         # so we don't have to predict how many times the loop re-estimates —
         # the post-response real-token estimate is an extra call that a
         # 2-element list would exhaust (StopIteration).
-        _rough_calls = {"n": 0}
+        finalized_estimates = iter([125_000, 40_000])
 
-        def _rough_estimate(*_args, **_kwargs):
-            _rough_calls["n"] += 1
-            return 125_000 if _rough_calls["n"] == 1 else 40_000
+        def _compress(msgs, *_args, **kwargs):
+            candidate = [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
+            return _mock_compression_result(
+                agent,
+                candidate,
+                "new system prompt",
+                kwargs["live_request_context"],
+                admitted=True,
+            )
 
         with (
-            patch("agent.conversation_loop.estimate_messages_tokens_rough", side_effect=_rough_estimate),
-            patch.object(agent, "_compress_context") as mock_compress,
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=lambda *_a, **_k: next(finalized_estimates),
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
-                "new system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_called_once()
@@ -1399,29 +1457,30 @@ class TestPreflightCompression:
 
         compress_calls = 0
 
-        def _compress(messages, *_args, **_kwargs):
+        def _compress(messages, *_args, **kwargs):
             nonlocal compress_calls
             compress_calls += 1
             if compress_calls == 1:
                 kept = messages[:-rows_removed] if rows_removed else messages
-                return kept, agent._cached_system_prompt
-            return (
-                [{"role": "user", "content": "hello"}],
-                "compressed after provider overflow",
-            )
+                return _mock_compression_result(
+                    agent,
+                    kept,
+                    agent._cached_system_prompt,
+                    kwargs["live_request_context"],
+                    admitted=False,
+                )
+            candidate = [{"role": "user", "content": "hello"}]
+            return candidate, "compressed after provider overflow"
+
+        finalized_estimates = iter([144_669, 144_669])
+
+        def _finalized_pressure(*_args, **_kwargs):
+            return next(finalized_estimates, 40_000)
 
         with (
             patch(
-                "agent.turn_context.estimate_request_tokens_rough",
-                return_value=144_669,
-            ),
-            patch(
-                "agent.conversation_loop.estimate_request_tokens_rough",
-                return_value=144_669,
-            ),
-            patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
-                return_value=144_669,
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=_finalized_pressure,
             ),
             patch.object(
                 agent, "_compress_context", side_effect=_compress
@@ -1492,17 +1551,26 @@ class TestPreflightCompression:
             big_history.append({"role": "user", "content": f"Message {i} padded text"})
             big_history.append({"role": "assistant", "content": f"Response {i} padded text"})
 
-        def _fake_preflight_compress(msgs, *_args, **_kwargs):
+        def _fake_preflight_compress(msgs, *_args, **kwargs):
             agent.context_compressor.last_prompt_tokens = -1
             agent.context_compressor.awaiting_real_usage_after_compression = True
             agent.context_compressor.compression_count += 1
             agent.context_compressor._ineffective_compression_count = 2
             agent.context_compressor._last_compression_savings_pct = 0.0
             agent._interrupt_requested = True
-            return msgs, agent._cached_system_prompt
+            return _mock_compression_result(
+                agent,
+                msgs,
+                agent._cached_system_prompt,
+                kwargs["live_request_context"],
+                admitted=False,
+            )
 
         with (
-            patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=144_669),
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                return_value=144_669,
+            ),
             patch.object(agent.context_compressor, "should_compress", return_value=True),
             patch.object(agent, "_compress_context", side_effect=_fake_preflight_compress),
             patch.object(agent, "_persist_session"),
@@ -1585,23 +1653,29 @@ class TestToolResultPreflightCompression:
         # trims it from 150K to 148K. Raw-message estimation is much smaller,
         # which previously made the no-op pass look successful and allowed two
         # more immediate summaries.
-        assembled_estimates = iter(
+        finalized_estimates = iter(
             [1_000, 150_000, 148_000, 148_000, 148_000]
         )
 
+        def _reject_candidate(msgs, *_args, **kwargs):
+            return _mock_compression_result(
+                agent,
+                msgs,
+                agent._cached_system_prompt,
+                kwargs["live_request_context"],
+                admitted=False,
+            )
+
         with (
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
-                side_effect=lambda *_a, **_k: next(assembled_estimates),
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=lambda *_a, **_k: next(finalized_estimates),
             ),
             patch("run_agent.handle_function_call", return_value="x" * 100_000),
             patch.object(
                 agent,
                 "_compress_context",
-                side_effect=lambda msgs, *_a, **_k: (
-                    msgs,
-                    agent._cached_system_prompt,
-                ),
+                side_effect=_reject_candidate,
             ) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),

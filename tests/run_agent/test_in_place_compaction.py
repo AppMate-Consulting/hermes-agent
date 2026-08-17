@@ -1022,7 +1022,12 @@ class TestCompressionAttemptStateContract:
 
         assert compressed is not messages
         assert state == {"cursor": 1}
-        restore.assert_not_called()
+        # Candidate selection first rewinds the selector from the
+        # pre-old projection snapshot.  A successful publication must keep
+        # the candidate mutation and must not perform the separate abort
+        # rollback to the attempt snapshot.
+        restore.assert_called_once()
+        assert restore.call_args.args[0] is not None
 
     def test_successful_publication_keeps_nested_resource_identity(self, tmp_path):
         from agent.conversation_compression import compress_context

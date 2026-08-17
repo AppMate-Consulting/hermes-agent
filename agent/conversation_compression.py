@@ -4397,12 +4397,30 @@ def compress_context(
         _provider_request_in = _finalized_in["payload"]
         from agent.turn_context import reanchor_current_turn_user_idx
 
-        _turn_identity = _live.get("current_turn_identity")
-        _candidate_turn_idx = (
-            reanchor_current_turn_user_idx(compressed, _turn_identity)
-            if _turn_identity is not None
-            else None
-        )
+        _turn_anchor = _live.get("current_turn_anchor")
+        if _turn_anchor is not None:
+            _anchor_matches = [
+                index for index, row in enumerate(compressed)
+                if isinstance(row, dict)
+                and row.get("_compression_turn_anchor") == _turn_anchor
+            ]
+            _candidate_turn_idx = (
+                _anchor_matches[0] if len(_anchor_matches) == 1 else None
+            )
+            # The marker is transaction-only provenance.  Strip every copy
+            # before provider projection and before any durable publication.
+            for _anchor_row in compressed:
+                if isinstance(_anchor_row, dict):
+                    _anchor_row.pop("_compression_turn_anchor", None)
+            if len(_anchor_matches) != 1:
+                _protected_seam_valid = False
+        else:
+            _turn_identity = _live.get("current_turn_identity")
+            _candidate_turn_idx = (
+                reanchor_current_turn_user_idx(compressed, _turn_identity)
+                if _turn_identity is not None
+                else None
+            )
         _candidate_incoming = (
             compressed[_candidate_turn_idx]
             if isinstance(_candidate_turn_idx, int)
@@ -4867,10 +4885,12 @@ def compress_context(
             agent._last_compaction_in_place = False
             return messages, _rollback_prompt()
 
-        # The conversation loop consumes this object verbatim on the next
-        # provider dispatch; it must not re-run a stateful selector, MoA
-        # preparation, transport preflight, or middleware after admission.
-        agent._admitted_provider_request = _admitted_finalized_request
+        # Publish only through the caller-owned, transaction-local capability.
+        # No request is parked on the agent where a retry, new turn, or later
+        # tool iteration could consume it against a different transcript.
+        _admission_handoff = _live.get("admission_handoff")
+        if isinstance(_admission_handoff, dict):
+            _admission_handoff["request"] = _admitted_finalized_request
 
         # These extension callbacks are deliberately post-persistence AND
         # post-lease. Schedule their semantically ordered chain exactly once;

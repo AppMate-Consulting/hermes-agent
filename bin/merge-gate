@@ -12,6 +12,7 @@ fi
   tests/agent/test_compress_context_progress_timeout.py \
   tests/agent/test_compression_review_76354.py \
   tests/agent/test_compression_adoption_preserves_live_tail.py \
+  tests/agent/test_request_admission_ownership.py \
   tests/agent/test_compression_anti_thrash_persistence.py \
   tests/agent/test_compression_anti_thrash_recovery.py \
   tests/gateway/test_buzz_adapter.py \

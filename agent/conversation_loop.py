@@ -1990,6 +1990,10 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # Admission is call-local.  Discard the obsolete process-like parking
+    # slot defensively so an agent created by older embedding code cannot
+    # replay speculative bytes into this turn or a later tool iteration.
+    vars(agent).pop("_admitted_provider_request", None)
 
     # If a background memory/skill review spawned at the end of a PRIOR turn
     # (agent/background_review.py) is still running its own run_conversation()
@@ -2370,7 +2374,7 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
-        _admitted_request = vars(agent).pop("_admitted_provider_request", None)
+        _admitted_request = None
         # MoA guidance is the sole live-only dynamic transform. Produce it
         # before canonical projection, then pass the resulting text into the
         # current-turn composition below; compression never replays advisors.
@@ -2621,45 +2625,70 @@ def run_conversation(
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
-            messages, active_system_prompt = agent._compress_context(
-                messages,
-                system_message,
-                approx_tokens=request_pressure_tokens,
-                task_id=effective_task_id,
-                live_request_context={
-                    "frozen_projection": _provider_request,
-                    "current_turn_user_idx": current_turn_user_idx,
-                    "current_turn_identity": copy.deepcopy(
-                        messages[current_turn_user_idx].get("content")
-                        if 0 <= current_turn_user_idx < len(messages) else None
-                    ),
-                    "incoming_message": copy.deepcopy(_incoming),
-                    "external_prefetch": copy.deepcopy(_ext_prefetch_cache),
-                    "plugin_user_context": copy.deepcopy(_plugin_user_context),
-                    "prefill_messages": copy.deepcopy(
-                        getattr(agent, "prefill_messages", None)
-                    ),
-                    "sanitize_model": _sanitize_model,
-                    "current_turn_suffix": _moa_context,
-                    "moa_prepared_request": _moa_prepared_request,
-                    "tools": copy.deepcopy(agent.tools or []),
-                    "user_initiated_turn": bool(
-                        getattr(agent, "_is_user_initiated_turn", False)
-                    ),
-                    "middleware_context": {
-                        "task_id": effective_task_id,
-                        "turn_id": turn_id,
-                        "api_request_id": f"{turn_id}:api:{api_call_count}",
-                        "session_id": agent.session_id or "",
-                        "platform": agent.platform or "",
-                        "model": agent.model,
-                        "provider": agent.provider,
-                        "base_url": agent.base_url,
-                        "api_mode": agent.api_mode,
-                        "api_call_count": api_call_count,
-                    },
-                },
+            # Both objects are transaction-local capabilities.  The anchor
+            # identifies the exact current-turn row through compressor copies;
+            # the handoff can be filled only after successful publication and
+            # is consumed by this same dispatch (never agent state / next loop).
+            _admission_handoff = {}
+            _turn_anchor = f"{turn_id}:compression:{compression_attempts}:{api_call_count}"
+            _anchored_turn_row = (
+                messages[current_turn_user_idx]
+                if 0 <= current_turn_user_idx < len(messages) else None
             )
+            if isinstance(_anchored_turn_row, dict):
+                _anchored_turn_row["_compression_turn_anchor"] = _turn_anchor
+            try:
+                messages, active_system_prompt = agent._compress_context(
+                    messages,
+                    system_message,
+                    approx_tokens=request_pressure_tokens,
+                    task_id=effective_task_id,
+                    live_request_context={
+                        "admission_handoff": _admission_handoff,
+                        "current_turn_anchor": _turn_anchor,
+                        "frozen_projection": _provider_request,
+                        "current_turn_user_idx": current_turn_user_idx,
+                        "current_turn_identity": copy.deepcopy(
+                            messages[current_turn_user_idx].get("content")
+                            if 0 <= current_turn_user_idx < len(messages) else None
+                        ),
+                        "incoming_message": copy.deepcopy(_incoming),
+                        "external_prefetch": copy.deepcopy(_ext_prefetch_cache),
+                        "plugin_user_context": copy.deepcopy(_plugin_user_context),
+                        "prefill_messages": copy.deepcopy(
+                            getattr(agent, "prefill_messages", None)
+                        ),
+                        "sanitize_model": _sanitize_model,
+                        "current_turn_suffix": _moa_context,
+                        "moa_prepared_request": _moa_prepared_request,
+                        "tools": copy.deepcopy(agent.tools or []),
+                        "user_initiated_turn": bool(
+                            getattr(agent, "_is_user_initiated_turn", False)
+                        ),
+                        "middleware_context": {
+                            "task_id": effective_task_id,
+                            "turn_id": turn_id,
+                            "api_request_id": f"{turn_id}:api:{api_call_count}",
+                            "session_id": agent.session_id or "",
+                            "platform": agent.platform or "",
+                            "model": agent.model,
+                            "provider": agent.provider,
+                            "base_url": agent.base_url,
+                            "api_mode": agent.api_mode,
+                            "api_call_count": api_call_count,
+                        },
+                    },
+                )
+            finally:
+                # Rejection/cancellation paths return caller-owned rows.  The
+                # marker is private transaction provenance and must never
+                # survive into transcript persistence or a later iteration.
+                for _anchor_row in messages:
+                    if isinstance(_anchor_row, dict):
+                        _anchor_row.pop("_compression_turn_anchor", None)
+                if isinstance(_anchored_turn_row, dict):
+                    _anchored_turn_row.pop("_compression_turn_anchor", None)
+            _admitted_request = _admission_handoff.pop("request", None)
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
                 # compression lock, so this pass no-oped. That is a temporary
@@ -2695,17 +2724,6 @@ def run_conversation(
                 conversation_history = conversation_history_after_compression(
                     agent, messages, conversation_history
                 )
-                # This preflight iteration never reaches the provider whether
-                # we skip the turn (handoff guard below) or re-run the loop —
-                # refund the consumed call/budget in BOTH cases, mirroring the
-                # ollama_runtime_context_too_small early-exit above. Without
-                # the refund on the break path, every skipped turn leaked one
-                # iteration-budget unit for the agent's lifetime and
-                # finalize_turn logged an api_call_count including a call that
-                # was never made.
-                api_call_count -= 1
-                agent._api_call_count = api_call_count
-                agent.iteration_budget.refund()
                 if _should_skip_model_call_for_reference_handoff(
                     messages, user_message
                 ):
@@ -2718,8 +2736,28 @@ def run_conversation(
                     if not final_response:
                         final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                     _turn_exit_reason = "compaction_handoff_not_actionable"
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
                     break
-                continue
+                if _admitted_request is None:
+                    # A no-op/failed publication has no exact request to own.
+                    # Rebuild on a fresh iteration; never dispatch the
+                    # speculative pre-compression projection below.
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
+                    continue
+                # Successful admission owns this SAME dispatch.  Refresh only
+                # diagnostics; provider kwargs below come verbatim from the
+                # frozen admitted object and run no selector/advisor/middleware.
+                api_messages = _admitted_request["messages"]
+                tools_for_api = _admitted_request["tools"]
+                _moa_prepared_request = _admitted_request.get(
+                    "moa_prepared_request"
+                )
+                approx_tokens = estimate_messages_tokens_rough(api_messages)
+                total_chars = approx_tokens * 4
         elif (
             agent.compression_enabled
             and len(messages) > 1
@@ -2847,7 +2885,8 @@ def run_conversation(
                 # echo-back pad for the *current* provider here (idempotent no-op
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
-                _finalized_request = (_admitted_request if _admitted_request is not None else finalize_provider_request(
+                _using_admitted_request = _admitted_request is not None
+                _finalized_request = (_admitted_request if _using_admitted_request else finalize_provider_request(
                     agent,
                     messages,
                     system_message=effective_system,
@@ -2874,7 +2913,12 @@ def run_conversation(
                     },
                     consume_user_initiator=True,
                 ))
-                if _admitted_request is not None and _admitted_request.get(
+                # Admission authorizes exactly one provider attempt.  Clear
+                # the local capability before any network call so an SDK
+                # retry, fallback, exception, or later tool iteration cannot
+                # consume it again against changed provider/transcript state.
+                _admitted_request = None
+                if _using_admitted_request and _finalized_request.get(
                     "_consumes_user_initiator"
                 ):
                     agent._is_user_initiated_turn = False

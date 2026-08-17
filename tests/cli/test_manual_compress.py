@@ -159,15 +159,8 @@ def test_manual_compress_syncs_session_id_after_split():
     assert shell._pending_title is None
 
 
-def test_manual_compress_flushes_compressed_history_to_child_session_db():
-    """Manual /compress must persist the handoff in the continuation DB.
-
-    _compress_context rotates the agent to a new child session and returns a
-    compressed transcript whose first messages include the handoff summary. The
-    CLI then replaces its in-memory conversation_history with that transcript.
-    Because the child DB starts empty, the flush must start from offset 0 rather
-    than treating the compressed history as already persisted.
-    """
+def test_manual_compress_does_not_republish_transactional_child_history():
+    """The compression transaction, not the CLI host, publishes the child."""
     shell = _make_cli()
     history = _make_history()
     old_id = shell.session_id
@@ -192,7 +185,9 @@ def test_manual_compress_flushes_compressed_history_to_child_session_db():
     with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100):
         shell._manual_compress()
 
-    shell.agent._flush_messages_to_session_db.assert_called_once_with(compressed, None)
+    assert shell.session_id == new_child_id
+    assert shell.conversation_history == compressed
+    shell.agent._flush_messages_to_session_db.assert_not_called()
 
 
 

@@ -33,6 +33,23 @@ CALL_ID = "call_protected_1"
 SUMMARY = "[CONTEXT COMPACTION] durable generated head"
 
 
+def _select_transcript_dependent_context(
+    request_rows: list[dict], *, conversation_messages=None, **_kwargs
+) -> list[dict]:
+    """Return a request clone whose system marker reflects its transcript."""
+    selected = copy.deepcopy(request_rows)
+    assert conversation_messages is not None
+    marker = f"selected_conversation_count={len(conversation_messages)}"
+    for row in selected:
+        if row.get("role") == "system":
+            assert isinstance(row.get("content"), str)
+            row["content"] = f'{row["content"]}\n{marker}'
+            break
+    else:
+        raise AssertionError("finalized request must contain its existing system row")
+    return selected
+
+
 def _seed(db: SessionDB, sid: str) -> list[dict]:
     """Create a compressible head and a metadata-rich protected suffix."""
     from agent.conversation_compression import (
@@ -223,6 +240,7 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
     durable_case, in_place
 ):
     """GatewaySlashCommandsMixin real /compress handler uses the same transaction."""
+    from agent.conversation_loop import finalize_provider_request
     from gateway.config import Platform
     from gateway.platforms.base import MessageEvent
     from gateway.session import SessionEntry, SessionSource
@@ -231,6 +249,9 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
     db, sid, source_rows = durable_case
     seen: list[list[dict]] = []
     prepared = _agent(db, sid, in_place=in_place, seen=seen)
+    prepared.context_compressor.select_context.side_effect = (
+        _select_transcript_dependent_context
+    )
     source = SessionSource(platform=Platform.TELEGRAM, user_id="u", chat_id="c", chat_type="dm")
     event = MessageEvent(text="/compress here 4", source=source, message_id="m")
     entry = SessionEntry(
@@ -255,6 +276,38 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
         def _sync_telegram_topic_binding(self, *_a, **_kw): return None
 
     host = Host()
+    expected_rows = [{"role": "assistant", "content": SUMMARY}] + copy.deepcopy(
+        source_rows[4:]
+    )
+    prompt = prepared._cached_system_prompt
+    tools = prepared.tools or []
+    source_before = copy.deepcopy(source_rows)
+    expected_before = copy.deepcopy(expected_rows)
+    prompt_before = copy.deepcopy(prompt)
+    tools_before = copy.deepcopy(tools)
+    source_payload = finalize_provider_request(
+        prepared,
+        source_rows,
+        system_message=prompt,
+        tools=tools,
+    )["payload"]
+    expected_payload = finalize_provider_request(
+        prepared,
+        expected_rows,
+        system_message=prompt,
+        tools=tools,
+    )["payload"]
+    source_marker = f"selected_conversation_count={len(source_rows)}"
+    expected_marker = f"selected_conversation_count={len(expected_rows)}"
+    assert source_marker != expected_marker
+    assert source_marker in repr(source_payload)
+    assert expected_marker in repr(expected_payload)
+    assert source_payload != expected_payload
+    assert source_rows == source_before
+    assert expected_rows == expected_before
+    assert prompt == prompt_before
+    assert tools == tools_before
+
     method = "archive_and_compact" if in_place else "publish_compression_child"
     with patch("run_agent.AIAgent", return_value=prepared), patch.object(
         db, method, wraps=getattr(db, method)

@@ -184,6 +184,125 @@ class TestInPlaceCompaction:
             "messages_transcript_generation_move",
         }
 
+    def test_trigger_reconciliation_holds_write_lock_across_drop_create(self, tmp_path):
+        """No writer can mutate a transcript while its CAS triggers are replaced."""
+        import sqlite3
+        import threading
+
+        from hermes_state import SessionDB
+
+        path = tmp_path / "atomic-trigger-reconcile.db"
+        seed = SessionDB(db_path=path)
+        seed.create_session("session", "cli")
+        seed.append_message("session", "user", "before")
+        row_id = seed.get_messages("session")[0]["id"]
+        generation_before = seed.get_active_transcript_identity("session")
+        seed.close()
+
+        reconcile_conn = sqlite3.connect(
+            str(path), isolation_level=None, check_same_thread=False
+        )
+        writer = sqlite3.connect(str(path), isolation_level=None, timeout=0)
+        reached_boundary = threading.Event()
+        release_reconcile = threading.Event()
+        errors = []
+
+        class PausingCursor:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                result = self._real.execute(sql, *args, **kwargs)
+                if sql.startswith(
+                    "DROP TRIGGER IF EXISTS messages_transcript_generation_move"
+                ):
+                    reached_boundary.set()
+                    if not release_reconcile.wait(timeout=5):
+                        raise AssertionError("test did not release trigger reconciliation")
+                return result
+
+        owner = SessionDB.__new__(SessionDB)
+        owner._conn = reconcile_conn
+
+        def reconcile():
+            try:
+                owner._reconcile_transcript_generation_triggers(
+                    PausingCursor(reconcile_conn.cursor())
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=reconcile)
+        thread.start()
+        try:
+            assert reached_boundary.wait(timeout=5), "reconciliation never reached DROP boundary"
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                writer.execute(
+                    "UPDATE messages SET content = ? WHERE id = ?",
+                    ("unfenced", row_id),
+                )
+
+            release_reconcile.set()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "trigger reconciliation did not finish"
+            assert errors == []
+            assert writer.execute(
+                "SELECT content FROM messages WHERE id = ?", (row_id,)
+            ).fetchone()[0] == "before"
+
+            writer.execute(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                ("after reconciliation", row_id),
+            )
+            assert writer.execute(
+                "SELECT transcript_generation FROM sessions WHERE id = ?",
+                ("session",),
+            ).fetchone()[0] > generation_before
+        finally:
+            release_reconcile.set()
+            thread.join(timeout=5)
+            writer.close()
+            reconcile_conn.close()
+
+    def test_trigger_reconciliation_ddl_failure_rolls_back_whole_set(self, tmp_path):
+        """A failed CREATE restores every prior trigger and closes the transaction."""
+        import sqlite3
+
+        from hermes_state import SessionDB
+
+        path = tmp_path / "trigger-reconcile-rollback.db"
+        seed = SessionDB(db_path=path)
+        seed.close()
+        conn = sqlite3.connect(str(path), isolation_level=None)
+        owner = SessionDB.__new__(SessionDB)
+        owner._conn = conn
+        before = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_transcript_generation_%' ORDER BY name"
+        ).fetchall()
+
+        class FailingCursor:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                if sql.startswith("CREATE TRIGGER"):
+                    raise sqlite3.OperationalError("injected DDL failure")
+                return self._real.execute(sql, *args, **kwargs)
+
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="injected DDL failure"):
+                owner._reconcile_transcript_generation_triggers(
+                    FailingCursor(conn.cursor())
+                )
+            assert conn.in_transaction is False
+            assert conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_transcript_generation_%' ORDER BY name"
+            ).fetchall() == before
+        finally:
+            conn.close()
+
     def test_generation_covers_every_model_field_and_excludes_presentation_only(self, tmp_path):
         """Schema fence matches the conversation projection's semantic boundary.
 

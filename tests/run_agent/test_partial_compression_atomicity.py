@@ -603,6 +603,27 @@ def test_postcommit_readback_failure_is_typed_and_retriable(durable_case):
     assert db.get_compression_lock_holder(sid) is None
 
 
+def test_authoritative_reload_never_falls_back_to_candidate():
+    from agent.conversation_compression import (
+        CompressionCommittedPostpublicationError,
+    )
+
+    db = MagicMock()
+    db.get_messages_as_conversation.side_effect = RuntimeError("read unavailable")
+    agent = SimpleNamespace(_session_db=db)
+    error = CompressionCommittedPostpublicationError(
+        session_id="committed-child",
+        transcript=None,
+        candidate_transcript=[{"role": "user", "content": "speculative"}],
+        in_place=False,
+        cause=RuntimeError("initial read failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="read unavailable"):
+        error.load_authoritative_transcript(agent)
+    db.get_messages_as_conversation.assert_called_once_with("committed-child")
+
+
 def test_begin_commit_cancel_after_host_claim_releases_once(durable_case):
     """Fence refusal after a claim releases both host claim and durable lease."""
     from agent.conversation_compression import CompressionCommitFence

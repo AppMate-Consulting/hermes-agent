@@ -19194,12 +19194,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_wrapper_exc,
                                             CompressionCommittedPostpublicationError,
                                         ):
-                                            _compressed = (
-                                                _hyg_wrapper_exc.load_authoritative_transcript(
-                                                    _hyg_agent
-                                                )
-                                            )
                                             _hyg_agent.session_id = _hyg_wrapper_exc.session_id
+                                            if (
+                                                _hyg_wrapper_exc.session_id
+                                                != session_entry.session_id
+                                            ):
+                                                session_entry.session_id = (
+                                                    _hyg_wrapper_exc.session_id
+                                                )
+                                                self._rebind_turn_lease(
+                                                    _quick_key,
+                                                    run_generation,
+                                                    _hyg_wrapper_exc.session_id,
+                                                )
+                                                await self.async_session_store._save()
+                                                await asyncio.to_thread(
+                                                    self._sync_telegram_topic_binding,
+                                                    source,
+                                                    session_entry,
+                                                    reason=(
+                                                        "hygiene-compression-postcommit"
+                                                    ),
+                                                )
                                             logger.warning(
                                                 "Session hygiene compression committed but "
                                                 "required postcommit reconciliation: %s",
@@ -19209,6 +19225,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _hyg_agent,
                                                 "committed_postpublication_sync_error",
                                             )
+                                            try:
+                                                _compressed = _hyg_wrapper_exc.load_authoritative_transcript(
+                                                    _hyg_agent
+                                                )
+                                            except Exception as _reconcile_exc:
+                                                _warn_msg = (
+                                                    "⚠️ Context compression committed, but "
+                                                    "durable reconciliation is required before "
+                                                    "another turn. The committed session was "
+                                                    "preserved and this turn was stopped."
+                                                )
+                                                try:
+                                                    _adapter = self._adapter_for_source(source)
+                                                    if _adapter and source.chat_id:
+                                                        await _adapter.send(
+                                                            source.chat_id,
+                                                            _warn_msg,
+                                                            metadata=_hyg_meta,
+                                                        )
+                                                except Exception:
+                                                    logger.debug(
+                                                        "Failed to deliver reconciliation warning",
+                                                        exc_info=True,
+                                                    )
+                                                logger.error(
+                                                    "Committed hygiene compression could not be "
+                                                    "reloaded for %s: %s",
+                                                    _hyg_wrapper_exc.session_id,
+                                                    _reconcile_exc,
+                                                )
+                                                return
                                             _hyg_wrapper_exc = None
                                         if _hyg_wrapper_exc is None:
                                             pass

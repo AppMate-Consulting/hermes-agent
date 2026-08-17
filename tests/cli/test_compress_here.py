@@ -152,3 +152,33 @@ def test_committed_postpublication_error_reconciles_cli_state(capsys):
     output = capsys.readouterr().out
     assert "Compression committed" in output
     assert "Compression failed" not in output
+
+
+def test_committed_reload_failure_rebinds_and_blocks_cli(capsys):
+    from agent.conversation_compression import CompressionCommittedPostpublicationError
+
+    shell = _make_cli()
+    shell.conversation_history = _make_history()
+    shell.session_id = "parent"
+    _wire_agent(shell, [])
+    shell.agent.session_id = "parent"
+    shell.agent._session_db = MagicMock()
+    shell.agent._session_db.get_messages_as_conversation.side_effect = RuntimeError(
+        "read still unavailable"
+    )
+    shell.agent._compress_context.side_effect = CompressionCommittedPostpublicationError(
+        session_id="child",
+        transcript=None,
+        candidate_transcript=[{"role": "user", "content": "speculative"}],
+        in_place=False,
+        cause=RuntimeError("first read unavailable"),
+    )
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress")
+
+    assert shell.session_id == shell.agent.session_id == "child"
+    assert shell.conversation_history == []
+    shell.chat("must not run")
+    shell.agent.run_conversation.assert_not_called()
+    assert "Session blocked" in capsys.readouterr().out

@@ -12632,13 +12632,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     CompressionCommittedPostpublicationError,
                 )
                 if isinstance(e, CompressionCommittedPostpublicationError):
+                    self.agent.session_id = e.session_id
+                    self.session_id = e.session_id
+                    self._pending_title = None
                     try:
                         self.conversation_history = e.load_authoritative_transcript(
                             self.agent
                         )
-                        self.agent.session_id = e.session_id
-                        self.session_id = e.session_id
-                        self._pending_title = None
+                        self._compression_reconciliation_required = None
                         finalize_context_engine_compression_notification(
                             self.agent, committed=True
                         )
@@ -12647,6 +12648,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             f"needed recovery: {e.cause}"
                         )
                     except Exception as reconcile_error:
+                        self.conversation_history = []
+                        self._compression_reconciliation_required = str(reconcile_error)
                         finalize_context_engine_compression_notification(
                             self.agent, committed=True
                         )
@@ -15138,6 +15141,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        if getattr(self, "_compression_reconciliation_required", None):
+            print(
+                "  ⛔ Session blocked: committed compression requires durable "
+                "reconciliation; no new turn started."
+            )
+            return None
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)

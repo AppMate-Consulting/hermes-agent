@@ -196,3 +196,30 @@ def test_committed_postpublication_error_adopts_tui_history():
     assert session["history_version"] == 2
     assert agent._last_compression_postcommit_warning == "host adoption failed"
 
+
+def test_committed_reload_failure_rebinds_and_blocks_tui_history():
+    from agent.conversation_compression import CompressionCommittedPostpublicationError
+    from tui_gateway.server import _compress_session_history
+
+    history = _make_history()
+    agent = _make_lock_skip_agent(None)
+    agent.session_id = "parent"
+    agent._session_db = MagicMock()
+    agent._session_db.get_messages_as_conversation.side_effect = RuntimeError("db down")
+    agent._compress_context.side_effect = CompressionCommittedPostpublicationError(
+        session_id="child",
+        transcript=None,
+        candidate_transcript=[{"role": "user", "content": "speculative"}],
+        in_place=False,
+        cause=RuntimeError("first read failed"),
+    )
+    session = _make_session(agent, history)
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100), \
+         pytest.raises(RuntimeError, match="reconciliation required"):
+        _compress_session_history(session)
+
+    assert agent.session_id == session["committed_session_id"] == "child"
+    assert session["session_key"] == "sess-lock"
+    assert session["history"] == []
+    assert "compression_reconciliation_required" in session

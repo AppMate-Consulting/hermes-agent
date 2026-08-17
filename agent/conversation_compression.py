@@ -192,23 +192,20 @@ class CompressionCommittedPostpublicationError(RuntimeError):
         )
 
     def load_authoritative_transcript(self, agent: Any) -> list:
-        """Return the committed transcript, retrying the authoritative store."""
+        """Return only the committed transcript, retrying SessionDB once.
+
+        ``candidate_transcript`` is diagnostic only: it was prepared before
+        publication and can never substitute for durable authority.
+        """
         if self.transcript is not None:
             return copy.deepcopy(self.transcript)
         session_db = getattr(agent, "_session_db", None)
         if session_db is None:
             raise RuntimeError("Committed compression has no authoritative SessionDB")
-        try:
-            rows = session_db.get_messages_as_conversation(self.session_id)
-        except Exception:
-            if self.candidate_transcript is not None:
-                return copy.deepcopy(self.candidate_transcript)
-            raise
+        rows = session_db.get_messages_as_conversation(self.session_id)
         if not isinstance(rows, list) or not rows or not all(
             isinstance(row, dict) for row in rows
         ):
-            if self.candidate_transcript is not None:
-                return copy.deepcopy(self.candidate_transcript)
             raise RuntimeError("Committed compression durable reconciliation read unusable")
         self.transcript = copy.deepcopy(rows)
         return rows

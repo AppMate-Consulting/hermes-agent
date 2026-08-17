@@ -5120,13 +5120,30 @@ def _compress_session_history(
             CompressionCommittedPostpublicationError,
         )
         if isinstance(exc, CompressionCommittedPostpublicationError):
-            authoritative = exc.load_authoritative_transcript(agent)
+            agent.session_id = exc.session_id
+            session["committed_session_id"] = exc.session_id
+            try:
+                authoritative = exc.load_authoritative_transcript(agent)
+            except Exception as reconcile_error:
+                with session["history_lock"]:
+                    session["history"] = []
+                    session["history_version"] = max(
+                        int(session.get("history_version", 0)), history_version + 1
+                    )
+                    session["compression_reconciliation_required"] = str(
+                        reconcile_error
+                    )
+                finalize_context_engine_compression_notification(agent, committed=True)
+                setattr(agent, "_last_compression_postcommit_warning", str(exc.cause))
+                raise RuntimeError(
+                    "compression committed; durable reconciliation required"
+                ) from reconcile_error
             with session["history_lock"]:
                 session["history"] = authoritative
                 session["history_version"] = max(
                     int(session.get("history_version", 0)), history_version + 1
                 )
-            agent.session_id = exc.session_id
+                session.pop("compression_reconciliation_required", None)
             finalize_context_engine_compression_notification(agent, committed=True)
             setattr(agent, "_last_compression_postcommit_warning", str(exc.cause))
             return len(history) - len(authoritative), _get_usage(agent)
@@ -10331,6 +10348,17 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
 ) -> None:
     with session["history_lock"]:
+        if session.get("compression_reconciliation_required"):
+            session["running"] = False
+            _emit(
+                "message.error",
+                sid,
+                error=(
+                    "Session blocked: committed compression requires durable "
+                    "reconciliation; no new turn started."
+                ),
+            )
+            return
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation

@@ -4290,8 +4290,26 @@ class GatewaySlashCommandsMixin:
                     )
                     if not isinstance(exc, CompressionCommittedPostpublicationError):
                         raise
-                    compressed = exc.load_authoritative_transcript(tmp_agent)
                     tmp_agent.session_id = exc.session_id
+                    if exc.session_id != session_entry.session_id:
+                        session_entry.session_id = exc.session_id
+                        await self.async_session_store._save()
+                        await asyncio.to_thread(
+                            self._sync_telegram_topic_binding,
+                            source,
+                            session_entry,
+                            reason="compress-command-postcommit",
+                        )
+                    try:
+                        compressed = exc.load_authoritative_transcript(tmp_agent)
+                    except Exception as reconcile_error:
+                        finalize_context_engine_compression_notification(
+                            tmp_agent, committed=True
+                        )
+                        return (
+                            "⚠️ Compression committed, but durable reconciliation is "
+                            f"required before another turn: {reconcile_error}"
+                        )
                     _postcommit_warning = str(exc.cause)
 
                 # If _compress_context returned unchanged because a

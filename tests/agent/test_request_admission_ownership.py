@@ -111,7 +111,15 @@ def _agent():
     return agent, compressor
 
 
-def _run(agent, responses, *, admitted, middleware_calls, boundary_events=None):
+def _run(
+    agent,
+    responses,
+    *,
+    admitted,
+    admitted_snapshots,
+    middleware_calls,
+    boundary_events=None,
+):
     boundary_events = boundary_events if boundary_events is not None else []
     response_iter = iter(responses)
 
@@ -129,6 +137,17 @@ def _run(agent, responses, *, admitted, middleware_calls, boundary_events=None):
 
     agent.context_compressor.select_context.side_effect = select
 
+    real_compress_context = agent._compress_context
+
+    def capture_admission(*args, **kwargs):
+        result = real_compress_context(*args, **kwargs)
+        handoff = kwargs["live_request_context"]["admission_handoff"]
+        request = handoff.get("request")
+        if request is not None and not admitted:
+            admitted.append(request)
+            admitted_snapshots.append(copy.deepcopy(request))
+        return result
+
     def middleware(payload, **context):
         shaped = copy.deepcopy(payload)
         shaped["extra_headers"] = {
@@ -137,8 +156,6 @@ def _run(agent, responses, *, admitted, middleware_calls, boundary_events=None):
         }
         middleware_calls.append((copy.deepcopy(shaped), copy.deepcopy(context)))
         boundary_events.append(("middleware", copy.deepcopy(shaped)))
-        if "compact summary" in str(shaped):
-            admitted[:] = [copy.deepcopy(shaped)]
         return RequestMiddlewareResult(
             payload=shaped,
             original_payload=copy.deepcopy(payload),
@@ -155,6 +172,7 @@ def _run(agent, responses, *, admitted, middleware_calls, boundary_events=None):
         ),
         patch("hermes_cli.middleware.apply_llm_request_middleware", side_effect=middleware),
         patch("agent.conversation_loop.jittered_backoff", return_value=0),
+        patch.object(agent, "_compress_context", side_effect=capture_admission),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -172,13 +190,24 @@ def _run(agent, responses, *, admitted, middleware_calls, boundary_events=None):
         )
 
 
+def _assert_dispatch_uses_admission(dispatch, admitted_request, snapshot):
+    payload = admitted_request["payload"]
+    assert dispatch == snapshot["payload"]
+    assert dispatch["messages"] is payload["messages"]
+    assert dispatch["tools"] is payload["tools"]
+    prepared = admitted_request.get("moa_prepared_request")
+    if prepared is not None:
+        assert dispatch["_moa_prepared_request"] is prepared
+
+
 def test_real_compression_admission_dispatches_exact_finalized_payload():
     agent, compressor = _agent()
-    admitted, middleware_calls = [], []
+    admitted, admitted_snapshots, middleware_calls = [], [], []
     events = []
 
     result = _run(
         agent, [_response()], admitted=admitted,
+        admitted_snapshots=admitted_snapshots,
         middleware_calls=middleware_calls, boundary_events=events,
     )
 
@@ -193,52 +222,64 @@ def test_real_compression_admission_dispatches_exact_finalized_payload():
     dispatch_index = next(i for i, event in enumerate(events) if event[0] == "dispatch")
     admission_index = max(
         i for i, event in enumerate(events[:dispatch_index])
-        if event[0] == "middleware" and event[1] == admitted[0]
+        if event[0] == "middleware"
+        and event[1] == admitted_snapshots[0]["payload"]
     )
     assert [event[0] for event in events[admission_index:dispatch_index + 1]] == [
         "middleware", "dispatch",
     ]
-    assert agent.client.chat.completions.create.call_args.kwargs == admitted[0]
-    assert admitted[0]["extra_headers"]["x-proof-middleware"] == "applied"
-    assert sum("duplicate human content" in str(row) for row in admitted[0]["messages"]) == 1
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    _assert_dispatch_uses_admission(dispatch, admitted[0], admitted_snapshots[0])
+    assert dispatch["extra_headers"]["x-proof-middleware"] == "applied"
+    assert sum("duplicate human content" in str(row) for row in dispatch["messages"]) == 1
     assert all("_compression_turn_anchor" not in row for row in result["messages"])
     assert "_admitted_provider_request" not in vars(agent)
 
 
 def test_same_provider_retry_reuses_admitted_bytes_verbatim():
     agent, _ = _agent()
-    admitted, middleware_calls = [], []
+    admitted, admitted_snapshots, middleware_calls = [], [], []
     events = []
 
     result = _run(
-        agent, [_response(invalid=True), _response()],
-        admitted=admitted, middleware_calls=middleware_calls, boundary_events=events,
+        agent, [_response(invalid=True), _response()], admitted=admitted,
+        admitted_snapshots=admitted_snapshots,
+        middleware_calls=middleware_calls, boundary_events=events,
     )
 
     assert result["completed"] is True
     calls = agent.client.chat.completions.create.call_args_list
     assert len(calls) == 2
-    assert calls[0].kwargs == calls[1].kwargs == admitted[0]
-    dispatch_indexes = [i for i, event in enumerate(events) if event[0] == "dispatch"]
-    assert [event[0] for event in events[dispatch_indexes[0]:dispatch_indexes[1] + 1]] == [
-        "dispatch", "dispatch",
-    ]
+    _assert_dispatch_uses_admission(
+        calls[0].kwargs, admitted[0], admitted_snapshots[0]
+    )
+    _assert_dispatch_uses_admission(
+        calls[1].kwargs, admitted[0], admitted_snapshots[0]
+    )
+    assert calls[0].kwargs == calls[1].kwargs
+    assert calls[0].kwargs["messages"] is calls[1].kwargs["messages"]
+    assert calls[0].kwargs["tools"] is calls[1].kwargs["tools"]
 
 
 def test_tool_iteration_cannot_consume_stale_admission():
     agent, _ = _agent()
-    admitted, middleware_calls = [], []
+    admitted, admitted_snapshots, middleware_calls = [], [], []
 
     result = _run(
-        agent, [_response(tool=True), _response()],
-        admitted=admitted, middleware_calls=middleware_calls,
+        agent, [_response(tool=True), _response()], admitted=admitted,
+        admitted_snapshots=admitted_snapshots, middleware_calls=middleware_calls,
     )
 
     assert result["completed"] is True
     calls = agent.client.chat.completions.create.call_args_list
-    assert calls[0].kwargs == admitted[0]
-    assert calls[1].kwargs != admitted[0]
+    _assert_dispatch_uses_admission(
+        calls[0].kwargs, admitted[0], admitted_snapshots[0]
+    )
+    assert calls[1].kwargs != admitted_snapshots[0]["payload"]
+    assert calls[1].kwargs["messages"] is not admitted[0]["payload"]["messages"]
+    assert calls[1].kwargs["tools"] is not admitted[0]["payload"]["tools"]
     assert calls[1].kwargs["messages"][-1]["role"] == "tool"
+    assert admitted[0] == admitted_snapshots[0]
     assert len(middleware_calls) == 5
     assert len(agent.context_compressor.compression_checks) == 5
     assert "_admitted_provider_request" not in vars(agent)

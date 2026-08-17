@@ -2804,6 +2804,24 @@ def run_conversation(
                 conversation_history = conversation_history_after_compression(
                     agent, messages, conversation_history
                 )
+                # Compression may take long enough for a user interrupt to
+                # arrive while it is running.  The loop-level interrupt check
+                # happened before this pass, so fence the newly admitted
+                # request at its source before any provider dispatch.  The
+                # compaction itself is already committed: keep its transcript
+                # and compressor state, and refund only the provider call that
+                # never happened.
+                if agent._interrupt_requested:
+                    interrupted = True
+                    _turn_exit_reason = "interrupted_by_user"
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
+                    if not agent.quiet_mode:
+                        agent._safe_print(
+                            "\n⚡ Breaking out of tool loop due to interrupt..."
+                        )
+                    break
                 if _should_skip_model_call_for_reference_handoff(
                     messages, user_message
                 ):

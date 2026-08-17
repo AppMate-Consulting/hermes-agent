@@ -2944,6 +2944,23 @@ def compress_context(
                 continue
         return copied
 
+    # Selector and compressor attempt state share the same object.  Snapshot
+    # selector-owned copyable values at the actual transaction boundary,
+    # before ``compress()`` can mutate attempt counters or diagnostics.  A
+    # later policy rejection may first perform the targeted compressor
+    # rollback and then the general uncommitted-input rollback; both must
+    # restore the same pre-attempt values rather than resurrecting a
+    # speculative post-compress snapshot.  Opaque clients and locks remain
+    # excluded by ``_copyable_selector_values``.
+    try:
+        _selector_values = vars(agent.context_compressor)
+        _selector_state_snapshot = (
+            set(_selector_values),
+            _copyable_selector_values(_selector_values),
+        )
+    except TypeError:
+        _selector_state_snapshot = (set(), {})
+
     def _restore_selector_state() -> None:
         """Undo selector-owned mutations when candidate admission aborts."""
         nonlocal _selector_state_snapshot
@@ -4255,17 +4272,13 @@ def compress_context(
         # head.  In that case publish one complete before/contract/after
         # sequence ahead of the byte-exact suffix so restart/replay retains the
         # task without misclassifying the completion notification as human.
-        from agent.context_compressor import ContextCompressor
-
         # Human authority and text-contract serializability are deliberately
         # different predicates.  A multimodal human turn cannot be serialized
         # as the text-only trusted contract, but it is still the newest task
         # authority and must suppress restoration from the compressed head.
-        suffix_has_task = bool(_protected_tail_snapshot) and (
-            any(_is_real_user_message(row) for row in _protected_tail_snapshot)
-            or ContextCompressor._active_task_contract(
-                _protected_tail_snapshot
-            ) is not None
+        suffix_has_task = (
+            bool(_protected_tail_snapshot)
+            and _latest_active_human_task_row(_protected_tail_snapshot) is not None
         )
         if not suffix_has_task:
             _refresh_active_task_contract(
@@ -4409,14 +4422,6 @@ def compress_context(
             and 0 <= _candidate_turn_idx < len(compressed)
             else None
         )
-        try:
-            _selector_values = vars(agent.context_compressor)
-            _selector_state_snapshot = (
-                set(_selector_values),
-                _copyable_selector_values(_selector_values),
-            )
-        except TypeError:
-            _selector_state_snapshot = (set(), {})
         _finalized_out = finalize_provider_request(
             agent,
             compressed,

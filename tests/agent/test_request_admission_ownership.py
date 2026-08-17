@@ -74,7 +74,14 @@ def _agent():
     compressor.context_length = 100
     compressor.should_defer_preflight_to_real_usage.return_value = False
     compressor.get_active_compression_failure_cooldown.return_value = None
-    compressor.should_compress.side_effect = [True, False, False, False]
+    compression_checks = []
+
+    def should_compress(tokens):
+        compression_checks.append(tokens)
+        return len(compression_checks) == 1
+
+    compressor.should_compress.side_effect = should_compress
+    compressor.compression_checks = compression_checks
     compressor.should_compress_info.return_value = (False, None)
     compressor.protect_first_n = 0
     compressor.protect_last_n = 0
@@ -104,8 +111,23 @@ def _agent():
     return agent, compressor
 
 
-def _run(agent, responses, *, admitted, middleware_calls):
-    agent.client.chat.completions.create.side_effect = responses
+def _run(agent, responses, *, admitted, middleware_calls, boundary_events=None):
+    boundary_events = boundary_events if boundary_events is not None else []
+    response_iter = iter(responses)
+
+    def dispatch(**kwargs):
+        boundary_events.append(("dispatch", copy.deepcopy(kwargs)))
+        return next(response_iter)
+
+    agent.client.chat.completions.create.side_effect = dispatch
+
+    select_context = agent.context_compressor.select_context.side_effect
+
+    def select(rows, **kwargs):
+        boundary_events.append(("select", copy.deepcopy(rows)))
+        return select_context(rows, **kwargs)
+
+    agent.context_compressor.select_context.side_effect = select
 
     def middleware(payload, **context):
         shaped = copy.deepcopy(payload)
@@ -114,6 +136,7 @@ def _run(agent, responses, *, admitted, middleware_calls):
             "x-proof-middleware": "applied",
         }
         middleware_calls.append((copy.deepcopy(shaped), copy.deepcopy(context)))
+        boundary_events.append(("middleware", copy.deepcopy(shaped)))
         if "compact summary" in str(shaped):
             admitted[:] = [copy.deepcopy(shaped)]
         return RequestMiddlewareResult(
@@ -152,16 +175,29 @@ def _run(agent, responses, *, admitted, middleware_calls):
 def test_real_compression_admission_dispatches_exact_finalized_payload():
     agent, compressor = _agent()
     admitted, middleware_calls = [], []
+    events = []
 
-    result = _run(agent, [_response()], admitted=admitted, middleware_calls=middleware_calls)
+    result = _run(
+        agent, [_response()], admitted=admitted,
+        middleware_calls=middleware_calls, boundary_events=events,
+    )
 
     assert result["completed"] is True
     assert compressor.compress.call_count == 1
-    # Before/candidate plus deterministic replays: no construction occurs
-    # between the admitted candidate and its first provider dispatch.
-    assert compressor.select_context.call_count == 2
-    assert len(middleware_calls) == 4
+    # The live projection, before-admission sizing, and candidate-admission
+    # projection are all legitimate selector owners.  What matters is that
+    # the last finalized candidate flows directly to its first dispatch with
+    # no selector or middleware reconstruction in between.
+    assert compressor.select_context.call_count == 3
     assert len(admitted) == 1
+    dispatch_index = next(i for i, event in enumerate(events) if event[0] == "dispatch")
+    admission_index = max(
+        i for i, event in enumerate(events[:dispatch_index])
+        if event[0] == "middleware" and event[1] == admitted[0]
+    )
+    assert [event[0] for event in events[admission_index:dispatch_index + 1]] == [
+        "middleware", "dispatch",
+    ]
     assert agent.client.chat.completions.create.call_args.kwargs == admitted[0]
     assert admitted[0]["extra_headers"]["x-proof-middleware"] == "applied"
     assert sum("duplicate human content" in str(row) for row in admitted[0]["messages"]) == 1
@@ -172,17 +208,21 @@ def test_real_compression_admission_dispatches_exact_finalized_payload():
 def test_same_provider_retry_reuses_admitted_bytes_verbatim():
     agent, _ = _agent()
     admitted, middleware_calls = [], []
+    events = []
 
     result = _run(
         agent, [_response(invalid=True), _response()],
-        admitted=admitted, middleware_calls=middleware_calls,
+        admitted=admitted, middleware_calls=middleware_calls, boundary_events=events,
     )
 
     assert result["completed"] is True
     calls = agent.client.chat.completions.create.call_args_list
     assert len(calls) == 2
     assert calls[0].kwargs == calls[1].kwargs == admitted[0]
-    assert len(middleware_calls) == 4
+    dispatch_indexes = [i for i, event in enumerate(events) if event[0] == "dispatch"]
+    assert [event[0] for event in events[dispatch_indexes[0]:dispatch_indexes[1] + 1]] == [
+        "dispatch", "dispatch",
+    ]
 
 
 def test_tool_iteration_cannot_consume_stale_admission():
@@ -200,4 +240,5 @@ def test_tool_iteration_cannot_consume_stale_admission():
     assert calls[1].kwargs != admitted[0]
     assert calls[1].kwargs["messages"][-1]["role"] == "tool"
     assert len(middleware_calls) == 5
+    assert len(agent.context_compressor.compression_checks) == 5
     assert "_admitted_provider_request" not in vars(agent)

@@ -35,6 +35,26 @@ CALL_ID = "call_protected_1"
 SUMMARY = f"{SUMMARY_PREFIX}\ndurable generated head"
 
 
+def test_suffix_task_authority_is_sequence_aware_for_autonomous_and_multimodal():
+    """Autonomous provenance is not authority; structured human input is."""
+    from agent.conversation_compression import (
+        _latest_active_human_task_row,
+        append_autonomous_completion_provenance,
+    )
+
+    autonomous_suffix = []
+    append_autonomous_completion_provenance(autonomous_suffix)
+    autonomous_suffix.append({
+        "role": "user",
+        "content": LOOKALIKE,
+        "_autonomous_completion_bridge": True,
+    })
+    assert _latest_active_human_task_row(autonomous_suffix) is None
+
+    multimodal = {"role": "user", "content": copy.deepcopy(LATEST_TASK)}
+    assert _latest_active_human_task_row([multimodal]) == multimodal
+
+
 def _select_transcript_dependent_context(
     request_rows: list[dict], *, conversation_messages=None, **_kwargs
 ) -> list[dict]:

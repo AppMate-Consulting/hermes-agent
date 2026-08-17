@@ -188,6 +188,83 @@ def _assert_success(db, parent, source, agent, caller_history, seen, publish):
 
 
 @pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "rotation"])
+def test_autonomous_only_suffix_restores_task_contract_across_restart(
+    tmp_path: Path, in_place: bool
+):
+    """A /compress here 1 boundary keeps provenance and the prior human task."""
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
+    from hermes_cli.partial_compress import split_history_for_partial_compress
+
+    path = tmp_path / "autonomous-replay.db"
+    db = SessionDB(db_path=path)
+    sid = "AUTONOMOUS_ONLY_SUFFIX"
+    db.create_session(sid, source="cli", model="test/model")
+    db.append_message(sid, "user", OLD_TASK)
+    db.append_message(sid, "assistant", "old answer " + "bulk " * 1200)
+    db.append_message(sid, "user", "LATEST GENUINE HUMAN TASK")
+    db.append_message(sid, "assistant", "work completed")
+    db.append_message(
+        sid, "user", AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        autonomous_completion_provenance=True,
+    )
+    db.append_message(
+        sid, "assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        autonomous_completion_provenance=True,
+    )
+    db.append_message(
+        sid, "user", LOOKALIKE, display_kind="async_delegation_complete",
+        autonomous_completion_provenance=True,
+    )
+    db.append_message(sid, "assistant", "completion consumed")
+    source = db.get_messages_as_conversation(sid)
+    head, tail = split_history_for_partial_compress(source, 1)
+    assert head == source[:4]
+    assert tail == source[4:]
+
+    seen: list[list[dict]] = []
+    agent = _agent(db, sid, in_place=in_place, seen=seen)
+    with patch(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        side_effect=[100_000, 1_000],
+    ):
+        published, _ = agent._compress_context(
+            source, None, approx_tokens=100_000, force=True,
+            protected_tail=tail,
+        )
+    active_id = agent.session_id
+    assert published[-len(tail):] == tail
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    replay = reopened.get_messages_as_conversation(active_id)
+    assert replay[-len(tail):] == tail
+    completion_index = len(replay) - 2
+    assert ContextCompressor._completion_has_durable_provenance(
+        replay, completion_index
+    )
+    assert ContextCompressor._latest_user_task_snapshot(replay) is not None
+    contract_indexes = [
+        i for i, row in enumerate(replay)
+        if row.get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+    ]
+    assert len(contract_indexes) == 1
+    before = contract_indexes[0]
+    assert replay[before + 2]["content"] == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
+    contract = ContextCompressor.parse_active_task_contract(
+        replay[before + 1], allow_projected=True
+    )
+    assert contract is not None
+    assert contract["content"] == "LATEST GENUINE HUMAN TASK"
+    reopened.close()
+
+
+@pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "rotation"])
 def test_cli_manual_compress_real_sessiondb_partial_matrix(durable_case, in_place):
     """HermesCLI._manual_compress publishes one exact head+suffix transcript."""
     from cli import HermesCLI

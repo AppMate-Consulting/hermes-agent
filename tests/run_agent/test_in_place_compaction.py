@@ -358,6 +358,41 @@ class TestInPlaceCompaction:
             assert model_config["marker"] == "kept"
             assert row["system_prompt"] == "prompt-after"
 
+    def test_archive_and_compact_replaces_hashed_prompt_across_restart(self):
+        """Compaction atomically replaces modern prompt storage and its hash."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=path)
+            sid = "hashed_prompt_boundary"
+            _seed(db, sid, "hashed", n=2)
+            db.update_system_prompt(sid, "prompt-before")
+            old_hash = db._conn.execute(
+                "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()[0]
+
+            db.archive_and_compact(
+                sid,
+                [{"role": "user", "content": "durable summary"}],
+                system_prompt="prompt-after",
+            )
+            db.close()
+
+            reopened = SessionDB(db_path=path)
+            row = reopened.get_session(sid)
+            stored = reopened._conn.execute(
+                "SELECT system_prompt_hash, system_prompt FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+            assert row["system_prompt"] == "prompt-after"
+            assert stored[0] != old_hash
+            assert stored[1] is None
+            assert reopened._conn.execute(
+                "SELECT 1 FROM system_prompts WHERE hash = ?", (old_hash,)
+            ).fetchone() is None
+            reopened.close()
+
     def test_archive_and_compact_failure_rolls_back_every_boundary_field(self):
         """A failure after archiving starts leaves no partially published state."""
         from hermes_state import SessionDB

@@ -78,6 +78,35 @@ def test_compress_here_reappends_verbatim_tail(capsys):
     assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
 
 
+def test_compress_here_one_keeps_trusted_completion_sequence_whole():
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
+    from hermes_cli.partial_compress import split_history_for_partial_compress
+
+    history = _make_history() + [
+        {
+            "role": "user", "content": AUTONOMOUS_COMPLETION_BRIDGE_USER,
+            "_autonomous_completion_bridge": True,
+        },
+        {
+            "role": "assistant", "content": AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+            "_autonomous_completion_bridge": True,
+        },
+        {
+            "role": "user", "content": "[ASYNC DELEGATION COMPLETE child=x]",
+            "_autonomous_completion_bridge": True,
+        },
+        {"role": "assistant", "content": "consumed"},
+    ]
+
+    head, tail = split_history_for_partial_compress(history, 1)
+
+    assert head == history[:-4]
+    assert tail == history[-4:]
+
+
 def test_compress_here_banner_mentions_summarizing_up_to_here(capsys):
     shell = _make_cli()
     history = _make_history()

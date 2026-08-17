@@ -9799,6 +9799,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         f"Compression transcript changed before publication: {session_id}"
                     )
             patched_model_config = None
+            system_prompt_hash = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
                 # against a vanished session row (the compressor's caller
@@ -9806,6 +9807,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # no-op), unlike the flag setters which tolerate missing rows.
                 patched_model_config = self._merge_model_config_json(
                     conn, session_id, model_config_patch, on_missing="raise"
+                )
+            if system_prompt is not None:
+                system_prompt_hash = self._store_system_prompt(
+                    conn, _scrub_surrogates(system_prompt)
                 )
 
             # Soft-archive the live turns: active=0 hides them from the live
@@ -9836,13 +9841,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     assignments.append("model_config = ?")
                     values.append(patched_model_config)
                 if system_prompt is not None:
-                    assignments.append("system_prompt = ?")
-                    values.append(_scrub_surrogates(system_prompt))
+                    assignments.extend(
+                        ["system_prompt_hash = ?", "system_prompt = NULL"]
+                    )
+                    values.append(system_prompt_hash)
                 values.append(session_id)
                 conn.execute(
                     f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
                     values,
                 )
+                if system_prompt is not None:
+                    self._delete_unreferenced_system_prompts(conn)
             return inserted
 
         return self._execute_write(_do)

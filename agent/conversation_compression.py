@@ -4195,16 +4195,28 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
-        # Full compression must restore the latest human/active-task contract
-        # when an engine omitted it.  Partial compression is different: the
-        # protected suffix is already the authoritative latest contract.  A
-        # head-only restoration would either resurrect an older head task or,
-        # if pointed at the whole transcript, duplicate a protected task into
-        # generated output.  Leave generated-head repair to the seam validator
-        # and preserve the suffix as the sole latest-human evidence.
-        if not _protected_tail_snapshot:
-            _refresh_active_task_contract(_compression_head_snapshot, compressed)
-            _ensure_compressed_has_user_turn(_compression_head_snapshot, compressed)
+        # Restore from the complete authoritative snapshot unless the exact
+        # protected suffix already carries a newer genuine human task (or a
+        # complete trusted task contract).  A suffix made solely of autonomous
+        # runtime traffic does not supersede the human task summarized in the
+        # head.  In that case publish one complete before/contract/after
+        # sequence ahead of the byte-exact suffix so restart/replay retains the
+        # task without misclassifying the completion notification as human.
+        from agent.context_compressor import ContextCompressor
+
+        suffix_has_task = bool(
+            _protected_tail_snapshot
+            and ContextCompressor._active_task_contract(
+                _protected_tail_snapshot
+            ) is not None
+        )
+        if not suffix_has_task:
+            _refresh_active_task_contract(
+                _authoritative_pre_compression_snapshot, compressed
+            )
+            _ensure_compressed_has_user_turn(
+                _authoritative_pre_compression_snapshot, compressed
+            )
         if _protected_tail_snapshot:
             # The protected suffix is appended byte-for-byte before admission
             # and before the sole SessionDB publication.  Never run sequence

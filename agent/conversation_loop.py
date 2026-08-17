@@ -1249,9 +1249,9 @@ def project_provider_request(
     the transcript, prefill rows, nor registry schemas can be mutated.
     """
     api_messages = []
-    source_messages = [
-        msg
-        for msg in (messages or [])
+    indexed_source_messages = [
+        (source_idx, msg)
+        for source_idx, msg in enumerate(messages or [])
         if not (
             msg.get("display_kind") == "hidden"
             and msg.get("role") == "assistant"
@@ -1262,11 +1262,12 @@ def project_provider_request(
             )
         )
     ]
-    for idx, msg in enumerate(source_messages):
+    source_messages = [msg for _, msg in indexed_source_messages]
+    for source_idx, msg in indexed_source_messages:
         api_msg = _project_provider_history_message(
             agent, msg, model=sanitize_model
         )
-        if idx == current_turn_user_idx and msg.get("role") == "user":
+        if source_idx == current_turn_user_idx and msg.get("role") == "user":
             api_content = msg.get("api_content")
             if isinstance(api_content, str) and api_content:
                 api_msg["content"] = api_content

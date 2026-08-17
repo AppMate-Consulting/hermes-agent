@@ -3,6 +3,7 @@
 import copy
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -96,6 +97,360 @@ def test_provider_visible_reclaim_control_is_admitted(monkeypatch):
 
     assert returned != _messages()
     assert agent._last_compression_outcome == "committed_in_memory"
+
+
+def test_rebuilt_system_growth_outweighs_real_message_shrink():
+    """Admission sizes the complete request, including prompt and tool schema."""
+    compressor = MagicMock()
+    original = [{"role": "user", "content": "old " * 20_000}]
+    compressor.compress.return_value = [{"role": "user", "content": "small"}]
+    _configure_engine_state(compressor)
+    agent = _make_agent(MagicMock(), compressor)
+    agent._cached_system_prompt = "old system"
+    agent._cached_system_prompt_static = "old"
+    agent._build_system_prompt = lambda _message: "grown " * 100_000
+    agent.tools = [{
+        "type": "function",
+        "function": {
+            "name": "large_schema",
+            "description": "schema " * 5_000,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    tools_before = copy.deepcopy(agent.tools)
+
+    returned, prompt = agent._compress_context(
+        original, "sys", approx_tokens=100_000, force=True
+    )
+
+    assert returned is original
+    assert prompt == "old system"
+    assert agent._last_compression_outcome == "rejected_would_grow"
+    assert agent._cached_system_prompt == "old system"
+    assert agent._cached_system_prompt_static == "old"
+    assert agent.tools == tools_before
+
+
+def test_projection_preserves_current_turn_identity_after_interrupt_ghost():
+    """Filtering a hidden interrupt row must not shift the caller's index."""
+    from agent.conversation_loop import project_provider_request
+
+    compressor = MagicMock()
+    _configure_engine_state(compressor)
+    agent = _make_agent(None, compressor)
+    rows = [
+        {"role": "user", "content": "historical"},
+        {
+            "role": "assistant",
+            "content": "[This response was interrupted by a user correction.]",
+            "display_kind": "hidden",
+        },
+        {"role": "user", "content": "current"},
+    ]
+
+    projected = project_provider_request(
+        agent,
+        rows,
+        current_turn_user_idx=2,
+        external_prefetch="fresh recall",
+        apply_context_selection=False,
+    )["messages"]
+
+    assert not any(
+        row.get("content") == "[This response was interrupted by a user correction.]"
+        for row in projected
+    )
+    users = [row["content"] for row in projected if row["role"] == "user"]
+    assert users[0] == "historical"
+    assert "fresh recall" not in users[0]
+    assert users[1].startswith("current") and "fresh recall" in users[1]
+
+
+@pytest.mark.parametrize("mode", ["codex", "anthropic-native"])
+def test_complete_projection_matches_live_send_and_is_non_mutating(
+    monkeypatch, mode
+):
+    """run_conversation consumes the canonical complete request verbatim."""
+    from agent.conversation_loop import project_provider_request
+
+    compressor = MagicMock()
+    _configure_engine_state(compressor)
+    agent = _make_agent(None, compressor)
+    agent.compression_enabled = False
+    agent._cached_system_prompt = "stable system"
+    agent.ephemeral_system_prompt = "ephemeral system"
+    agent.prefill_messages = [{"role": "assistant", "content": " prefill "}]
+    agent.provider = "anthropic" if mode == "anthropic-native" else "openrouter"
+    agent.api_mode = "chat_completions"
+    agent._use_prompt_caching = mode == "anthropic-native"
+    agent._use_native_cache_layout = mode == "anthropic-native"
+    agent._cache_ttl = "5m"
+    agent._direct_native_anthropic_tool_cache_capability = (
+        lambda: mode == "anthropic-native"
+    )
+    agent._should_sanitize_tool_calls = lambda: True
+    agent.tools = [{
+        "type": "function",
+        "function": {
+            "name": "demo",
+            "description": "immutable schema",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    history = [
+        {"role": "tool", "tool_call_id": "orphan", "content": "drop orphan"},
+        {"role": "user", "content": "display old", "api_content": " wire old ",
+         "display_metadata": {"private": "never sent"}},
+        {"role": "assistant", "content": "calling", "reasoning": "thought",
+         "reasoning_details": [{"type": "text", "text": "detail"}],
+         "tool_calls": [{"id": "c1", "type": "function", "function": {
+             "name": "demo", "arguments": " { \"x\" : 1 } "}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": " result "},
+    ]
+    before = copy.deepcopy((
+        history, agent.prefill_messages, agent.tools,
+        agent._cached_system_prompt,
+        getattr(agent, "_cached_system_prompt_static", None),
+    ))
+    sent = {}
+
+    def create(**kwargs):
+        sent.update(copy.deepcopy(kwargs))
+        message = SimpleNamespace(
+            content="done", tool_calls=None, reasoning_content=None, reasoning=None
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            model=agent.model,
+            usage=None,
+        )
+
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = create
+    agent.run_conversation(" current ", conversation_history=history)
+    live_rows = history + [{"role": "user", "content": " current "}]
+    expected = project_provider_request(
+        agent,
+        live_rows,
+        system_prompt="stable system",
+        tools=agent.tools,
+        current_turn_user_idx=len(history),
+        apply_context_selection=True,
+        incoming_message=live_rows[-1],
+    )
+
+    assert sent["messages"] == expected["messages"]
+    assert sent["tools"] == expected["tools"]
+    assert (
+        history, agent.prefill_messages, agent.tools,
+        agent._cached_system_prompt,
+        getattr(agent, "_cached_system_prompt_static", None),
+    ) == before
+    assert compressor.select_context.call_count >= 2
+
+
+def test_in_memory_publication_cancel_and_claim_are_linearized(monkeypatch):
+    """The production seam deterministically proves both sides of the race."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    for cancellation_wins in (True, False):
+        compressor = MagicMock()
+        compressor.compress.return_value = [
+            {"role": "user", "content": "small committed candidate"}
+        ]
+        _configure_engine_state(compressor)
+        compressor._session_id = "test-session"
+        compressor._proactive_prune_rearm_tokens = 77
+        agent = _make_agent(None, compressor)
+        agent._cached_system_prompt = "old prompt"
+        agent._cached_system_prompt_static = "old static"
+        agent._persist_user_message_idx = 4
+        agent._persist_user_message_override = {"identity": [1]}
+        agent.commit_memory_session = MagicMock()
+        agent.event_callback = MagicMock()
+        original = _messages()
+        snapshot = copy.deepcopy(original)
+        fence = CompressionCommitFence()
+        barrier_entered = threading.Event()
+        release = threading.Event()
+        result = []
+
+        def barrier():
+            barrier_entered.set()
+            assert release.wait(2)
+
+        agent._before_in_memory_compression_publication = barrier
+        estimates = iter((100_000, 1_000))
+        monkeypatch.setattr(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            lambda *_a, **_k: next(estimates),
+        )
+        worker = threading.Thread(target=lambda: result.append(
+            agent._compress_context(
+                original, "sys", approx_tokens=100_000, force=True,
+                commit_fence=fence,
+            )
+        ))
+        worker.start()
+        assert barrier_entered.wait(1)
+        if cancellation_wins:
+            assert fence.cancel_before_commit() is True
+        else:
+            assert fence.claim_caller_publication() is True
+            assert fence.cancel_before_commit() is False
+        release.set()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert fence.commit_in_flight is False
+
+        if cancellation_wins:
+            assert result[0][0] is original and original == snapshot
+            assert agent._last_compression_outcome == "cancelled_commit_fence"
+            assert agent._cached_system_prompt == "old prompt"
+            assert agent._cached_system_prompt_static == "old static"
+            assert agent._persist_user_message_idx == 4
+            assert agent._persist_user_message_override == {"identity": [1]}
+            assert compressor._session_id == "test-session"
+            assert compressor._proactive_prune_rearm_tokens == 77
+            agent.commit_memory_session.assert_not_called()
+            agent.event_callback.assert_not_called()
+        else:
+            assert result[0][0][0]["content"] == "small committed candidate"
+            assert agent._last_compression_outcome == "committed_in_memory"
+
+
+def test_in_memory_exception_after_claim_restores_all_shared_state(monkeypatch):
+    """A failure at the first claimed outcome publication is transactional."""
+    import agent.conversation_compression as compression
+    from agent.conversation_compression import CompressionCommitFence
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "small"}]
+    _configure_engine_state(compressor)
+    compressor._session_id = "test-session"
+    compressor._proactive_prune_rearm_tokens = 91
+    agent = _make_agent(None, compressor)
+    agent._cached_system_prompt = "old prompt"
+    agent._cached_system_prompt_static = "old static"
+    agent._persist_user_message_idx = 5
+    agent._persist_user_message_override = {"cursor": [2]}
+    agent.commit_memory_session = MagicMock()
+    agent.event_callback = MagicMock()
+    original = _messages()
+    original_copy = copy.deepcopy(original)
+    fence = CompressionCommitFence()
+    real_publish = compression._publish_compression_outcome
+
+    def fail_first_publication(target, value, **kwargs):
+        if value == "committed_in_memory":
+            raise RuntimeError("injected after publication claim")
+        return real_publish(target, value, **kwargs)
+
+    monkeypatch.setattr(compression, "_publish_compression_outcome", fail_first_publication)
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        compression, "estimate_request_tokens_rough",
+        lambda *_a, **_k: next(estimates),
+    )
+
+    with pytest.raises(RuntimeError, match="injected after publication claim"):
+        agent._compress_context(
+            original, "sys", 100_000, force=True, commit_fence=fence
+        )
+
+    assert original == original_copy
+    assert agent._cached_system_prompt == "old prompt"
+    assert agent._cached_system_prompt_static == "old static"
+    assert agent._persist_user_message_idx == 5
+    assert agent._persist_user_message_override == {"cursor": [2]}
+    assert compressor._session_id == "test-session"
+    assert compressor._proactive_prune_rearm_tokens == 91
+    assert fence.commit_in_flight is False
+    agent.commit_memory_session.assert_not_called()
+    agent.event_callback.assert_not_called()
+
+
+def test_permanently_blocked_event_callback_is_bounded_and_fifo(
+    monkeypatch, tmp_path, request
+):
+    """A real durable publication returns while its event observer is wedged."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "blocked-event.db")
+    request.addfinalizer(db.close)
+    sid = "blocked-event-parent"
+    db.create_session(sid, "cli", model="test/model")
+    db.append_message(sid, "user", "durable " + "large " * 10_000)
+    compressor = MagicMock()
+    _configure_engine_state(compressor)
+    compressor.compress.side_effect = lambda *_a, **_k: [
+        {"role": "user", "content": "small child"}
+    ]
+    agent = _make_agent(None, compressor)
+    agent._session_db = db
+    agent.session_id = sid
+    agent.compression_in_place = False
+    first_entered = threading.Event()
+    release = threading.Event()
+    request.addfinalizer(release.set)
+    events = []
+
+    def commit_memory(rows, *, old_session_id):
+        events.append(("commit", old_session_id, copy.deepcopy(rows)))
+
+    def callback(_name, payload):
+        events.append(("enter", payload["old_session_id"], payload["session_id"]))
+        if not first_entered.is_set():
+            first_entered.set()
+            assert release.wait(5)
+        events.append(("exit", payload["old_session_id"], payload["session_id"]))
+
+    agent.event_callback = callback
+    agent.commit_memory_session = commit_memory
+    monkeypatch.setattr(
+        "agent.conversation_compression._POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.03
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda messages, **_k: 100_000 if any(
+            "large" in str(row.get("content", "")) for row in messages
+        ) else 1_000,
+    )
+
+    first, _ = agent._compress_context(
+        db.get_messages_as_conversation(sid), "sys", 100_000, force=True
+    )
+    child_b = agent.session_id
+    assert child_b != sid and first_entered.is_set()
+    assert db.get_compression_lock_holder(sid) is None
+    assert agent._last_compression_outcome == "committed_materially_shrunk"
+
+    # Grow only the provider-visible child input so a second real rotation is admitted.
+    second_input = copy.deepcopy(first)
+    second_input[0]["content"] += " next " * 10_000
+    second, _ = agent._compress_context(
+        second_input, "sys", 100_000, force=True
+    )
+    child_c = agent.session_id
+    assert child_c not in (sid, child_b)
+    assert [entry[:2] for entry in events] == [
+        ("commit", sid), ("enter", sid)
+    ]
+    frozen_parent_a = copy.deepcopy(events[0][2])
+    assert db.get_compression_lock_holder(child_b) is None
+    assert second[0]["content"] == "small child"
+
+    release.set()
+    tail = agent._compression_observer_lane_tail
+    assert tail.wait(2)
+    assert [entry[:2] for entry in events] == [
+        ("commit", sid), ("enter", sid), ("exit", sid),
+        ("commit", child_b), ("enter", child_b), ("exit", child_b),
+    ]
+    assert events[0][2] == frozen_parent_a
+    assert events[3][2] == second_input
+    assert events[1][2] == child_b and events[4][2] == child_c
+    assert agent.event_callback is callback
 
 
 def test_on_pre_compress_runs_after_engine_and_does_not_influence_summary(monkeypatch):

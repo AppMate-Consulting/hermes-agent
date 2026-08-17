@@ -133,7 +133,7 @@ def test_rebuilt_system_growth_outweighs_real_message_shrink():
 
 def test_projection_preserves_current_turn_identity_after_interrupt_ghost():
     """Filtering a hidden interrupt row must not shift the caller's index."""
-    from agent.conversation_loop import project_provider_request
+    from agent.conversation_loop import _project_provider_request
 
     compressor = MagicMock()
     _configure_engine_state(compressor)
@@ -148,7 +148,7 @@ def test_projection_preserves_current_turn_identity_after_interrupt_ghost():
         {"role": "user", "content": "current"},
     ]
 
-    projected = project_provider_request(
+    projected = _project_provider_request(
         agent,
         rows,
         current_turn_user_idx=2,
@@ -173,7 +173,7 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
     monkeypatch, mode
 ):
     """run_conversation consumes the canonical complete request verbatim."""
-    from agent.conversation_loop import project_provider_request
+    from agent.conversation_loop import _project_provider_request
 
     compressor = MagicMock()
     _configure_engine_state(compressor)
@@ -231,7 +231,7 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
     agent.client.chat.completions.create.side_effect = create
     agent.run_conversation(" current ", conversation_history=history)
     live_rows = history + [{"role": "user", "content": " current "}]
-    expected = project_provider_request(
+    expected = _project_provider_request(
         agent,
         live_rows,
         system_prompt="stable system",

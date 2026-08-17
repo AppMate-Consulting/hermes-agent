@@ -1225,7 +1225,7 @@ def _project_provider_history_message(agent, msg, *, model=None):
     return api_msg
 
 
-def project_provider_request(
+def _project_provider_request(
     agent,
     messages,
     *,
@@ -1370,23 +1370,56 @@ def project_provider_request(
 
 def finalize_provider_request(
     agent,
-    projected_request: Dict[str, Any],
+    messages,
     *,
     system_message: str = "",
+    tools=None,
+    current_turn_user_idx: Optional[int] = None,
+    external_prefetch: Any = None,
+    plugin_user_context: Any = None,
+    prefill_messages: Optional[List[Dict[str, Any]]] = None,
+    incoming_message: Optional[Dict[str, Any]] = None,
+    sanitize_model: Optional[str] = None,
+    current_turn_suffix: Optional[str] = None,
+    static_system_prefix: Any = _PROVIDER_REQUEST_UNSET,
+    _frozen_projection: Optional[Dict[str, Any]] = None,
     moa_prepared_request: Any = None,
     middleware_context: Optional[Dict[str, Any]] = None,
     consume_user_initiator: bool = False,
 ) -> Dict[str, Any]:
     """Construct the sole provider-wire request consumed by dispatch/admission.
 
-    The input projection is privately cloned.  Every deterministic,
+    Durable/current transcript rows and frozen turn inputs are projected here;
+    callers cannot omit context selection or another model-visible stage.
+    Every deterministic,
     model-visible send-path transformation is completed here: provider
     reasoning echo, cache redecoration, API-mode kwargs shaping, Unicode
     normalization, Responses transport preflight, and request middleware.
     Callers must dispatch ``payload`` verbatim.
     """
-    api_messages = copy.deepcopy(projected_request.get("messages") or [])
-    tools_for_api = copy.deepcopy(projected_request.get("tools") or [])
+    # Live dispatch may freeze the projection once before pressure checks and
+    # MoA preparation. This private handoff is not a public stage-selection
+    # switch: admission and all external callers always build from transcript.
+    projected_request = (
+        copy.deepcopy(_frozen_projection)
+        if _frozen_projection is not None
+        else _project_provider_request(
+            agent,
+            messages,
+            system_prompt=system_message,
+            tools=tools,
+            current_turn_user_idx=current_turn_user_idx,
+            external_prefetch=external_prefetch,
+            plugin_user_context=plugin_user_context,
+            prefill_messages=prefill_messages,
+            incoming_message=incoming_message,
+            sanitize_model=sanitize_model,
+            current_turn_suffix=current_turn_suffix,
+            static_system_prefix=static_system_prefix,
+        )
+    )
+    api_messages = projected_request["messages"]
+    tools_for_api = projected_request["tools"]
     agent._reapply_reasoning_echo_for_provider(api_messages)
     api_messages, moa_prepared_request, tools_for_api = (
         _redecorate_prompt_cache_for_provider(
@@ -1421,6 +1454,7 @@ def finalize_provider_request(
         payload["extra_headers"] = headers
         agent._is_user_initiated_turn = False
     middleware_trace = []
+    middleware_error = None
     original_payload = copy.deepcopy(payload)
     if middleware_context is not None:
         try:
@@ -1430,8 +1464,11 @@ def finalize_provider_request(
             payload = mw.payload
             original_payload = mw.original_payload
             middleware_trace = list(mw.trace)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Live behavior remains best-effort. Admission inspects this field
+            # and fails closed because it cannot compare a body whose normal
+            # middleware shaping was unavailable.
+            middleware_error = f"{type(exc).__name__}: {exc}"
     return {
         "payload": payload,
         "messages": api_messages,
@@ -1439,6 +1476,7 @@ def finalize_provider_request(
         "moa_prepared_request": moa_prepared_request,
         "original_payload": original_payload,
         "middleware_trace": middleware_trace,
+        "middleware_error": middleware_error,
     }
 
 
@@ -2307,7 +2345,7 @@ def run_conversation(
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
 
-                api_messages = project_provider_request(
+                api_messages = _project_provider_request(
                     agent,
                     messages,
                     system_prompt=effective_system,
@@ -2356,7 +2394,7 @@ def run_conversation(
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        _provider_request = project_provider_request(
+        _provider_request = _project_provider_request(
             agent,
             messages,
             system_prompt=effective_system,
@@ -2733,8 +2771,16 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 _finalized_request = finalize_provider_request(
                     agent,
-                    {"messages": api_messages, "tools": tools_for_api},
-                    system_message=system_message or "",
+                    messages,
+                    system_message=effective_system,
+                    tools=agent.tools or [],
+                    current_turn_user_idx=current_turn_user_idx,
+                    external_prefetch=_ext_prefetch_cache,
+                    plugin_user_context=_plugin_user_context,
+                    incoming_message=_incoming,
+                    sanitize_model=_sanitize_model,
+                    current_turn_suffix=_moa_context,
+                    _frozen_projection=_provider_request,
                     moa_prepared_request=_moa_prepared_request,
                     middleware_context={
                         "task_id": effective_task_id,
@@ -2767,12 +2813,9 @@ def run_conversation(
                             request_messages = api_kwargs.get("input")
                         if not isinstance(request_messages, list):
                             request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
+                        # Observation hooks receive structural copies.  A hook
+                        # must never mutate the finalized object dispatched to
+                        # the provider after compression admission.
                         #
                         # The ``request_messages`` and ``conversation_history``
                         # kwargs below are pre-existing raw passthroughs
@@ -2783,7 +2826,9 @@ def run_conversation(
                         # ``api_kwargs`` is the same object passed to the
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                        _request_payload = copy.deepcopy(
+                            agent._api_request_payload_for_hook(api_kwargs)
+                        )
                         # Anthropic (``system``) and Responses/Codex
                         # (``instructions``) move the system prompt out of
                         # messages; pass it explicitly for observability
@@ -2797,8 +2842,8 @@ def run_conversation(
                             turn_id=turn_id,
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
+                            user_message=copy.deepcopy(original_user_message),
+                            conversation_history=copy.deepcopy(messages),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
@@ -2806,7 +2851,7 @@ def run_conversation(
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
                             retry_count=retry_count,
-                            request_messages=list(request_messages)
+                            request_messages=copy.deepcopy(request_messages)
                             if isinstance(request_messages, list)
                             else [],
                             system_prompt=system_prompt_for_hooks,

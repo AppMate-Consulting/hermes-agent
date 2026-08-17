@@ -77,6 +77,51 @@ from agent.session_activity import ActivityProvenance, normalize_activity_proven
 
 logger = logging.getLogger(__name__)
 
+
+def estimate_finalized_payload_tokens_rough(payload: Any) -> int:
+    """Estimate the complete finalized provider body without serializing blobs.
+
+    Every key and scalar in the post-preflight/post-middleware payload counts.
+    Bytes and data-URL bodies are charged by encoded length but never copied or
+    decoded, keeping admission stable and bounded for multimodal requests.
+    """
+    if not isinstance(payload, dict):
+        payload = {"body": payload}
+    messages = payload.get("messages") or payload.get("input") or []
+    tools = payload.get("tools") or None
+    total = estimate_request_tokens_rough(messages, tools=tools)
+    # The established estimator owns the large message/tool fields. Charge
+    # every other finalized field exactly once here.
+    remainder = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"messages", "input", "tools"}
+    }
+    chars = 0
+    stack = [remainder]
+    while stack:
+        value = stack.pop()
+        if value is None:
+            chars += 4
+        elif isinstance(value, bool):
+            chars += 4 if value else 5
+        elif isinstance(value, (int, float)):
+            chars += len(str(value))
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            chars += len(value)
+        elif isinstance(value, str):
+            chars += len(value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                chars += len(str(key)) + 3
+                stack.append(item)
+        elif isinstance(value, (list, tuple)):
+            chars += len(value) + 1
+            stack.extend(value)
+        else:
+            chars += len(repr(value))
+    return max(1, total + math.ceil(chars / 4))
+
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
 # agent.compression after cancel (otherwise timeout is unobservable). Observing
@@ -2636,7 +2681,11 @@ def finalize_context_engine_compression_notification(
     *,
     committed: bool,
 ) -> bool:
-    """Emit or discard a deferred notification; repeated calls are no-ops."""
+    """Claim one deferred record and queue committed work on the FIFO lane.
+
+    ``True`` means the record was claimed and queued, not that an arbitrary
+    observer completed within the bounded caller wait.
+    """
     lock = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION_LOCK, None)
     if lock is None:
         return False
@@ -2645,9 +2694,15 @@ def finalize_context_engine_compression_notification(
         pending = queue.popleft() if isinstance(queue, collections.deque) and queue else None
         if isinstance(queue, collections.deque) and not queue:
             setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
-    if not committed or not callable(pending):
+    if not callable(pending):
         return False
-    return bool(pending())
+    if not committed:
+        return False
+    frozen_session_id = str(getattr(agent, "session_id", None) or "")
+    _run_postcommit_callbacks_bounded(
+        agent, pending, session_id=frozen_session_id
+    )
+    return True
 
 
 def compress_context(
@@ -2761,11 +2816,15 @@ def compress_context(
     )
     _durable_cooldown_authoritative: Optional[bool] = None
     _durable_cooldown_state: Optional[dict[str, Any]] = None
-    if (
-        defer_context_engine_notification
-        and callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None))
-    ):
-        raise RuntimeError("a compression notification is already pending")
+    if defer_context_engine_notification:
+        pending_notifications = getattr(
+            agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None
+        )
+        if (
+            isinstance(pending_notifications, collections.deque)
+            and pending_notifications
+        ):
+            raise RuntimeError("a compression notification is already pending")
 
     # ``conversation_history_after_compression()`` needs the latest attempt's
     # outcome, while ``_last_compaction_in_place`` remains the run-level signal
@@ -3900,11 +3959,12 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
-        _refresh_active_task_contract(
-            _authoritative_pre_compression_snapshot, compressed
-        )
+        # Restoration is head-scoped.  The protected suffix is authoritative
+        # evidence in the final candidate and must never be copied into or
+        # used to rewrite the generated head.
+        _refresh_active_task_contract(_compression_input, compressed)
         _ensure_compressed_has_user_turn(
-            _authoritative_pre_compression_snapshot, compressed
+            _compression_input, compressed
         )
         if _protected_tail_snapshot:
             # The protected suffix is appended byte-for-byte before admission
@@ -3912,6 +3972,26 @@ def compress_context(
             # repair over this join: a malformed seam is rejected below by the
             # canonical request builder instead of rewriting protected rows.
             compressed = list(compressed) + copy.deepcopy(_protected_tail_snapshot)
+
+        _protected_seam_valid = True
+        if _protected_tail_snapshot:
+            seam_index = len(compressed) - len(_protected_tail_snapshot)
+            if seam_index and compressed[seam_index - 1].get("role") == compressed[
+                seam_index
+            ].get("role"):
+                _protected_seam_valid = False
+            call_ids = set()
+            for row in compressed:
+                if row.get("role") == "assistant":
+                    for call in row.get("tool_calls") or []:
+                        if isinstance(call, dict) and call.get("id"):
+                            call_ids.add(call["id"])
+                elif (
+                    row.get("role") == "tool"
+                    and row.get("tool_call_id") not in call_ids
+                ):
+                    _protected_seam_valid = False
+                    break
 
         cached_system_prompt = getattr(agent, "_cached_system_prompt", None)
         agent._invalidate_system_prompt()
@@ -3955,32 +4035,14 @@ def compress_context(
         # conversation-loop dependency.  The old and rebuilt prompts are part
         # of their respective complete requests: prompt growth is real request
         # growth and must not be hidden merely to isolate transcript reclaim.
-        from agent.conversation_loop import (
-            finalize_provider_request,
-            project_provider_request,
-        )
+        from agent.conversation_loop import finalize_provider_request
 
-        _provider_request_in = project_provider_request(
-            agent,
-            _authoritative_pre_compression_snapshot,
-            system_prompt=_system_prompt_before_compression or "",
-            tools=agent.tools or [],
-            apply_context_selection=False,
-            static_system_prefix=(
-                _cached_static_before_compression
-                if isinstance(_cached_static_before_compression, str)
-                else None
-            ),
-        )
-        _provider_request_out = project_provider_request(
-            agent,
-            compressed,
-            system_prompt=new_system_prompt or "",
-            tools=agent.tools or [],
-            apply_context_selection=False,
-        )
+        # Middleware comparison uses one documented frozen synthetic context
+        # for both bodies.  IDs are deliberately equal: they are request
+        # metadata, not transcript state.  Non-deterministic middleware is
+        # detected by replay below and admission fails closed.
         _admission_middleware_context = {
-            "task_id": task_id,
+            "task_id": str(task_id),
             "turn_id": "compression-admission",
             "api_request_id": "compression-admission",
             "session_id": str(agent.session_id or ""),
@@ -3991,33 +4053,53 @@ def compress_context(
             "api_mode": str(agent.api_mode or ""),
             "api_call_count": 0,
         }
-        _provider_request_in = finalize_provider_request(
+        _finalized_in = finalize_provider_request(
             agent,
-            _provider_request_in,
+            _authoritative_pre_compression_snapshot,
             system_message=_system_prompt_before_compression or "",
+            tools=agent.tools or [],
+            static_system_prefix=(
+                _cached_static_before_compression
+                if isinstance(_cached_static_before_compression, str)
+                else None
+            ),
             middleware_context=dict(_admission_middleware_context),
-        )["payload"]
-        _provider_request_out = finalize_provider_request(
+        )
+        _provider_request_in = _finalized_in["payload"]
+        _finalized_out = finalize_provider_request(
             agent,
-            _provider_request_out,
+            compressed,
             system_message=new_system_prompt or "",
+            tools=agent.tools or [],
             middleware_context=dict(_admission_middleware_context),
-        )["payload"]
-        _request_in = estimate_request_tokens_rough(
-            _provider_request_in.get("messages") or _provider_request_in.get("input") or [],
-            tools=_provider_request_in.get("tools") or None,
         )
-        _request_out = estimate_request_tokens_rough(
-            _provider_request_out.get("messages") or _provider_request_out.get("input") or [],
-            tools=_provider_request_out.get("tools") or None,
+        _provider_request_out = _finalized_out["payload"]
+        _finalized_replay = finalize_provider_request(
+            agent,
+            compressed,
+            system_message=new_system_prompt or "",
+            tools=agent.tools or [],
+            middleware_context=dict(_admission_middleware_context),
         )
+        _middleware_replay = _finalized_replay["payload"]
+        _request_in = estimate_finalized_payload_tokens_rough(_provider_request_in)
+        _request_out = estimate_finalized_payload_tokens_rough(_provider_request_out)
         _threshold = int(
             getattr(agent.context_compressor, "threshold_tokens", 0) or 0
         )
         _minimum_reclaim = max(4_096, int(_threshold * 0.05))
         _reclaimed = _request_in - _request_out
         _rejection = None
-        if _provider_request_out == _provider_request_in:
+        if not _protected_seam_valid:
+            _rejection = "invalid_protected_tail_seam"
+        elif any(
+            result.get("middleware_error")
+            for result in (_finalized_in, _finalized_out, _finalized_replay)
+        ):
+            _rejection = "middleware_unavailable"
+        elif _middleware_replay != _provider_request_out:
+            _rejection = "nondeterministic_middleware"
+        elif _provider_request_out == _provider_request_in:
             _rejection = "no_progress"
         elif _request_out > _request_in:
             _rejection = "would_grow"

@@ -779,7 +779,7 @@ class TestInPlaceAntiGrowthGuard:
     def test_uncached_admission_uses_built_input_prompt(self):
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
-        from agent.conversation_loop import project_provider_request
+        from agent.conversation_loop import _project_provider_request
 
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
@@ -807,7 +807,7 @@ class TestInPlaceAntiGrowthGuard:
             assert len(seen) == 2
             request_in, tools_in = seen[0]
             request_out, tools_out = seen[1]
-            expected_in = project_provider_request(
+            expected_in = _project_provider_request(
                 agent,
                 messages_before,
                 system_prompt="EXACT BUILT PROMPT",
@@ -838,7 +838,7 @@ class TestInPlaceAntiGrowthGuard:
         """A plugin may mutate and return its exact input list (#remediation-7)."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
-        from agent.conversation_loop import project_provider_request
+        from agent.conversation_loop import _project_provider_request
         from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -893,7 +893,7 @@ class TestInPlaceAntiGrowthGuard:
                 assert len(estimates) == 2
                 request_in, tools_in = estimates[0]
                 request_out_rows, tools_out = estimates[1]
-                expected_in = project_provider_request(
+                expected_in = _project_provider_request(
                     agent,
                     original,
                     system_prompt=cached,

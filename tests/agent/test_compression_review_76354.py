@@ -188,6 +188,81 @@ def test_postcommit_lane_serializes_blocked_chains_in_publication_order(monkeypa
     assert order == ["first-enter", "first-exit", "second-enter"]
 
 
+def test_deferred_notification_claims_then_waits_fifo_with_frozen_identity(monkeypatch):
+    """Host finalization clears B immediately while observer A is blocked."""
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    delivered = threading.Event()
+    order = []
+    calls = []
+
+    class Compressor:
+        pass
+
+    class Agent:
+        platform = "old-platform"
+        session_id = "child-b"
+        _gateway_session_key = ("old", "conversation")
+        context_compressor = Compressor()
+
+    agent = Agent()
+    monkeypatch.setattr(cc, "_POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        cc,
+        "_notify_context_engine_compression_complete",
+        lambda _agent, **kwargs: (
+            order.append("b"), calls.append(kwargs), delivered.set(), True
+        )[-1],
+    )
+
+    def first():
+        order.append("a-enter")
+        first_entered.set()
+        assert release_first.wait(timeout=5)
+        order.append("a-exit")
+
+    cc._run_postcommit_callbacks_bounded(agent, first, session_id="child-a")
+    assert first_entered.is_set()
+    agent.context_compressor.on_session_start = object()
+    cc._queue_context_engine_compression_notification(
+        agent, new_session_id="child-b", old_session_id="parent-b"
+    )
+    agent.context_compressor.on_session_start = object()
+    agent.platform = "mutated-platform"
+    agent._gateway_session_key = ("mutated", "conversation")
+    agent.session_id = "child-c"
+
+    assert cc.finalize_context_engine_compression_notification(agent, committed=True)
+    assert getattr(agent, cc._PENDING_CONTEXT_ENGINE_NOTIFICATION) is None
+    assert not delivered.is_set()
+    release_first.set()
+    assert delivered.wait(timeout=2)
+    assert order == ["a-enter", "a-exit", "b"]
+    assert len(calls) == 1
+    assert calls[0]["new_session_id"] == "child-b"
+    assert calls[0]["old_session_id"] == "parent-b"
+    assert calls[0]["platform"] == "old-platform"
+    assert calls[0]["conversation_id"] == ("old", "conversation")
+
+    # No detached work can reinstall stale state; a subsequent record is
+    # independently claimable and discarded exactly once.
+    cc._queue_context_engine_compression_notification(
+        agent, new_session_id="child-c", old_session_id="child-b"
+    )
+    assert not cc.finalize_context_engine_compression_notification(
+        agent, committed=False
+    )
+    assert getattr(agent, cc._PENDING_CONTEXT_ENGINE_NOTIFICATION) is None
+
+
+def test_finalized_payload_estimator_charges_late_fields_and_binary_safely(monkeypatch):
+    monkeypatch.setattr(cc, "estimate_request_tokens_rough", lambda *_a, **_k: 10)
+    base = {"messages": [{"role": "user", "content": "same"}]}
+    grown = {**base, "instructions": "x" * 4000, "binary": b"z" * 4000}
+    assert cc.estimate_finalized_payload_tokens_rough(base) == 10
+    assert cc.estimate_finalized_payload_tokens_rough(grown) > 1900
+
+
 class _KIOnFirstResultFuture:
     """Future proxy raising on the host's first result() call."""
 

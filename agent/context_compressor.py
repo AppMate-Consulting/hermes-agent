@@ -5600,6 +5600,37 @@ This compaction should PRIORITISE preserving all information related to the focu
             return max(pair_end, head_end + 1)
         return adjusted
 
+    def _protect_completion_provenance_before_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        cut_idx: int,
+        head_end: int,
+    ) -> int:
+        """Keep one complete completion proof when the tail starts after it.
+
+        A completion notification is the causal boundary for the autonomous
+        work that immediately follows it.  If token selection lands directly
+        after that notification, retaining only the following work destroys
+        the sequence-valid durable proof used after SessionDB replay.  Expand
+        by the three provenance rows, plus one preceding assistant row when
+        needed to give the summary an alternation-safe insertion point.  This
+        is deliberately local to the boundary: older completion chains remain
+        in the summarized middle.
+        """
+        completion_idx = cut_idx - 1
+        if not self._completion_has_durable_provenance(messages, completion_idx):
+            return cut_idx
+
+        provenance_start = completion_idx - 2
+        adjusted = provenance_start
+        preceding = provenance_start - 1
+        if (
+            preceding > head_end
+            and messages[preceding].get("role") == "assistant"
+        ):
+            adjusted = preceding
+        return max(adjusted, head_end + 1)
+
     def _ensure_last_n_user_messages_in_tail(
         self,
         messages: List[Dict[str, Any]],
@@ -5807,6 +5838,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Each anchor only walks ``cut_idx`` backward, so chaining them is
         # monotonic — the tail can only grow, never shrink.
         cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+
+        # If the selected tail begins with work triggered by an immediately
+        # preceding autonomous completion, retain exactly that completion's
+        # durable proof group.  Without the group, DB replay can no longer
+        # distinguish the legitimate notification from human-authored text.
+        cut_idx = self._protect_completion_provenance_before_tail(
+            messages, cut_idx, head_end
+        )
 
         # Extend to the last N actionable user messages when configured
         # (compression.min_tail_user_messages > 1).  This prevents the

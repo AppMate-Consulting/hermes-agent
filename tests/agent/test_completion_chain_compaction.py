@@ -49,6 +49,7 @@ def _completion_chain(task: str = TASK, count: int = 45) -> list[dict]:
             "role": "user",
             "content": f"[IMPORTANT: Background process p-{index} completed normally. Final output: {index}]",
             "_autonomous_completion_bridge": True,
+            "display_kind": "internal_notification",
         })
     messages.append({"role": "assistant", "content": "CURRENT CONTINUATION"})
     return messages
@@ -116,6 +117,7 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
             sid, message["role"], message.get("content", ""),
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
+            display_kind=message.get("display_kind"),
         )
 
     first, _ = compress_context(
@@ -147,6 +149,7 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
             sid, message["role"], message.get("content", ""),
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
+            display_kind=message.get("display_kind"),
         )
     resumed = db.get_messages_as_conversation(sid)
     archived_before_second = len([
@@ -276,6 +279,7 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
             sid, message["role"], message.get("content", ""),
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
+            display_kind=message.get("display_kind"),
         )
     projected = db.get_messages_as_conversation(sid)[0]
     assert json.dumps(
@@ -297,6 +301,7 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
                     sid, message["role"], message.get("content", ""),
                     tool_calls=message.get("tool_calls"),
                     tool_call_id=message.get("tool_call_id"),
+                    display_kind=message.get("display_kind"),
                 )
             resumed = db.get_messages_as_conversation(sid)
         cycle_agent = _agent(db, sid)

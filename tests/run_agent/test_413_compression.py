@@ -6,6 +6,7 @@ Verifies that:
 - Preflight compression proactively compresses oversized sessions before API calls
 """
 
+import copy
 import hashlib
 import os
 

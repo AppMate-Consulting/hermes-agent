@@ -387,7 +387,19 @@ def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
     assert len(estimates) == 2
     request_in, tools_in = estimates[0]
     request_out, tools_out = estimates[1]
-    assert request_in[0] == {"role": "system", "content": "sys"}
+    from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+
+    assert request_in[0]["role"] == "system"
+    built_input_prompt = request_in[0]["content"]
+    for required_fragment in (
+        DEFAULT_AGENT_IDENTITY,
+        "deterministic memory prompt",
+        "Conversation started:",
+        "Model: test/model",
+    ):
+        assert built_input_prompt.count(required_fragment) == 1
+    assert built_input_prompt.split("\n\n").count("sys") == 1
+    assert sum(row.get("role") == "system" for row in request_in) == 1
     assert _contents(request_in[1:]) == _contents(adopted)
     assert "NEWER AUTHORITATIVE TASK" in _contents(request_in[1:])
     assert "stale caller task" in _contents(request_in[1:])

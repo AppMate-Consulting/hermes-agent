@@ -318,8 +318,12 @@ def test_in_memory_publication_cancel_and_claim_are_linearized(monkeypatch):
             agent.event_callback.assert_not_called()
         else:
             committed = result[0][0]
-            assert committed[0]["content"] == "message 5"
-            assert committed[-1]["content"] == "small committed candidate"
+            assert len(committed) == 1
+            assert committed[0]["role"] == "user"
+            merged = committed[0]["content"]
+            assert merged.index("message 5") < merged.index(
+                "small committed candidate"
+            )
             assert agent._last_compression_outcome == "committed_in_memory"
 
 
@@ -384,7 +388,9 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     request.addfinalizer(db.close)
     sid = "blocked-event-parent"
     db.create_session(sid, "cli", model="test/model")
-    db.append_message(sid, "user", "durable " + "large " * 10_000)
+    db.append_message(sid, "user", "earlier task")
+    db.append_message(sid, "assistant", "large history " * 10_000)
+    db.append_message(sid, "user", "latest short human task")
     compressor = MagicMock()
     _configure_engine_state(compressor)
     compressor.compress.side_effect = lambda *_a, **_k: [
@@ -416,9 +422,9 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     )
     monkeypatch.setattr(
         "agent.conversation_compression.estimate_request_tokens_rough",
-        lambda messages, **_k: 100_000 if any(
-            "large" in str(row.get("content", "")) for row in messages
-        ) else 1_000,
+        lambda messages, **_k: sum(
+            len(str(row.get("content", ""))) for row in messages
+        ),
     )
 
     first, _ = agent._compress_context(
@@ -430,9 +436,11 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     assert db.get_compression_lock_holder(sid) is None
     assert agent._last_compression_outcome == "committed_materially_shrunk"
 
-    # Grow only the provider-visible child input so a second real rotation is admitted.
-    second_input = copy.deepcopy(first)
-    second_input[0]["content"] += " next " * 10_000
+    # Grow provider-visible history while leaving the latest human task short.
+    second_input = [
+        {"role": "assistant", "content": "large second history " * 10_000},
+        *copy.deepcopy(first),
+    ]
     second, _ = agent._compress_context(
         second_input, "sys", approx_tokens=100_000, force=True
     )
@@ -443,7 +451,8 @@ def test_permanently_blocked_event_callback_is_bounded_and_fifo(
     ]
     frozen_parent_a = copy.deepcopy(events[0][2])
     assert db.get_compression_lock_holder(child_b) is None
-    assert second[0]["content"] == "small child"
+    assert "small child" in second[0]["content"]
+    assert "latest short human task" in second[0]["content"]
 
     release.set()
     tail = agent._compression_observer_lane_tail

@@ -46,7 +46,7 @@ def _select_transcript_dependent_context(
             row["content"] = f'{row["content"]}\n{marker}'
             break
     else:
-        raise AssertionError("finalized request must contain its existing system row")
+        selected.insert(0, {"role": "system", "content": marker})
     return selected
 
 
@@ -276,6 +276,13 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
         def _sync_telegram_topic_binding(self, *_a, **_kw): return None
 
     host = Host()
+    actual_payloads = []
+    real_finalize = finalize_provider_request
+
+    def capture_finalize(*args, **kwargs):
+        result = real_finalize(*args, **kwargs)
+        actual_payloads.append(copy.deepcopy(result["payload"]))
+        return result
     expected_rows = [{"role": "assistant", "content": SUMMARY}] + copy.deepcopy(
         source_rows[4:]
     )
@@ -314,11 +321,16 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
     ) as publish, patch(
         "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
         side_effect=[100_000, 1_000],
+    ), patch(
+        "agent.conversation_loop.finalize_provider_request",
+        side_effect=capture_finalize,
     ), patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100_000), patch(
         "agent.manual_compression_feedback.summarize_manual_compression",
         return_value={"headline": "ok", "token_line": "small", "note": "", "noop": False},
     ):
         await host._handle_compress_command_inner(event)
+    assert len(actual_payloads) == 2
+    assert actual_payloads[0] != actual_payloads[1]
     active_id = entry.session_id
     _assert_success(db, sid, source_rows, prepared, db.get_messages_as_conversation(active_id), seen, publish)
 

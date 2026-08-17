@@ -4876,17 +4876,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             messages[row_index].get("_autonomous_completion_bridge") is True
             for row_index in (index - 2, index - 1, index)
         )
-        # SessionDB projection intentionally strips underscore metadata.  Its
-        # durable equivalent therefore requires all three markers to be absent
-        # and the persisted completion-row presentation type to be explicit.
-        projected = (
-            all(
-                "_autonomous_completion_bridge" not in messages[row_index]
-                for row_index in (index - 2, index - 1, index)
-            )
-            and completion.get("display_kind") == "internal_notification"
-        )
-        return runtime_markers or projected
+        # SessionDB projects the dedicated provenance column back to the same
+        # private marker. Presentation kind is deliberately irrelevant: real
+        # process completions have no kind and delegation completions use
+        # ``async_delegation_complete``.
+        return runtime_markers
 
     @classmethod
     def _bridge_user_has_durable_provenance(

@@ -3730,6 +3730,9 @@ class SessionStore:
             # #82888). DB-only; stripped from provider-bound payloads.
             display_kind=message.get("display_kind"),
             display_metadata=message.get("display_metadata"),
+            autonomous_completion_provenance=(
+                message.get("_autonomous_completion_bridge") is True
+            ),
         )
 
     # Maximum in-memory pending messages per session before dropping the

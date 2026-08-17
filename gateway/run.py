@@ -19006,6 +19006,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             rejection_cooldown_seconds=None,
                                         ),
                                     )
+                                    _hyg_failure_recorded = False
                                     try:
                                         # Progress-aware wait: the timeout is an
                                         # INACTIVITY budget, not a total one. The
@@ -19104,6 +19105,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     "timed out with no output from "
                                                     "the summary model",
                                                 )
+                                                _hyg_failure_recorded = True
                                             from agent.session_activity import (
                                                 ActivityProvenance,
                                             )
@@ -19174,15 +19176,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         ):
                                             _outer_outcome = "cancelled_host"
                                         else:
+                                            _worker_outcome = getattr(
+                                                _hyg_agent,
+                                                "_last_compression_outcome",
+                                                None,
+                                            )
                                             _outer_outcome = (
-                                                "wrapper_exception_"
+                                                _worker_outcome
+                                                if isinstance(_worker_outcome, str)
+                                                and _worker_outcome.startswith(
+                                                    "compression_exception_"
+                                                )
+                                                else "wrapper_exception_"
                                                 f"{type(_hyg_wrapper_exc).__name__}"
                                             )
                                         _publish_compression_outcome(
                                             _hyg_agent,
                                             _outer_outcome,
-                                            outer_terminal=True,
+                                            outer_terminal=(
+                                                _outer_outcome == "cancelled_host"
+                                                or _outer_outcome.startswith(
+                                                    "wrapper_exception_"
+                                                )
+                                            ),
                                         )
+                                        if (
+                                            _outer_outcome.startswith(
+                                                ("wrapper_exception_", "compression_exception_")
+                                            )
+                                            and not _hyg_failure_recorded
+                                            and _hyg_failure_cooldown_seconds >= 0
+                                        ):
+                                            _record_hygiene_failure(
+                                                self, session_key,
+                                                session_entry.session_id,
+                                                _hyg_failure_cooldown_seconds,
+                                                _outer_outcome,
+                                            )
+                                            _hyg_failure_recorded = True
                                         _hyg_commit_fence.revoke_commit_admission()
                                         if not _hyg_cleanup_deferred:
                                             self._defer_agent_cleanup_until_future_done(
@@ -19348,13 +19379,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         "rejected_would_grow",
                                         "rejected_below_minimum_reclaim",
                                     }
-                                    if _hyg_rejected and _hyg_failure_cooldown_seconds >= 0:
+                                    _hyg_terminal_failure = bool(
+                                        _hyg_outcome == "persistence_failure"
+                                        or (
+                                            isinstance(_hyg_outcome, str)
+                                            and _hyg_outcome.startswith(
+                                                ("compression_exception_", "wrapper_exception_")
+                                            )
+                                        )
+                                    )
+                                    if (
+                                        (_hyg_rejected or _hyg_terminal_failure)
+                                        and not _hyg_failure_recorded
+                                        and _hyg_failure_cooldown_seconds >= 0
+                                    ):
                                         _record_hygiene_failure(
                                             self, session_key,
                                             session_entry.session_id,
                                             _hyg_failure_cooldown_seconds,
-                                            _hyg_outcome.removeprefix("rejected_"),
+                                            (
+                                                _hyg_outcome.removeprefix("rejected_")
+                                                if _hyg_rejected
+                                                else _hyg_outcome
+                                            ),
                                         )
+                                        _hyg_failure_recorded = True
                                     if not _hyg_aborted:
                                         # Recovery decision lives in the
                                         # extracted, unit-tested predicate — the
@@ -19378,7 +19427,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _hyg_new_sid,
                                             )
                                     if _hyg_aborted:
-                                        if _hyg_failure_cooldown_seconds >= 0:
+                                        if (
+                                            not _hyg_failure_recorded
+                                            and _hyg_failure_cooldown_seconds >= 0
+                                        ):
                                             _record_hygiene_failure(
                                                 self, session_key,
                                                 session_entry.session_id,
@@ -19387,6 +19439,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _comp, "_last_summary_error", None
                                                 ),
                                             )
+                                            _hyg_failure_recorded = True
                                         from agent.session_activity import (
                                             ActivityProvenance,
                                         )

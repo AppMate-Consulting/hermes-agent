@@ -5,6 +5,8 @@ import json
 import os
 from unittest.mock import patch
 
+import pytest
+
 from agent.context_compressor import (
     ACTIVE_TASK_CONTRACT_INSTRUCTION,
     ACTIVE_TASK_CONTRACT_PREFIX,
@@ -118,6 +120,9 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
             display_kind=message.get("display_kind"),
+            autonomous_completion_provenance=(
+                message.get("_autonomous_completion_bridge") is True
+            ),
         )
 
     first, _ = compress_context(
@@ -150,6 +155,9 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
             display_kind=message.get("display_kind"),
+            autonomous_completion_provenance=(
+                message.get("_autonomous_completion_bridge") is True
+            ),
         )
     resumed = db.get_messages_as_conversation(sid)
     archived_before_second = len([
@@ -190,8 +198,8 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
     assert archived_after_second - archived_before_second == active_before_second
     assert len([r for r in rows_after_second if r.get("active", 1)]) == len(durable)
 
-    # Repeat through another DB projection. Visible exact bridge markers let
-    # refresh remove stale rows even though SessionDB omits underscore metadata.
+    # Repeat through another DB projection. Dedicated durable provenance lets
+    # refresh remove stale rows independently of presentation kind.
     third_agent = _agent(db, sid)
     third, _ = compress_context(
         third_agent, db.get_messages_as_conversation(sid), "sys",
@@ -234,6 +242,34 @@ def test_completion_notification_forms_are_exact_and_human_near_match_stays_real
         assert not ContextCompressor._transcript_has_real_user_turn(completion_only)
     human = {"role": "user", "content": "Please explain [ASYNC DELEGATION COMPLETE child=one] in the logs."}
     assert _is_real_user_message(human)
+
+
+@pytest.mark.parametrize("display_kind", [None, "async_delegation_complete"])
+def test_durable_completion_provenance_is_independent_of_presentation_kind(
+    tmp_path, display_kind
+):
+    db = SessionDB(db_path=tmp_path / "provenance.db")
+    db.create_session("sid", "tui")
+    messages = []
+    append_autonomous_completion_provenance(messages)
+    messages.append({
+        "role": "user",
+        "content": "[IMPORTANT: Background process p completed normally.]",
+        "_autonomous_completion_bridge": True,
+        "display_kind": display_kind,
+    })
+    db.replace_messages("sid", messages)
+    replay = db.get_messages_as_conversation("sid")
+    assert ContextCompressor._has_autonomous_completion_chain(replay)
+    assert replay[-1].get("display_kind") == display_kind
+
+    # Exact reserved human text plus presentation metadata is still human.
+    db.replace_messages("sid", [{
+        "role": "user", "content": messages[-1]["content"],
+        "display_kind": display_kind,
+    }])
+    human = db.get_messages_as_conversation("sid")
+    assert not ContextCompressor._has_autonomous_completion_chain(human)
 
 
 def test_structured_human_task_has_deterministic_model_visible_contract():

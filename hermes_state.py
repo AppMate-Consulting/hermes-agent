@@ -5548,6 +5548,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
+        expected_active_identity: Optional[tuple[int, int]] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -5556,6 +5557,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         a complete child, never an ended parent with a missing/empty child.
         """
         def _do(conn):
+            if expected_active_identity is not None:
+                identity_row = conn.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
+                    "FROM messages WHERE session_id = ? AND active = 1",
+                    (parent_session_id,),
+                ).fetchone()
+                actual_identity = (
+                    int(identity_row["n"]), int(identity_row["max_id"])
+                )
+                if actual_identity != expected_active_identity:
+                    raise RuntimeError(
+                        "Compression transcript changed before publication: "
+                        f"{parent_session_id}"
+                    )
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
                 (parent_session_id,),
@@ -9047,6 +9062,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         api_content: Optional[str] = None,
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
+        autonomous_completion_provenance: bool = False,
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
@@ -9118,8 +9134,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata,
+                   autonomous_completion_provenance)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -9142,6 +9159,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    1 if autonomous_completion_provenance else 0,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -9549,8 +9567,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata,
+                   autonomous_completion_provenance)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -9573,6 +9592,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
+                    1 if msg.get("_autonomous_completion_bridge") is True else 0,
                 ),
             )
             if isinstance(msg, dict) and cur.lastrowid is not None:
@@ -9685,12 +9705,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def get_active_transcript_identity(self, session_id: str) -> tuple[int, int]:
+        """Return the compare-and-swap identity of the active transcript.
+
+        Message ids are monotonic and active compaction replaces the complete
+        active set, so ``(count, max_id)`` changes for every append or rewrite
+        that could make a generated candidate stale.
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
+                "FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+        return (int(row["n"]), int(row["max_id"]))
+
     def archive_and_compact(
         self,
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
         system_prompt: Optional[str] = None,
+        expected_active_identity: Optional[tuple[int, int]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -9720,6 +9756,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
+            if expected_active_identity is not None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
+                    "FROM messages WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                ).fetchone()
+                actual = (int(row["n"]), int(row["max_id"]))
+                if actual != expected_active_identity:
+                    raise RuntimeError(
+                        f"Compression transcript changed before publication: {session_id}"
+                    )
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
@@ -10193,7 +10240,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, autonomous_completion_provenance"
     )
 
     def _rows_to_conversation(
@@ -10240,6 +10287,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 decoded = self._decode_display_metadata(row["display_metadata"])
                 if decoded is not None:
                     msg["display_metadata"] = decoded
+            if row["autonomous_completion_provenance"]:
+                msg["_autonomous_completion_bridge"] = True
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:

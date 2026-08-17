@@ -35,6 +35,7 @@ class ApiServerLikeAdapter:
         self._port = port
         self._api_key = key
         self._model_name = model
+        self._internal_wake_token = "process-private-wake-token"
 
     async def handle_message(self, event):  # pragma: no cover — must NOT be hit
         raise AssertionError("non-push adapter must not receive handle_message wakes")
@@ -78,6 +79,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     async def handler(request):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
         seen["auth"] = request.headers.get("Authorization")
+        seen["internal_wake"] = request.headers.get("X-Hermes-Internal-Wake")
         seen["body"] = await request.json()
         return web.json_response({"choices": [{"message": {"content": "ok"}}]})
 
@@ -92,6 +94,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     asyncio.run(run())
     assert seen["session_id"] == "raw-sid-42"
     assert seen["auth"] == "Bearer sekrit"
+    assert seen["internal_wake"] == "process-private-wake-token"
     assert seen["body"]["stream"] is False
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
@@ -123,5 +126,4 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
-
 

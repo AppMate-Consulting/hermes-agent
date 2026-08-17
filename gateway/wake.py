@@ -126,6 +126,9 @@ async def _self_post_chat_completion(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
+        "X-Hermes-Internal-Wake": str(
+            getattr(adapter, "_internal_wake_token", "")
+        ),
     }
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),

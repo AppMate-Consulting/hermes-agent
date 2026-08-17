@@ -69,6 +69,34 @@ def _materially_compressible_messages(n=8):
 
 
 class TestInPlaceCompaction:
+    def test_sessiondb_rejects_append_after_candidate_for_both_publications(self, tmp_path):
+        """A newer durable row can never be archived into a stale candidate."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "fence.db")
+        _seed(db, "in-place", "in-place", n=4)
+        identity = db.get_active_transcript_identity("in-place")
+        db.append_message("in-place", "user", "late durable truth")
+        with pytest.raises(RuntimeError, match="transcript changed"):
+            db.archive_and_compact(
+                "in-place", [{"role": "user", "content": "stale summary"}],
+                expected_active_identity=identity,
+            )
+        assert db.get_messages_as_conversation("in-place")[-1]["content"] == "late durable truth"
+
+        _seed(db, "rotation", "rotation", n=4)
+        identity = db.get_active_transcript_identity("rotation")
+        db.append_message("rotation", "assistant", "late durable truth")
+        with pytest.raises(RuntimeError, match="transcript changed"):
+            db.publish_compression_child(
+                parent_session_id="rotation", child_session_id="stale-child",
+                source="cli", messages=[{"role": "user", "content": "stale"}],
+                require_compression_lease=False,
+                expected_active_identity=identity,
+            )
+        assert db.get_session("stale-child") is None
+        assert db.get_messages_as_conversation("rotation")[-1]["content"] == "late durable truth"
+
     def test_rotation_publication_failure_restores_parent_and_all_ephemeral_state(self):
         """A materially admitted child that cannot publish leaves no boundary trace."""
         from hermes_state import SessionDB

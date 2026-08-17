@@ -3142,6 +3142,51 @@ def compress_context(
                     _lock_refresher = _candidate_refresher
                     _lock_refresher.start()
 
+        # Reconcile every compression mode against durable truth after the
+        # lease is held. The caller may additionally carry a not-yet-persisted
+        # current-turn tail; retain that tail exactly once.
+        _expected_active_identity = None
+        if _lock_db is not None and _lock_sid:
+            durable_loader = getattr(
+                type(_lock_db), "get_messages_as_conversation", None
+            )
+            identity_loader = getattr(
+                type(_lock_db), "get_active_transcript_identity", None
+            )
+            if callable(durable_loader) and callable(identity_loader):
+                durable_parent = durable_loader(_lock_db, _lock_sid)
+                if isinstance(durable_parent, list):
+                    live_tail = []
+                    tail_idx = getattr(agent, "_persist_user_message_idx", None)
+                    if isinstance(tail_idx, int) and 0 <= tail_idx < len(messages):
+                        live_tail = copy.deepcopy(messages[tail_idx:])
+                    elif len(messages) > len(durable_parent):
+                        # Entry points without a turn anchor still commonly
+                        # carry an append-only caller tail. Preserve only the
+                        # portion beyond the durable prefix.
+                        live_tail = copy.deepcopy(messages[len(durable_parent):])
+                    # A crash/early persist can already have made some or all
+                    # of the live tail durable. Strip only an exact suffix;
+                    # presentation/private bookkeeping is intentionally not
+                    # part of transcript identity here.
+                    def _same_row(left: Any, right: Any) -> bool:
+                        if not isinstance(left, dict) or not isinstance(right, dict):
+                            return left == right
+                        keys = ("role", "content", "tool_call_id", "tool_calls", "tool_name")
+                        return all(left.get(key) == right.get(key) for key in keys)
+                    for overlap in range(min(len(live_tail), len(durable_parent)), 0, -1):
+                        if all(
+                            _same_row(durable_parent[-overlap + i], live_tail[i])
+                            for i in range(overlap)
+                        ):
+                            live_tail = live_tail[overlap:]
+                            break
+                    messages = copy.deepcopy(durable_parent) + live_tail
+                    _pre_msg_count = len(messages)
+                    approx_tokens = 0
+                    agent._persist_user_message_idx = len(durable_parent)
+                    _expected_active_identity = identity_loader(_lock_db, _lock_sid)
+
         # The caller's history snapshot predates lease acquisition. Reload the
         # durable parent after the lease is live; MORE durable rows than the
         # snapshot carries means a frontend/background writer committed a turn
@@ -3162,7 +3207,12 @@ def compress_context(
         # behind the DB: every /compress and auto-compress saw
         # "changed before lease acquisition", surfaced as the misleading
         # "No changes from compression", and never reclaimed tokens.
-        if not in_place and _lock_db is not None and _lock_sid:
+        if (
+            _expected_active_identity is None
+            and not in_place
+            and _lock_db is not None
+            and _lock_sid
+        ):
             durable_loader = getattr(
                 type(_lock_db), "get_messages_as_conversation", None
             )
@@ -3794,6 +3844,7 @@ def compress_context(
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
                         system_prompt=new_system_prompt,
+                        expected_active_identity=_expected_active_identity,
                     )
                     agent._compression_durable_commit_occurred = True
                     split_status = "in_place_committed"
@@ -3810,9 +3861,10 @@ def compress_context(
                     _set_compression_outcome("committed_materially_shrunk")
                 else:
                     # ── Rotation (legacy): end this session, fork a continuation ─
-                    # Flush any un-persisted current-turn messages to the OLD
-                    # session before ending it, so they survive in the preserved
-                    # parent transcript (#47202). (In-place skips this — see above.)
+                    # Caller-only current-turn rows are already included in the
+                    # reconciled candidate. Do not append them to the parent
+                    # after candidate generation: doing so would invalidate the
+                    # publication compare-and-swap fence.
                     #
                     # Pass the already-durable prefix as conversation_history so
                     # the flush skips it by identity (#68196). Preflight
@@ -3824,20 +3876,6 @@ def compress_context(
                     # the current-turn user message before preflight runs, so
                     # messages[:idx] is exactly the persisted prefix; only the
                     # current turn's new messages get written.
-                    current_idx = getattr(agent, "_persist_user_message_idx", None)
-                    persisted_history = (
-                        messages[:current_idx]
-                        if isinstance(current_idx, int)
-                        and 0 <= current_idx <= len(messages)
-                        else None
-                    )
-                    try:
-                        agent._flush_messages_to_session_db(
-                            messages,
-                            conversation_history=persisted_history,
-                        )
-                    except Exception:
-                        pass  # best-effort — don't block compression on a flush error
                     # Publish parent closure + child row + compacted handoff in
                     # one transaction. No reader can observe a missing/empty child.
                     # The rotation child must stay on the parent's profile —
@@ -3872,6 +3910,7 @@ def compress_context(
                         profile_name=_profile_for_child,
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
+                        expected_active_identity=_expected_active_identity,
                     )
                     agent._compression_durable_commit_occurred = True
                     agent.session_id = new_session_id

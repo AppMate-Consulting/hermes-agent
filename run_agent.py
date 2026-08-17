@@ -2285,6 +2285,12 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    # Runtime-only trusted producer bit. SessionDB persists it
+                    # in a dedicated column; presentation metadata remains
+                    # independent and cannot confer trust on replay.
+                    "_autonomous_completion_bridge": (
+                        msg.get("_autonomous_completion_bridge") is True
+                    ),
                 })
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8

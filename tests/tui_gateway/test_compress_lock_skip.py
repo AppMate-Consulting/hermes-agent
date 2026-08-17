@@ -30,6 +30,14 @@ def _make_lock_skip_agent(signal):
     agent.session_id = "sess-lock"
     # Deferred-notify contract: no pending notification exists.
     agent._pending_context_engine_compression_notification = None
+    agent.session_input_tokens = 0
+    agent.session_output_tokens = 0
+    agent.session_reasoning_tokens = 0
+    agent.session_prompt_tokens = 0
+    agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+    agent.session_api_calls = 0
+    agent.context_compressor.last_prompt_tokens = 0
 
     def _fake_compress(msgs=None, *_args, **_kwargs):
         agent._compression_skipped_due_to_lock = signal

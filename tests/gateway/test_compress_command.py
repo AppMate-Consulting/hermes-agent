@@ -566,6 +566,9 @@ async def test_compress_command_reconciles_committed_postpublication_failure(
             messages=durable,
             require_compression_lease=False,
         )
+    # Drive reconciliation with the canonical durable projection. SessionDB
+    # owns timestamp normalization and never exposes candidate ``_row_id``s.
+    durable = db.get_messages_as_conversation(committed)
 
     runner = _make_runner(history)
     runner._session_db = AsyncSessionDB(db)
@@ -627,7 +630,7 @@ async def test_compress_command_reconciles_committed_postpublication_failure(
             runner.session_store._save.assert_called_once()
             runner._sync_telegram_topic_binding.assert_called_once()
             assert runner._sync_telegram_topic_binding.call_args.args[1].session_id == committed
-            if reconciliation != "embedded":
+            if reconciliation == "retry":
                 assert ordering[:2] == ["route-saved", "durable-read"]
             # The normal-turn lookup shares this persisted host entry and can
             # no longer fall back to the ended parent.

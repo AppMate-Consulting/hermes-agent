@@ -1503,6 +1503,9 @@ async def test_gateway_hygiene_reconciles_committed_postpublication_failure(
             messages=durable,
             compression_lock_holder="proof-holder",
         )
+    # The committed transcript is the SessionDB projection, not the candidate
+    # passed to its writer (which may contain speculative row ids/timestamps).
+    durable = db.get_messages_as_conversation(child)
 
     class CommittedAgent:
         instance = None

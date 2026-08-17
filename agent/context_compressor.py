@@ -4811,6 +4811,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _active_task_contract(cls, messages: List[Dict[str, Any]]) -> Optional[dict]:
         """Return the latest real human task, including across compactions."""
         from agent.conversation_compression import (
+            ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
             ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
             ACTIVE_TASK_TRUST_MARKER,
             _latest_active_human_task_row,
@@ -4821,11 +4822,16 @@ This compaction should PRIORITISE preserving all information related to the focu
             message = messages[index]
             projected = (
                 index > 0
+                and index + 1 < len(messages)
                 and isinstance(messages[index - 1], dict)
+                and isinstance(messages[index + 1], dict)
                 and messages[index - 1].get("role") == "assistant"
                 and messages[index - 1].get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
                 and messages[index - 1].get(ACTIVE_TASK_TRUST_MARKER) is True
                 and message.get(ACTIVE_TASK_TRUST_MARKER) is True
+                and messages[index + 1].get("role") == "assistant"
+                and messages[index + 1].get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
+                and messages[index + 1].get(ACTIVE_TASK_TRUST_MARKER) is True
             )
             contract = cls.parse_active_task_contract(message, allow_projected=projected)
             if contract is not None:
@@ -4840,6 +4846,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return None
             content = _content_text_for_contains(raw_content)
             if content:
+                # An untrusted exact-text replay remains a genuine human row,
+                # but reserved contract syntax must never bootstrap itself
+                # into an authoritative active-task contract.
+                if content.startswith(ACTIVE_TASK_CONTRACT_PREFIX):
+                    return None
                 return {
                     "content": content,
                     "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
@@ -4927,8 +4938,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
         contract = {"content": content, "sha256": digest}
         metadata = message.get(ACTIVE_TASK_CONTRACT_METADATA_KEY)
-        trusted_durable = message.get("_active_task_contract_trusted") is True
-        if metadata is None and not allow_projected and not trusted_durable:
+        if metadata is None and not allow_projected:
             return None
         if metadata is not None and metadata != contract:
             return None

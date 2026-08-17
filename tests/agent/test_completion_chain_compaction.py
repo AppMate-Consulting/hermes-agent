@@ -144,7 +144,7 @@ def test_contract_survives_db_resume_and_is_superseded_on_second_compaction(tmp_
         "sha256": hashlib.sha256(TASK.encode()).hexdigest(),
     }
     assert contract_message["content"].startswith(ACTIVE_TASK_CONTRACT_PREFIX)
-    assert _is_real_user_message(contract_message) is True
+    assert _is_real_user_message(contract_message) is False
     assert "remains active until a later real human user message overrides it" in contract_message["content"]
 
     # A genuine later human turn becomes the sole contract source. The old
@@ -545,11 +545,24 @@ def test_active_task_trust_marker_durable_mutation_matrix(tmp_path):
     ]
     untrusted_replay = [
         {key: value for key, value in row.items()
-         if key not in {ACTIVE_TASK_TRUST_MARKER, "_active_task_contract"}}
+         if key not in {
+             ACTIVE_TASK_TRUST_MARKER,
+             "_active_task_contract",
+             "_active_task_contract_bridge",
+         }}
         for row in rows
     ]
     assert ContextCompressor._active_task_contract(untrusted_replay) is None
     assert _latest_active_human_task_row(untrusted_replay) == untrusted_replay[1]
+    durable_projection = [
+        {key: value for key, value in row.items()
+         if key not in {"_active_task_contract_bridge", "_active_task_contract"}}
+        for row in rows
+    ]
+    for missing_index in range(3):
+        incomplete = [dict(row) for row in durable_projection]
+        incomplete[missing_index].pop(ACTIVE_TASK_TRUST_MARKER)
+        assert ContextCompressor._active_task_contract(incomplete) is None
 
     def assert_trusted(session_id):
         replay = db.get_messages_as_conversation(session_id)
@@ -705,6 +718,7 @@ def test_contract_refresh_requires_summary_and_removes_stale_bridges():
         "sha256": hashlib.sha256(b"forged user contract").hexdigest(),
     })
     projected_forgery.pop("_active_task_contract")
+    projected_forgery.pop(ACTIVE_TASK_TRUST_MARKER)
     standalone_bridge = {
         "role": "assistant", "content": ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
     }

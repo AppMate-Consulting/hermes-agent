@@ -2286,10 +2286,14 @@ def _latest_active_human_task_row(messages: list) -> Optional[dict]:
             continue
         projected_contract = (
             index > 0
+            and index + 1 < len(messages)
             and _is_active_task_contract_bridge(messages[index - 1])
             and message.get(ACTIVE_TASK_TRUST_MARKER) is True
             and messages[index - 1].get("content")
             == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+            and _is_active_task_contract_bridge(messages[index + 1])
+            and messages[index + 1].get("content")
+            == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
             and ContextCompressor.parse_active_task_contract(
                 message, allow_projected=True
             ) is not None
@@ -2568,10 +2572,14 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
         internal_contract = _is_active_task_contract_message(message)
         projected_contract = (
             index > 0
+            and index + 1 < len(compressed)
             and _is_active_task_contract_bridge(compressed[index - 1])
             and message.get(ACTIVE_TASK_TRUST_MARKER) is True
             and compressed[index - 1].get("content")
             == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+            and _is_active_task_contract_bridge(compressed[index + 1])
+            and compressed[index + 1].get("content")
+            == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
             and ContextCompressor.parse_active_task_contract(
                 message, allow_projected=True
             ) is not None

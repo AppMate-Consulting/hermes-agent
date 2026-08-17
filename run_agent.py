@@ -8070,11 +8070,15 @@ class AIAgent:
                 )
                 raise
             except BaseException as exc:
-                _publish_compression_outcome(
-                    self,
-                    f"wrapper_exception_{type(exc).__name__}",
-                    outer_terminal=True,
+                from agent.conversation_compression import (
+                    CompressionCommittedPostpublicationError,
                 )
+                if not isinstance(exc, CompressionCommittedPostpublicationError):
+                    _publish_compression_outcome(
+                        self,
+                        f"wrapper_exception_{type(exc).__name__}",
+                        outer_terminal=True,
+                    )
                 raise
             # compress_context ran on a daemon pool worker thread; the session
             # id rotation updated hermes_logging._session_context (a

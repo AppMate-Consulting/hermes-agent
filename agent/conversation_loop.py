@@ -2947,6 +2947,10 @@ def run_conversation(
                 # dispatch. It remains reusable only under the semantics gate
                 # above and cannot survive this provider-attempt loop.
                 _admitted_request = None
+                _immutable_admitted_payload = (
+                    _admitted_retry_request is not None
+                    and _finalized_request is _admitted_retry_request
+                )
                 if _using_admitted_request and _finalized_request.get(
                     "_consumes_user_initiator"
                 ):
@@ -3157,6 +3161,7 @@ def run_conversation(
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
+                        immutable_request=_immutable_admitted_payload,
                     )
                 finally:
                     if _redirect_lock is not None:

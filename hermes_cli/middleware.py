@@ -34,6 +34,10 @@ VALID_MIDDLEWARE: set[str] = {
 }
 
 
+class ImmutableRequestMiddlewareError(RuntimeError):
+    """Execution middleware violated an admitted-request ownership contract."""
+
+
 @dataclass
 class RequestMiddlewareResult:
     """Result of applying request middleware to a mutable payload."""
@@ -189,7 +193,14 @@ def run_llm_execution_middleware(
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
-    """Run provider execution through registered LLM execution middleware."""
+    """Run provider execution through registered LLM execution middleware.
+
+    ``immutable_request=True`` is reserved for a request already admitted by
+    the compression transaction.  Wrappers still run on every attempt, but
+    they may only continue with ``next_call()``; the terminal call always
+    receives the originally admitted object.
+    """
+    immutable_request = bool(context.pop("immutable_request", False))
     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(request)
@@ -199,6 +210,7 @@ def run_llm_execution_middleware(
         next_call,
         request=request,
         original_request=context.pop("original_request", request),
+        immutable_payload=immutable_request,
         **context,
     )
 
@@ -258,6 +270,23 @@ def _run_execution_chain(
     **kwargs: Any,
 ) -> Any:
     payload_key = "request" if "request" in kwargs else "args"
+    immutable_payload = bool(kwargs.pop("immutable_payload", False))
+    admitted_payload = kwargs[payload_key]
+    admitted_snapshot = _safe_copy(admitted_payload) if immutable_payload else None
+
+    def assert_admitted_unchanged(callback: Callable) -> None:
+        if not immutable_payload:
+            return
+        try:
+            unchanged = admitted_payload == admitted_snapshot
+        except Exception:
+            unchanged = False
+        if not unchanged:
+            raise ImmutableRequestMiddlewareError(
+                f"Middleware '{kind}' callback "
+                f"{getattr(callback, '__name__', repr(callback))} mutated the "
+                "immutable admitted request; provider dispatch was refused"
+            )
 
     class _DownstreamExecutionError(Exception):
         def __init__(self, original: BaseException) -> None:
@@ -285,9 +314,27 @@ def _run_execution_chain(
                     f"{getattr(callback, '__name__', repr(callback))} called "
                     "next_call() more than once; downstream execution is single-use"
                 )
+            assert_admitted_unchanged(callback)
+            if immutable_payload and next_payload is not None:
+                try:
+                    replacement_changed = next_payload != admitted_snapshot
+                except Exception:
+                    replacement_changed = True
+                if replacement_changed:
+                    raise ImmutableRequestMiddlewareError(
+                        f"Middleware '{kind}' callback "
+                        f"{getattr(callback, '__name__', repr(callback))} tried "
+                        "to replace the immutable admitted request; provider "
+                        "dispatch was refused"
+                    )
             next_called = True
             try:
-                next_result = call_at(index + 1, payload if next_payload is None else next_payload)
+                next_result = call_at(
+                    index + 1,
+                    admitted_payload
+                    if immutable_payload
+                    else payload if next_payload is None else next_payload,
+                )
                 next_succeeded = True
                 return next_result
             except Exception as exc:
@@ -297,7 +344,11 @@ def _run_execution_chain(
         call_kwargs[payload_key] = payload
         call_kwargs["next_call"] = next_call
         try:
-            return callback(**call_kwargs)
+            result = callback(**call_kwargs)
+            assert_admitted_unchanged(callback)
+            return result
+        except ImmutableRequestMiddlewareError:
+            raise
         except _DownstreamExecutionError as exc:
             raise exc.original
         except Exception as exc:

@@ -119,6 +119,7 @@ def _run(
     admitted_snapshots,
     middleware_calls,
     boundary_events=None,
+    execution_callbacks=None,
 ):
     boundary_events = boundary_events if boundary_events is not None else []
     response_iter = iter(responses)
@@ -171,6 +172,11 @@ def _run(
             side_effect=lambda payload: 1_000 if "compact summary" in str(payload) else 100_000,
         ),
         patch("hermes_cli.middleware.apply_llm_request_middleware", side_effect=middleware),
+        patch(
+            "hermes_cli.middleware._get_middleware_callbacks",
+            side_effect=lambda kind: list(execution_callbacks or [])
+            if kind == "llm_execution" else [],
+        ),
         patch("agent.conversation_loop.jittered_backoff", return_value=0),
         patch.object(agent, "_compress_context", side_effect=capture_admission),
         patch.object(agent, "_persist_session"),
@@ -258,6 +264,131 @@ def test_same_provider_retry_reuses_admitted_bytes_verbatim():
     assert calls[0].kwargs == calls[1].kwargs
     assert calls[0].kwargs["messages"] is calls[1].kwargs["messages"]
     assert calls[0].kwargs["tools"] is calls[1].kwargs["tools"]
+
+
+def test_admitted_execution_replacement_fails_closed_before_dispatch():
+    agent, _ = _agent()
+    admitted, snapshots, middleware_calls = [], [], []
+
+    def replace(request, next_call, **_context):
+        replacement = copy.deepcopy(request)
+        replacement["messages"].append({"role": "user", "content": "inflated"})
+        replacement["tools"] = []
+        replacement["input"] = [{"role": "user", "content": "changed"}]
+        return next_call(replacement)
+
+    result = _run(
+        agent, [_response()], admitted=admitted, admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls, execution_callbacks=[replace],
+    )
+
+    assert result["failed"] is True
+    assert "immutable admitted request" in result["error"]
+    agent.client.chat.completions.create.assert_not_called()
+    assert admitted[0] == snapshots[0]
+
+
+def test_admitted_execution_in_place_mutation_fails_closed_before_dispatch():
+    agent, _ = _agent()
+    admitted, snapshots, middleware_calls = [], [], []
+
+    def mutate(request, next_call, **_context):
+        request["messages"][0]["content"] = "mutated in place"
+        return next_call()
+
+    result = _run(
+        agent, [_response()], admitted=admitted, admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls, execution_callbacks=[mutate],
+    )
+
+    assert result["failed"] is True
+    assert "mutated the immutable admitted request" in result["error"]
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_admitted_execution_wrapper_observes_exact_object_and_wraps_call():
+    agent, _ = _agent()
+    admitted, snapshots, middleware_calls, events = [], [], [], []
+    observed = []
+
+    def wrapper(request, next_call, **_context):
+        observed.append(request)
+        events.append("before")
+        response = next_call()
+        events.append("after")
+        return response
+
+    result = _run(
+        agent, [_response()], admitted=admitted, admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls, execution_callbacks=[wrapper],
+    )
+
+    assert result["completed"] is True
+    assert events == ["before", "after"]
+    assert observed == [admitted[0]["payload"]]
+    assert observed[0] is admitted[0]["payload"]
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatch["messages"] is observed[0]["messages"]
+    assert dispatch["tools"] is observed[0]["tools"]
+
+
+def test_admitted_retry_wrapper_cannot_statefully_replace_payload():
+    agent, _ = _agent()
+    admitted, snapshots, middleware_calls = [], [], []
+    attempts = []
+
+    def stateful_wrapper(request, next_call, **_context):
+        attempts.append(request)
+        # Semantically equal replacements are ignored: every terminal call
+        # must still receive the exact admitted object and nested objects.
+        return next_call(copy.deepcopy(request))
+
+    result = _run(
+        agent, [_response(invalid=True), _response()], admitted=admitted,
+        admitted_snapshots=snapshots, middleware_calls=middleware_calls,
+        execution_callbacks=[stateful_wrapper],
+    )
+
+    assert result["completed"] is True
+    assert attempts == [admitted[0]["payload"], admitted[0]["payload"]]
+    assert attempts[0] is attempts[1]
+    calls = agent.client.chat.completions.create.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["messages"] is calls[1].kwargs["messages"]
+    assert calls[0].kwargs["tools"] is calls[1].kwargs["tools"]
+
+
+def test_admitted_retry_refuses_statefully_changed_second_payload():
+    agent, _ = _agent()
+    admitted, snapshots, middleware_calls = [], [], []
+    attempts = 0
+
+    def stateful_wrapper(request, next_call, **_context):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return next_call()
+        replacement = copy.deepcopy(request)
+        replacement["messages"].append(
+            {"role": "user", "content": f"retry rewrite {attempts}"}
+        )
+        return next_call(replacement)
+
+    result = _run(
+        agent, [_response(invalid=True), _response()], admitted=admitted,
+        admitted_snapshots=snapshots, middleware_calls=middleware_calls,
+        execution_callbacks=[stateful_wrapper],
+    )
+
+    assert result["failed"] is True
+    assert "replace the immutable admitted request" in result["error"]
+    assert attempts == 2
+    # The first admitted attempt reached the provider.  The statefully changed
+    # retry did not, so there is no publication/dispatch of altered bytes.
+    calls = agent.client.chat.completions.create.call_args_list
+    assert len(calls) == 1
+    assert calls[0].kwargs["messages"] is admitted[0]["payload"]["messages"]
+    assert calls[0].kwargs["tools"] is admitted[0]["payload"]["tools"]
 
 
 def test_tool_iteration_cannot_consume_stale_admission():

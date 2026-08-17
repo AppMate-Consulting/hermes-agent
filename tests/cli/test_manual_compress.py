@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tests.cli.test_cli_init import _make_cli
 
 
@@ -41,6 +43,41 @@ def test_manual_compress_keeps_tui_composer_editable(capsys):
         shell._manual_compress()
 
     assert observed == {"running": True, "blocks_input": False}
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "summary_failure",
+        "rejected_no_progress",
+        "rejected_would_grow",
+        "rejected_below_minimum_reclaim",
+    ],
+)
+def test_manual_compress_rejection_preserves_history_identity_and_notification(outcome):
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = ""
+    shell.agent.tools = None
+    shell.agent.session_id = shell.session_id
+    shell.agent._compression_skipped_due_to_lock = None
+    shell.agent._last_compression_outcome = outcome
+    shell.agent._compress_context.return_value = (list(history), "")
+
+    with (
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        patch(
+            "agent.conversation_compression.finalize_context_engine_compression_notification"
+        ) as finalize,
+    ):
+        shell._manual_compress()
+
+    assert shell.conversation_history is history
+    assert shell.conversation_history == _make_history()
+    finalize.assert_called_once_with(shell.agent, committed=False)
 
 
 

@@ -5179,6 +5179,17 @@ def _compress_session_history(
             finalize_context_engine_compression_notification(agent, committed=False)
             return 0, _get_usage(agent)
         else:
+            from agent.conversation_compression import compression_outcome_committed
+
+            outcome = getattr(agent, "_last_compression_outcome", None)
+            committed = compression_outcome_committed(outcome)
+            if not isinstance(outcome, str):
+                committed = compressed != history
+            if not committed:
+                finalize_context_engine_compression_notification(
+                    agent, committed=False
+                )
+                return 0, _get_usage(agent)
             session["history"] = compressed
             session["history_version"] = history_version + 1
     usage = _get_usage(agent)

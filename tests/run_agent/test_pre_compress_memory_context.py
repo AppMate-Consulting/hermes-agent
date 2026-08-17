@@ -180,6 +180,127 @@ def test_compression_rejects_middleware_only_finalized_request_growth(
     assert agent._last_compression_outcome == "rejected_would_grow"
 
 
+def test_compression_rejects_nondeterministic_before_middleware(monkeypatch):
+    """The frozen before body must be replayed, not only the candidate body."""
+    from hermes_cli.middleware import RequestMiddlewareResult
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "small"}]
+    _configure_engine_state(compressor)
+    agent = _make_agent(None, compressor)
+    calls = 0
+
+    def stateful(payload, **_context):
+        nonlocal calls
+        calls += 1
+        shaped = copy.deepcopy(payload)
+        if calls == 1:
+            shaped["one_time_inflation"] = "x" * 100_000
+        return RequestMiddlewareResult(
+            payload=shaped,
+            original_payload=copy.deepcopy(payload),
+            changed=shaped != payload,
+            trace=[],
+        )
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware", stateful)
+    original = _messages()
+    returned, _ = agent._compress_context(
+        original, "sys", approx_tokens=100_000, force=True
+    )
+
+    assert calls == 4
+    assert returned is original
+    assert agent._last_compression_outcome == "rejected_nondeterministic_middleware"
+
+
+@pytest.mark.parametrize(
+    ("sizes", "outcome"),
+    [
+        ((100_000, 100_000), "rejected_no_progress"),
+        ((100_000, 101_000), "rejected_would_grow"),
+        ((100_000, 97_000), "rejected_below_minimum_reclaim"),
+    ],
+)
+def test_policy_rejection_restores_exact_compressor_state(monkeypatch, sizes, outcome):
+    compressor = MagicMock()
+    _configure_engine_state(compressor)
+    compressor._previous_summary = "committed summary"
+    compressor._fallback_compression_streak = 2
+    compressor._ineffective_compression_count = 1
+    compressor.summary_model = "stable/model"
+
+    def mutate_then_compress(_messages, **_kwargs):
+        compressor.compression_count = 99
+        compressor._previous_summary = "speculative summary"
+        compressor._fallback_compression_streak = 9
+        compressor._ineffective_compression_count = 9
+        compressor.summary_model = "speculative/model"
+        return [{"role": "user", "content": "candidate"}]
+
+    compressor.compress.side_effect = mutate_then_compress
+    agent = _make_agent(None, compressor)
+    estimates = iter(sizes)
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        lambda _payload: next(estimates),
+    )
+    original = _messages()
+    returned, _ = agent._compress_context(original, "sys", force=True)
+
+    assert returned is original
+    assert agent._last_compression_outcome == outcome
+    assert compressor.compression_count == 1
+    assert compressor._previous_summary == "committed summary"
+    assert compressor._fallback_compression_streak == 2
+    assert compressor._ineffective_compression_count == 1
+    assert compressor.summary_model == "stable/model"
+
+
+@pytest.mark.parametrize(
+    ("kind", "outcome"),
+    [
+        ("summary_failure", "summary_failure"),
+        ("no_progress", "rejected_no_progress"),
+        ("empty", "rejected_empty_transcript"),
+    ],
+)
+def test_early_rejection_restores_exact_compressor_state(kind, outcome):
+    compressor = MagicMock()
+    _configure_engine_state(compressor)
+    compressor._previous_summary = "committed summary"
+    compressor._fallback_compression_streak = 2
+    compressor._ineffective_compression_count = 1
+    compressor.summary_model = "stable/model"
+    original = _messages()
+
+    def reject(_messages, **_kwargs):
+        compressor.compression_count = 99
+        compressor._previous_summary = "speculative summary"
+        compressor._fallback_compression_streak = 9
+        compressor._ineffective_compression_count = 9
+        compressor.summary_model = "speculative/model"
+        if kind == "summary_failure":
+            compressor._last_compress_aborted = True
+            compressor._last_summary_error = "summary unavailable"
+        if kind == "empty":
+            return []
+        return copy.deepcopy(original)
+
+    compressor.compress.side_effect = reject
+    agent = _make_agent(None, compressor)
+    returned, _ = agent._compress_context(original, "sys", force=True)
+
+    assert returned is original
+    assert agent._last_compression_outcome == outcome
+    assert compressor.compression_count == 1
+    assert compressor._previous_summary == "committed summary"
+    assert compressor._fallback_compression_streak == 2
+    assert compressor._ineffective_compression_count == 1
+    assert compressor.summary_model == "stable/model"
+    assert compressor._last_compress_aborted is False
+
+
 def test_rebuilt_system_growth_outweighs_real_message_shrink():
     """Admission sizes the complete request, including prompt and tool schema."""
     compressor = MagicMock()

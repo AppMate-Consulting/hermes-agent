@@ -250,6 +250,16 @@ def _compaction_terminal_status(outcome: Any) -> str:
     return f"Context compaction failed — no changes committed ({value})."
 
 
+def compression_outcome_committed(outcome: Any) -> bool:
+    """Whether an attempt outcome authorizes host transcript adoption."""
+    return outcome in {
+        "committed_materially_shrunk",
+        "committed_in_memory",
+        "committed_provider_managed",
+        "committed_postpublication_sync_error",
+    }
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
     status_callback = getattr(agent, "status_callback", None)
@@ -2946,6 +2956,33 @@ def compress_context(
     )
     _durable_cooldown_authoritative: Optional[bool] = None
     _durable_cooldown_state: Optional[dict[str, Any]] = None
+
+    def _rollback_rejected_compressor_state(
+        *, cooldown_reason: Optional[str] = None, preserve_current_cooldown: bool = False
+    ) -> None:
+        """Roll back speculative engine state, retaining only required cooldown."""
+        current_cooldown = {
+            name: copy.deepcopy(vars(agent.context_compressor).get(name))
+            for name in _COMPRESSOR_COOLDOWN_STATE_FIELDS
+            if name in vars(agent.context_compressor)
+        }
+        _restore_compressor_attempt_state(
+            agent.context_compressor,
+            _compressor_attempt_snapshot,
+            durable_cooldown_authoritative=(
+                False if preserve_current_cooldown else _durable_cooldown_authoritative
+            ),
+            durable_cooldown_state=_durable_cooldown_state,
+        )
+        if preserve_current_cooldown:
+            for name, value in current_cooldown.items():
+                setattr(agent.context_compressor, name, value)
+        elif cooldown_reason is not None and rejection_cooldown_seconds is not None:
+            recorder = getattr(
+                agent.context_compressor, "_record_compression_failure_cooldown", None
+            )
+            if callable(recorder):
+                recorder(rejection_cooldown_seconds, cooldown_reason)
     if defer_context_engine_notification:
         pending_notifications = getattr(
             agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None
@@ -3856,6 +3893,11 @@ def compress_context(
             split_status="aborted",
             failure_class="explicit_interrupt",
         )
+        _restore_compressor_attempt_state(
+            agent.context_compressor,
+            _compressor_attempt_snapshot,
+            durable_cooldown_authoritative=False,
+        )
         _set_compression_outcome("cancelled_explicit_interrupt")
         _existing_sp = _rollback_prompt()
         return messages, _existing_sp
@@ -3875,6 +3917,7 @@ def compress_context(
             split_status="aborted",
             failure_class=f"exception:{type(_compress_exc).__name__}",
         )
+        _rollback_rejected_compressor_state(preserve_current_cooldown=True)
         _set_compression_outcome(
             f"compression_exception_{type(_compress_exc).__name__}"
         )
@@ -4015,6 +4058,7 @@ def compress_context(
                         and "summary_generation_aborted"
                     ),
                 )
+                _rollback_rejected_compressor_state(preserve_current_cooldown=True)
                 return messages, _existing_sp
             finally:
                 _release_lock()
@@ -4038,18 +4082,16 @@ def compress_context(
                 failure_class="no_progress",
             )
             _set_compression_outcome("rejected_no_progress")
-            if not force and rejection_cooldown_seconds is not None:
-                _record_rejection = getattr(
-                    agent.context_compressor,
-                    "_record_compression_failure_cooldown",
-                    None,
-                )
-                if callable(_record_rejection):
-                    _record_rejection(rejection_cooldown_seconds, "no_progress")
+            _rollback_rejected_compressor_state(
+                cooldown_reason="no_progress" if not force else None
+            )
             _release_lock()
             return messages, _existing_sp
 
         if not compressed:
+            _rollback_rejected_compressor_state(
+                cooldown_reason="empty_transcript" if not force else None
+            )
             logger.error(
                 "context compression returned an empty transcript; refusing to "
                 "rotate session=%s so the parent remains resumable",
@@ -4064,16 +4106,6 @@ def compress_context(
                 pass
             _existing_sp = _rollback_prompt()
             _set_compression_outcome("rejected_empty_transcript")
-            if not force and rejection_cooldown_seconds is not None:
-                _record_rejection = getattr(
-                    agent.context_compressor,
-                    "_record_compression_failure_cooldown",
-                    None,
-                )
-                if callable(_record_rejection):
-                    _record_rejection(
-                        rejection_cooldown_seconds, "empty_transcript"
-                    )
             _release_lock()
             return messages, _existing_sp
 
@@ -4284,11 +4316,16 @@ def compress_context(
             middleware_context=dict(_admission_middleware_context),
         )
         _provider_request_out = _finalized_out["payload"]
-        _finalized_replay = _apply_finalized_request_middleware(
+        _finalized_in_replay = _apply_finalized_request_middleware(
+            _finalized_in,
+            middleware_context=dict(_admission_middleware_context),
+        )
+        _finalized_out_replay = _apply_finalized_request_middleware(
             _finalized_out,
             middleware_context=dict(_admission_middleware_context),
         )
-        _middleware_replay = _finalized_replay["payload"]
+        _middleware_in_replay = _finalized_in_replay["payload"]
+        _middleware_out_replay = _finalized_out_replay["payload"]
         _request_in = estimate_finalized_payload_tokens_rough(_provider_request_in)
         _request_out = estimate_finalized_payload_tokens_rough(_provider_request_out)
         _threshold = int(
@@ -4301,10 +4338,16 @@ def compress_context(
             _rejection = "invalid_protected_tail_seam"
         elif any(
             result.get("middleware_error")
-            for result in (_finalized_in, _finalized_out, _finalized_replay)
+            for result in (
+                _finalized_in, _finalized_out, _finalized_in_replay,
+                _finalized_out_replay,
+            )
         ):
             _rejection = "middleware_unavailable"
-        elif _middleware_replay != _provider_request_out:
+        elif (
+            _middleware_in_replay != _provider_request_in
+            or _middleware_out_replay != _provider_request_out
+        ):
             _rejection = "nondeterministic_middleware"
         elif _provider_request_out == _provider_request_in:
             _rejection = "no_progress"
@@ -4345,14 +4388,9 @@ def compress_context(
                 failure_class=_rejection,
             )
             _set_compression_outcome(f"rejected_{_rejection}")
-            if not force and rejection_cooldown_seconds is not None:
-                _record_rejection = getattr(
-                    agent.context_compressor,
-                    "_record_compression_failure_cooldown",
-                    None,
-                )
-                if callable(_record_rejection):
-                    _record_rejection(rejection_cooldown_seconds, _rejection)
+            _rollback_rejected_compressor_state(
+                cooldown_reason=_rejection if not force else None
+            )
             _restore_uncommitted_input()
             _release_lock()
             return messages, _system_prompt_before_compression

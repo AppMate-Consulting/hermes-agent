@@ -19331,23 +19331,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_outcome = getattr(
                                         _hyg_agent, "_last_compression_outcome", None
                                     )
-                                    # Anti-growth guard: refuse a compression
-                                    # that did not shrink the transcript
-                                    # (observed: 427K -> 598K). Compare
-                                    # like-for-like rough estimates.
-                                    _hyg_in_toks = estimate_messages_tokens_rough(history)
-                                    _hyg_out_toks = estimate_messages_tokens_rough(_compressed)
-                                    if _hyg_rotated and _hyg_out_toks > _hyg_in_toks:
-                                        logger.warning(
-                                            "Gateway hygiene compression for session %s "
-                                            "would grow transcript (~%s -> ~%s tokens); "
-                                            "keeping the original transcript unchanged",
-                                            session_entry.session_id,
-                                            f"{_hyg_in_toks:,}",
-                                            f"{_hyg_out_toks:,}",
-                                        )
-                                        _hyg_rotated = False
-                                        _compressed = history
+                                    # Canonical complete provider-wire admission
+                                    # already ran before publication. Once the
+                                    # child commits, its durable transcript is
+                                    # authoritative even when a message-only
+                                    # estimate happens to be larger.
                                     # Only rewrite the transcript when rotation produced
                                     # a NEW session id.  In-place compaction does NOT
                                     # need a rewrite: archive_and_compact() has already

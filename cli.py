@@ -12587,6 +12587,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     return
 
+                from agent.conversation_compression import compression_outcome_committed
+
+                _compression_outcome = getattr(
+                    self.agent, "_last_compression_outcome", None
+                )
+                _host_commit = compression_outcome_committed(_compression_outcome)
+                # Keep compatibility with simple external/test engines that do
+                # not publish a typed outcome, but never infer a commit from an
+                # equal copy.
+                if not isinstance(_compression_outcome, str):
+                    _host_commit = compressed != original_history
+                if not _host_commit:
+                    finalize_context_engine_compression_notification(
+                        self.agent, committed=False
+                    )
+                    summary = summarize_manual_compression(
+                        original_history,
+                        original_history,
+                        approx_tokens,
+                        approx_tokens,
+                        compression_state=getattr(
+                            self.agent, "context_compressor", None
+                        ),
+                    )
+                    print(f"  🗜️ {summary['headline']}")
+                    print(f"     {summary['token_line']}")
+                    if summary["note"]:
+                        print(f"     {summary['note']}")
+                    return
+
                 self.conversation_history = compressed
                 # _compress_context ends the old session and creates a new child
                 # session on the agent (run_agent.py::_compress_context). Sync the

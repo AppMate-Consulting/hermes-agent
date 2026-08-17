@@ -82,6 +82,38 @@ def test_compress_session_history_raises_on_lock_skip():
     assert session["history_version"] == 1
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "summary_failure",
+        "rejected_no_progress",
+        "rejected_would_grow",
+        "rejected_below_minimum_reclaim",
+    ],
+)
+def test_rejected_compression_preserves_tui_history_identity_and_version(outcome):
+    from tui_gateway.server import _compress_session_history
+
+    history = _make_history()
+    agent = _make_lock_skip_agent(None)
+    agent._last_compression_outcome = outcome
+    session = _make_session(agent, history)
+
+    with (
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        patch(
+            "agent.conversation_compression.finalize_context_engine_compression_notification"
+        ) as finalize,
+    ):
+        removed, _ = _compress_session_history(session)
+
+    assert removed == 0
+    assert session["history"] is history
+    assert session["history"] == _make_history()
+    assert session["history_version"] == 1
+    finalize.assert_called_once_with(agent, committed=False)
+
+
 # ── Consumer 1: session.compress RPC ───────────────────────────────────
 
 

@@ -531,6 +531,127 @@ def test_active_task_trust_survives_close_reopen_and_rotation(tmp_path):
     db.close()
 
 
+def test_active_task_trust_marker_durable_mutation_matrix(tmp_path):
+    """All three internal rows retain trust through every transcript writer."""
+    path = tmp_path / "active-task-marker-matrix.db"
+    db = SessionDB(db_path=path)
+    contract = {"content": TASK, "sha256": hashlib.sha256(TASK.encode()).hexdigest()}
+    rows = [
+        {"role": "assistant", "content": ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+         ACTIVE_TASK_TRUST_MARKER: True},
+        ContextCompressor.make_active_task_contract_message(contract),
+        {"role": "assistant", "content": ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+         ACTIVE_TASK_TRUST_MARKER: True},
+    ]
+    untrusted_replay = [
+        {key: value for key, value in row.items()
+         if key not in {ACTIVE_TASK_TRUST_MARKER, "_active_task_contract"}}
+        for row in rows
+    ]
+    assert ContextCompressor._active_task_contract(untrusted_replay) is None
+    assert _latest_active_human_task_row(untrusted_replay) == untrusted_replay[1]
+
+    def assert_trusted(session_id):
+        replay = db.get_messages_as_conversation(session_id)
+        assert [m.get(ACTIVE_TASK_TRUST_MARKER) for m in replay] == [True] * 3
+        assert ContextCompressor._active_task_contract(replay) == contract
+        return replay
+
+    # Single-row append and the production batch writer use distinct bind paths.
+    db.create_session("single", source="test", model="test/model")
+    for row in rows:
+        db.append_message(
+            "single", row["role"], row["content"],
+            active_task_contract_provenance=True,
+        )
+    assert_trusted("single")
+
+    db.create_session("batch", source="test", model="test/model")
+    db.append_messages_batch("batch", [dict(row) for row in rows])
+    replay = assert_trusted("batch")
+
+    db.replace_messages("batch", replay)
+    replay = assert_trusted("batch")
+    generation = db.get_active_transcript_identity("batch")
+    db.archive_and_compact(
+        "batch", replay, expected_active_identity=generation,
+    )
+    replay = assert_trusted("batch")
+
+    # Rotation is a child publication through the same durable batch shape.
+    db.create_session(
+        "child", source="test", model="test/model", parent_session_id="batch",
+    )
+    db.append_messages_batch("child", replay)
+    assert_trusted("child")
+    db.close()
+
+    db = SessionDB(db_path=path)
+    assert_trusted("single")
+    assert_trusted("batch")
+    assert_trusted("child")
+    db.close()
+
+
+def test_active_task_provenance_update_advances_generation_and_fences_publish(tmp_path):
+    db = SessionDB(db_path=tmp_path / "active-task-generation.db")
+    db.create_session("s", source="test", model="test/model")
+    row_id = db.append_message("s", "user", "ordinary")
+    stale_generation = db.get_active_transcript_identity("s")
+
+    # Simulate a legacy/concurrent writer changing only the trust column.
+    with db._conn:
+        db._conn.execute(
+            "UPDATE messages SET active_task_contract_provenance = 1 WHERE id = ?",
+            (row_id,),
+        )
+    assert db.get_active_transcript_identity("s") == stale_generation + 1
+    with pytest.raises(RuntimeError, match="transcript changed"):
+        db.archive_and_compact(
+            "s", [{"role": "user", "content": "stale"}],
+            expected_active_identity=stale_generation,
+        )
+    assert db.get_messages_as_conversation("s")[0]["content"] == "ordinary"
+    db.close()
+
+
+def test_pre_v27_database_reconciles_active_task_provenance_without_data_loss(tmp_path):
+    """Exercise normal initialization against an actual v26-shaped SQLite file."""
+    import sqlite3
+    from hermes_state_common import SCHEMA_SQL
+
+    path = tmp_path / "pre-v27.db"
+    pre_v27_sql = SCHEMA_SQL.replace(
+        ",\n    active_task_contract_provenance INTEGER NOT NULL DEFAULT 0\n", "\n"
+    )
+    raw = sqlite3.connect(path)
+    raw.executescript(pre_v27_sql)
+    raw.execute("INSERT INTO schema_version(version) VALUES (26)")
+    raw.execute(
+        "INSERT INTO sessions(id, source, model, started_at) "
+        "VALUES ('legacy', 'test', 'test/model', 1)"
+    )
+    raw.execute(
+        "INSERT INTO messages(session_id, role, content, timestamp) "
+        "VALUES ('legacy', 'user', 'preserved legacy message', 1)"
+    )
+    raw.commit()
+    raw.close()
+
+    db = SessionDB(db_path=path)
+    columns = {
+        row["name"] for row in db._conn.execute("PRAGMA table_info(messages)")
+    }
+    assert "active_task_contract_provenance" in columns
+    stored = db._conn.execute(
+        "SELECT content, active_task_contract_provenance FROM messages "
+        "WHERE session_id = 'legacy'"
+    ).fetchone()
+    assert tuple(stored) == ("preserved legacy message", 0)
+    assert db.get_messages_as_conversation("legacy")[0]["content"] == "preserved legacy message"
+    db.close()
+
+
 def test_contract_refresh_requires_summary_and_removes_stale_bridges():
     original = [
         {"role": "user", "content": TASK},

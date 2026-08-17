@@ -547,16 +547,6 @@ def _has_valid_session_token(request: Request) -> bool:
     accept the legacy Bearer path for backward compatibility with older
     dashboard bundles.
     """
-    # Desktop starts a private backend bound to 127.0.0.1 from the Electron
-    # main process. After updates/reboots the frontend and backend can drift
-    # on the ephemeral token even though the backend is still process-owned by
-    # Desktop; keep that trusted local process path usable without exposing LAN
-    # access or remote dashboard binds.
-    if os.environ.get("HERMES_DESKTOP_LOCAL_BACKEND") == "1":
-        client_host = getattr(getattr(request, "client", None), "host", "")
-        if client_host in {"127.0.0.1", "::1", "localhost"}:
-            return True
-
     session_header = request.headers.get(_SESSION_HEADER_NAME, "")
     if session_header and hmac.compare_digest(
         session_header.encode(),
@@ -15495,17 +15485,6 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     Audit-logs the rejection so operators can debug "WS keeps closing"
     issues from the log.
     """
-    # Desktop starts a private backend bound to 127.0.0.1 from the Electron
-    # main process. After updates/reboots the frontend and backend can drift
-    # on ephemeral WS credentials even though the backend is still process-owned
-    # by Desktop; keep that trusted local process path usable without exposing
-    # LAN access or the separate Tailscale dashboard bind.
-    if os.environ.get("HERMES_DESKTOP_LOCAL_BACKEND") == "1":
-        client_host = ws.client.host if ws.client else ""
-        bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
-        if client_host in _LOOPBACK_HOST_VALUES and (not bound_host or bound_host in _LOOPBACK_HOST_VALUES):
-            return None, "desktop_loopback"
-
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses

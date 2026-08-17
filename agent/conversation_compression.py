@@ -3763,10 +3763,11 @@ def compress_context(
 
     _commit_fence_entered = False
     _caller_publication_authoritative = False
+    _host_claim_exception: Optional[BaseException] = None
 
     def _publish_session_db(operation: Callable[[], None]) -> None:
         """Fence exactly one SessionDB publication and promptly free its lease."""
-        nonlocal _commit_fence_entered
+        nonlocal _commit_fence_entered, _host_claim_exception
         # A host whose transcript has an independent in-memory generation may
         # claim that generation immediately before the durable transaction.
         # The claim returns an optional release callback so the host can hold
@@ -3778,15 +3779,19 @@ def compress_context(
         _claim_host_publication = getattr(
             agent, "_claim_compression_host_publication", None
         )
-        if callable(_claim_host_publication):
-            _release_host_claim = _claim_host_publication()
-        if commit_fence is not None:
-            _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
-            if not _commit_fence_entered:
-                if callable(_release_host_claim):
-                    _release_host_claim()
-                raise _CompressionPublicationCancelled()
         try:
+            if callable(_claim_host_publication):
+                try:
+                    _release_host_claim = _claim_host_publication()
+                except BaseException as exc:
+                    _host_claim_exception = exc
+                    raise
+            if commit_fence is not None:
+                _commit_fence_entered = commit_fence.begin_commit(
+                    _hard_cancel_event
+                )
+                if not _commit_fence_entered:
+                    raise _CompressionPublicationCancelled()
             operation()
             _adopt_host_publication = getattr(
                 agent, "_adopt_compression_host_publication", None
@@ -4456,6 +4461,8 @@ def compress_context(
                 _release_lock()
                 return messages, _rollback_prompt()
             except Exception as e:
+                if e is _host_claim_exception:
+                    raise
                 _set_compression_outcome("persistence_failure")
                 _restore_uncommitted_input()
                 compressed = messages

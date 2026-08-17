@@ -122,15 +122,27 @@ def durable_case(tmp_path: Path):
 
 
 def _assert_valid_tool_pairs(rows: list[dict]) -> None:
-    calls = {
-        call["id"]
+    roles = [row.get("role") for row in rows]
+    assert all(left != right for left, right in zip(roles, roles[1:]))
+    calls = [
+        call
         for row in rows if row.get("role") == "assistant"
-        for call in row.get("tool_calls") or [] if call.get("id")
-    }
-    assert all(
-        row.get("role") != "tool" or row.get("tool_call_id") in calls
-        for row in rows
-    )
+        for call in row.get("tool_calls") or []
+    ]
+    results = [row for row in rows if row.get("role") == "tool"]
+    assert all(call.get("id") for call in calls)
+    assert all(row.get("tool_call_id") for row in results)
+    call_ids = [
+        call["id"]
+        for call in calls
+    ]
+    result_ids = [
+        row["tool_call_id"]
+        for row in results
+    ]
+    assert len(call_ids) == len(set(call_ids))
+    assert len(result_ids) == len(set(result_ids))
+    assert set(call_ids) == set(result_ids)
 
 
 def _assert_success(db, parent, source, agent, caller_history, seen, publish):
@@ -176,7 +188,7 @@ def test_cli_manual_compress_real_sessiondb_partial_matrix(durable_case, in_plac
         "agent.manual_compression_feedback.summarize_manual_compression",
         return_value={"headline": "ok", "token_line": "small", "note": "", "noop": False},
     ), patch.object(agent, "_flush_messages_to_session_db", wraps=agent._flush_messages_to_session_db) as flush:
-        shell._manual_compress("/compress here 5")
+        shell._manual_compress("/compress here 4")
     flush.assert_not_called()
     _assert_success(db, sid, source, agent, shell.conversation_history, seen, publish)
 
@@ -198,7 +210,7 @@ def test_tui_compress_session_history_real_sessiondb_partial_matrix(durable_case
         "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
         side_effect=[100_000, 1_000],
     ):
-        _compress_session_history(session, "here 5", approx_tokens=100_000)
+        _compress_session_history(session, "here 4", approx_tokens=100_000)
     _assert_success(db, sid, source, agent, session["history"], seen, publish)
 
 
@@ -217,7 +229,7 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
     seen: list[list[dict]] = []
     prepared = _agent(db, sid, in_place=in_place, seen=seen)
     source = SessionSource(platform=Platform.TELEGRAM, user_id="u", chat_id="c", chat_type="dm")
-    event = MessageEvent(text="/compress here 5", source=source, message_id="m")
+    event = MessageEvent(text="/compress here 4", source=source, message_id="m")
     entry = SessionEntry(
         "telegram:u:c", sid, datetime.now(), datetime.now(),
         origin=source, platform=Platform.TELEGRAM, chat_type="dm",
@@ -272,7 +284,7 @@ def test_real_publication_failure_restores_exact_state(durable_case, in_place):
         "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
         side_effect=[100_000, 1_000],
     ), patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100_000):
-        shell._manual_compress("/compress here 5")
+        shell._manual_compress("/compress here 4")
     assert shell.conversation_history == original
     assert db.get_messages_as_conversation(sid) == original
     assert not any(row.get("compacted") for row in db.get_messages(sid, include_inactive=True))
@@ -369,8 +381,67 @@ def test_tui_prepublication_host_mutation_fails_without_lock_leak(durable_case):
         "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
         side_effect=[100_000, 1_000],
     ), pytest.raises(RuntimeError, match="history changed"):
-        _compress_session_history(session, "here 5", approx_tokens=100_000)
+        _compress_session_history(session, "here 4", approx_tokens=100_000)
     assert db.get_messages_as_conversation(sid) == source
     assert lock.acquire(blocking=False)
     lock.release()
+    assert db.get_compression_lock_holder(sid) is None
+
+
+def test_host_claim_exception_releases_lease_before_commit_fence(durable_case):
+    """A failed host claim preserves its error and never enters commit."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    db, sid, source = durable_case
+    agent = _agent(db, sid, in_place=True, seen=[])
+    fence = CompressionCommitFence()
+    host_release = MagicMock()
+
+    def reject_claim():
+        raise RuntimeError("host generation rejected")
+
+    agent._claim_compression_host_publication = reject_claim
+    with patch.object(fence, "begin_commit", wraps=fence.begin_commit) as begin, patch.object(
+        fence, "finish_commit", wraps=fence.finish_commit
+    ) as finish, patch(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        side_effect=[100_000, 1_000],
+    ), pytest.raises(RuntimeError, match="host generation rejected"):
+        agent._compress_context(
+            source, None, approx_tokens=100_000, force=True,
+            protected_tail=source[4:], commit_fence=fence,
+        )
+    begin.assert_not_called()
+    finish.assert_not_called()
+    host_release.assert_not_called()
+    assert db.get_messages_as_conversation(sid) == source
+    assert db.get_compression_lock_holder(sid) is None
+
+
+def test_begin_commit_cancel_after_host_claim_releases_once(durable_case):
+    """Fence refusal after a claim releases both host claim and durable lease."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    db, sid, source = durable_case
+    agent = _agent(db, sid, in_place=True, seen=[])
+    fence = CompressionCommitFence()
+    host_release = MagicMock()
+    agent._claim_compression_host_publication = MagicMock(return_value=host_release)
+    with patch.object(fence, "begin_commit", return_value=False) as begin, patch.object(
+        fence, "finish_commit", wraps=fence.finish_commit
+    ) as finish, patch(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        side_effect=[100_000, 1_000],
+    ):
+        returned, _ = agent._compress_context(
+            source, None, approx_tokens=100_000, force=True,
+            protected_tail=source[4:], commit_fence=fence,
+        )
+    assert returned == source
+    agent._claim_compression_host_publication.assert_called_once_with()
+    begin.assert_called_once()
+    finish.assert_not_called()
+    host_release.assert_called_once_with()
+    assert agent._last_compression_outcome == "cancelled_commit_fence"
+    assert db.get_messages_as_conversation(sid) == source
     assert db.get_compression_lock_holder(sid) is None

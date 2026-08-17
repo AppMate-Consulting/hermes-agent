@@ -1615,6 +1615,8 @@ class ContextCompressor(ContextEngine):
         str, bytes, int, float, bool, type(None), dict, list, set, tuple
     )
 
+    _ATTEMPT_STATE_CONTAINER_TYPES = (dict, list, set, tuple)
+
     def snapshot_compression_attempt_state(self) -> Dict[str, Any]:
         """Snapshot compressor-owned value state without copying resources.
 
@@ -1628,13 +1630,45 @@ class ContextCompressor(ContextEngine):
         owned = {
             name: value
             for name, value in values.items()
-            if isinstance(value, self._ATTEMPT_STATE_VALUE_TYPES)
+            if type(value) in self._ATTEMPT_STATE_VALUE_TYPES
         }
+
+        # This is deliberately a graph description rather than a deepcopy.
+        # Only exact built-in containers are structural nodes.  Everything
+        # else is an opaque leaf held by identity, so a client or lock nested
+        # anywhere in the graph never sees a copy protocol or lifecycle call.
+        nodes: list[Dict[str, Any]] = []
+        node_ids: Dict[int, int] = {}
+
+        def capture(value: Any) -> tuple[str, Any]:
+            if type(value) not in self._ATTEMPT_STATE_CONTAINER_TYPES:
+                return ("leaf", value)
+
+            object_id = id(value)
+            if object_id in node_ids:
+                return ("node", node_ids[object_id])
+
+            node_id = len(nodes)
+            node_ids[object_id] = node_id
+            node: Dict[str, Any] = {
+                "kind": type(value),
+                "original": value,
+                "items": None,
+            }
+            # Install the placeholder before descending to preserve cycles.
+            nodes.append(node)
+            if type(value) is dict:
+                node["items"] = [
+                    (capture(key), capture(item)) for key, item in value.items()
+                ]
+            else:
+                node["items"] = [capture(item) for item in value]
+            return ("node", node_id)
+
         return {
             "original_keys": frozenset(values),
-            "original_objects": owned.copy(),
-            # One aggregate deepcopy preserves aliases between owned fields.
-            "values": copy.deepcopy(owned),
+            "roots": {name: capture(value) for name, value in owned.items()},
+            "nodes": nodes,
         }
 
     def restore_compression_attempt_state(self, snapshot: Any) -> None:
@@ -1642,64 +1676,47 @@ class ContextCompressor(ContextEngine):
         if not isinstance(snapshot, dict):
             return
         original_keys = snapshot.get("original_keys", frozenset())
-        original_objects = snapshot.get("original_objects", {})
-        saved_values = copy.deepcopy(snapshot.get("values", {}))
+        roots = snapshot.get("roots", {})
+        nodes = snapshot.get("nodes", [])
+        if not isinstance(roots, dict) or not isinstance(nodes, list):
+            return
         live = vars(self)
 
-        saved_to_original = {
-            id(saved_values[name]): original
-            for name, original in original_objects.items()
-            if name in saved_values and isinstance(original, (dict, list, set))
-        }
+        def materialize(reference: tuple[str, Any]) -> Any:
+            kind, value = reference
+            if kind == "node":
+                return nodes[value]["original"]
+            return value
 
-        def materialize(value: Any) -> Any:
-            """Reattach saved graph edges that pointed at owned originals."""
-            original = saved_to_original.get(id(value))
-            if original is not None:
-                return original
-            if isinstance(value, dict):
-                return {
-                    materialize(key): materialize(item)
-                    for key, item in value.items()
-                }
-            if isinstance(value, list):
-                return [materialize(item) for item in value]
-            if isinstance(value, tuple):
-                return tuple(materialize(item) for item in value)
-            if isinstance(value, set):
-                return {materialize(item) for item in value}
-            return copy.deepcopy(value)
+        # Empty every captured mutable first, then rebuild all of them.  This
+        # repairs nested containers even when an attempt removed their only
+        # path from a root, while retaining every original alias and cycle.
+        for node in nodes:
+            original = node["original"]
+            if node["kind"] is dict or node["kind"] is set:
+                original.clear()
+            elif node["kind"] is list:
+                original[:] = []
 
-        restored_mutables: set[int] = set()
-        for name, original in original_objects.items():
-            saved = saved_values[name]
-            original_id = id(original)
-            if original_id not in restored_mutables:
-                if isinstance(original, dict):
-                    original.clear()
-                    original.update(
-                        (materialize(key), materialize(value))
-                        for key, value in saved.items()
-                    )
-                    restored_mutables.add(original_id)
-                elif isinstance(original, list):
-                    original[:] = [materialize(value) for value in saved]
-                    restored_mutables.add(original_id)
-                elif isinstance(original, set):
-                    original.clear()
-                    original.update(materialize(value) for value in saved)
-                    restored_mutables.add(original_id)
-            # Rebind fields to their pre-attempt object. This also repairs an
-            # attempt that replaced a container rather than mutating it.
-            if isinstance(original, (dict, list, set)):
-                live[name] = original
-            else:
-                live[name] = saved
+        for node in nodes:
+            original = node["original"]
+            if node["kind"] is dict:
+                original.update(
+                    (materialize(key), materialize(value))
+                    for key, value in node["items"]
+                )
+            elif node["kind"] is list:
+                original.extend(materialize(value) for value in node["items"])
+            elif node["kind"] is set:
+                original.update(materialize(value) for value in node["items"])
+
+        for name, reference in roots.items():
+            live[name] = materialize(reference)
 
         # Only value-state fields are owned by this contract. A newly-created
         # client/lock/resource is intentionally outside it and remains intact.
         for name in set(live) - set(original_keys):
-            if isinstance(live[name], self._ATTEMPT_STATE_VALUE_TYPES):
+            if type(live[name]) in self._ATTEMPT_STATE_VALUE_TYPES:
                 live.pop(name, None)
 
     def on_session_reset(self) -> None:

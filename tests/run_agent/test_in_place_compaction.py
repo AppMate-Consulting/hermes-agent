@@ -13,6 +13,7 @@ import os
 import copy
 import json
 import tempfile
+import threading
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -744,6 +745,148 @@ class TestCompressionAttemptStateContract:
         _seed(db, sid, suffix)
         return db, _make_agent(db, sid, in_place=True)
 
+    def test_graph_snapshot_restores_nested_resources_aliases_and_cycles(
+        self, tmp_path
+    ):
+        _db, agent = self._agent(tmp_path, "resource-graph")
+
+        class OpaqueResource:
+            def __init__(self, label):
+                self.label = label
+                self.copy_calls = 0
+                self.close_calls = 0
+
+            def __copy__(self):
+                self.copy_calls += 1
+                raise AssertionError(f"copied {self.label}")
+
+            def __deepcopy__(self, _memo):
+                self.copy_calls += 1
+                raise AssertionError(f"deep-copied {self.label}")
+
+            def close(self):
+                self.close_calls += 1
+
+        client = OpaqueResource("client")
+        database = OpaqueResource("database")
+        lock = threading.Lock()
+        shared = ["original"]
+        self_cycle = []
+        self_cycle.append(self_cycle)
+        mutual_list = []
+        mutual_dict = {"back": mutual_list}
+        mutual_list.append(mutual_dict)
+        structural_tuple = (shared, client, lock, database)
+        state = {
+            "client": client,
+            "database": database,
+            "lock": lock,
+            "left": shared,
+            "right": shared,
+            "tuple": structural_tuple,
+            "self_cycle": self_cycle,
+            "mutual": mutual_dict,
+            "removed": {"value": 7},
+        }
+        agent.context_compressor.selector_state = state
+        agent.context_compressor.selector_state_alias = state
+
+        snapshot = agent.context_compressor.snapshot_compression_attempt_state()
+        removed = state.pop("removed")
+        removed["value"] = 99
+        shared[:] = ["mutated"]
+        shared.append(client)
+        state["added"] = [database]
+        self_cycle[:] = ["broken"]
+        mutual_dict.clear()
+        mutual_list[:] = ["broken"]
+        agent.context_compressor.selector_state = {"replacement": database}
+        agent.context_compressor.attempt_owned = [client]
+
+        agent.context_compressor.restore_compression_attempt_state(snapshot)
+
+        assert agent.context_compressor.selector_state is state
+        assert agent.context_compressor.selector_state_alias is state
+        assert state["client"] is client
+        assert state["database"] is database
+        assert state["lock"] is lock
+        assert state["left"] is shared is state["right"]
+        assert shared == ["original"]
+        assert state["tuple"] is structural_tuple
+        assert structural_tuple == (shared, client, lock, database)
+        assert self_cycle[0] is self_cycle
+        assert mutual_dict["back"] is mutual_list
+        assert mutual_list[0] is mutual_dict
+        assert state["removed"] is removed
+        assert removed == {"value": 7}
+        assert "added" not in state
+        assert not hasattr(agent.context_compressor, "attempt_owned")
+        assert client.copy_calls == database.copy_calls == 0
+        assert client.close_calls == database.close_calls == 0
+
+    @pytest.mark.parametrize("exit_kind", ["rejected", "cancelled", "exception"])
+    def test_rollback_paths_preserve_nested_opaque_resources(
+        self, tmp_path, exit_kind
+    ):
+        from agent.auxiliary_client import AuxiliaryExplicitCancellation
+        from agent.conversation_compression import compress_context
+
+        class DatabaseHandle:
+            def __init__(self):
+                self.copy_calls = 0
+                self.close_calls = 0
+
+            def __copy__(self):
+                self.copy_calls += 1
+                raise AssertionError("database handle copied")
+
+            def __deepcopy__(self, _memo):
+                self.copy_calls += 1
+                raise AssertionError("database handle deep-copied")
+
+            def close(self):
+                self.close_calls += 1
+
+        _db, agent = self._agent(tmp_path, f"resource-{exit_kind}")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        handle = DatabaseHandle()
+        lock = threading.Lock()
+        items = [handle, lock, "control"]
+        state = {"items": items, "alias": items, "tuple": (handle, items)}
+        agent.context_compressor.selector_state = state
+
+        def terminate(candidate, **_kwargs):
+            items[:] = ["speculative"]
+            state.pop("tuple")
+            state["new"] = handle
+            if exit_kind == "cancelled":
+                raise AuxiliaryExplicitCancellation()
+            if exit_kind == "exception":
+                raise RuntimeError("selector failed")
+            return candidate
+
+        agent.context_compressor.compress = terminate
+        if exit_kind == "exception":
+            with pytest.raises(RuntimeError, match="selector failed"):
+                compress_context(
+                    agent, messages, "sys", approx_tokens=100_000, force=True
+                )
+        else:
+            returned, _ = compress_context(
+                agent, messages, "sys", approx_tokens=100_000, force=True
+            )
+            assert returned is messages
+
+        assert agent.context_compressor.selector_state is state
+        assert state["items"] is items is state["alias"]
+        assert items[0] is handle
+        assert items[1] is lock
+        assert items[2] == "control"
+        assert state["tuple"][0] is handle
+        assert state["tuple"][1] is items
+        assert "new" not in state
+        assert handle.copy_calls == handle.close_calls == 0
+
     def test_rejection_restores_aliased_containers_in_place(self, tmp_path):
         from agent.conversation_compression import compress_context
 
@@ -880,6 +1023,44 @@ class TestCompressionAttemptStateContract:
         assert compressed is not messages
         assert state == {"cursor": 1}
         restore.assert_not_called()
+
+    def test_successful_publication_keeps_nested_resource_identity(self, tmp_path):
+        from agent.conversation_compression import compress_context
+
+        class Client:
+            def __init__(self):
+                self.copy_calls = 0
+                self.close_calls = 0
+
+            def __deepcopy__(self, _memo):
+                self.copy_calls += 1
+                raise AssertionError("client deep-copied")
+
+            def close(self):
+                self.close_calls += 1
+
+        _db, agent = self._agent(tmp_path, "resource-success")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        client = Client()
+        state = {"client": client, "published": False}
+        agent.context_compressor.selector_state = state
+
+        def commit(_candidate, **_kwargs):
+            state["published"] = True
+            return [
+                {"role": "user", "content": "summary"},
+                {"role": "assistant", "content": "tail"},
+            ]
+
+        agent.context_compressor.compress = commit
+        compressed, _ = compress_context(
+            agent, messages, "sys", approx_tokens=100_000, force=True
+        )
+
+        assert compressed is not messages
+        assert state == {"client": client, "published": True}
+        assert state["client"] is client
+        assert client.copy_calls == client.close_calls == 0
 
 
 class TestInPlaceAntiGrowthGuard:

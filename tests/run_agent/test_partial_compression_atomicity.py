@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import os
 import threading
 from contextlib import ExitStack
@@ -165,6 +166,181 @@ def _assert_valid_tool_pairs(rows: list[dict]) -> None:
     assert set(call_ids) == set(result_ids)
 
 
+def _seed_here_one_boundary(
+    db: SessionDB, sid: str, *, newer_human: bool
+) -> tuple[list[dict], list[dict]]:
+    """Seed the two security-sensitive ``/compress here 1`` suffix shapes."""
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
+    from hermes_cli.partial_compress import split_history_for_partial_compress
+
+    db.create_session(sid, source="gateway", model="test/model")
+    db.append_message(sid, "user", OLD_TASK)
+    db.append_message(sid, "assistant", "old answer " + "bulk " * 1200)
+    db.append_message(sid, "user", "PRIOR GENUINE HUMAN TASK")
+    db.append_message(sid, "assistant", "prior task work completed")
+    db.append_message(
+        sid, "user", AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        autonomous_completion_provenance=True,
+    )
+    db.append_message(
+        sid, "assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        autonomous_completion_provenance=True,
+    )
+    db.append_message(
+        sid, "user", LOOKALIKE, display_kind="async_delegation_complete",
+        autonomous_completion_provenance=True,
+    )
+    db.append_message(
+        sid, "assistant", None,
+        tool_calls=[{
+            "id": "call_autonomous_tail",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": '{"cmd":"status"}'},
+        }],
+    )
+    db.append_message(
+        sid, "tool", "AUTONOMOUS TAIL TOOL RESULT", tool_name="terminal",
+        tool_call_id="call_autonomous_tail", effect_disposition="read_only",
+    )
+    db.append_message(sid, "assistant", "trusted completion consumed")
+    if newer_human:
+        db.append_message(sid, "user", "NEWER GENUINE HUMAN TASK")
+        db.append_message(
+            sid, "assistant", None,
+            tool_calls=[{
+                "id": "call_new_human_tail",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": '{"cmd":"proof"}'},
+            }],
+        )
+        db.append_message(
+            sid, "tool", "NEW HUMAN TAIL TOOL RESULT", tool_name="terminal",
+            tool_call_id="call_new_human_tail", effect_disposition="read_only",
+        )
+        db.append_message(sid, "assistant", "newer task acknowledged")
+    source = db.get_messages_as_conversation(sid)
+    head, tail = split_history_for_partial_compress(source, 1)
+    assert head + tail == source
+    if newer_human:
+        assert head == source[:-4]
+        assert tail == source[-4:]
+    else:
+        # The two bridge rows and completion row are one provenance unit;
+        # the consumer response remains adjacent as part of that exchange.
+        assert head == source[:4]
+        assert tail == source[4:]
+    return source, tail
+
+
+def _assert_here_one_boundary_result(
+    db: SessionDB,
+    parent: str,
+    source: list[dict],
+    protected_tail: list[dict],
+    agent,
+    host_history: list[dict],
+    seen: list[list[dict]],
+    publish,
+    *,
+    newer_human: bool,
+) -> None:
+    """Assert publication, provenance, classification, and exact host adoption."""
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        _latest_active_human_task_row,
+    )
+
+    active = db.get_messages_as_conversation(agent.session_id)
+    assert len(seen) == 1
+    assert seen[0] == source[:-len(protected_tail)]
+    assert active[-len(protected_tail):] == protected_tail
+    assert host_history == active
+    if not agent.compression_in_place:
+        assert source == db.get_messages_as_conversation(parent)
+    assert publish.call_count == 1
+    _assert_valid_tool_pairs(active)
+
+    completion = next(
+        i for i, row in enumerate(active)
+        if row.get("content") == LOOKALIKE
+    )
+    assert ContextCompressor._completion_has_durable_provenance(active, completion)
+    active_human = _latest_active_human_task_row(active)
+    assert active_human is not None
+    expected_task = (
+        "NEWER GENUINE HUMAN TASK" if newer_human
+        else "PRIOR GENUINE HUMAN TASK"
+    )
+    assert active_human["content"] == expected_task
+
+    before_indexes = [
+        i for i, row in enumerate(active)
+        if row.get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+    ]
+    after_indexes = [
+        i for i, row in enumerate(active)
+        if row.get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
+    ]
+    if newer_human:
+        assert before_indexes == []
+        assert after_indexes == []
+        assert ContextCompressor._active_task_contract(active) == {
+            "content": expected_task,
+            "sha256": hashlib.sha256(expected_task.encode("utf-8")).hexdigest(),
+        }
+    else:
+        assert len(before_indexes) == len(after_indexes) == 1
+        before = before_indexes[0]
+        assert after_indexes == [before + 2]
+        contract = ContextCompressor.parse_active_task_contract(
+            active[before + 1], allow_projected=True
+        )
+        assert contract is not None
+        assert contract["content"] == expected_task
+        assert ContextCompressor._active_task_contract(active) == contract
+
+    if agent.compression_in_place:
+        assert agent.session_id == parent
+    else:
+        assert agent.session_id != parent
+        assert db.get_session(agent.session_id)["parent_session_id"] == parent
+
+
+def _assert_here_one_restart_replay(
+    path: Path, session_id: str, expected: list[dict], *, newer_human: bool
+) -> None:
+    """A fresh SessionDB must replay the same authority and classification."""
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        _latest_active_human_task_row,
+    )
+
+    reopened = SessionDB(db_path=path)
+    replay = reopened.get_messages_as_conversation(session_id)
+    assert replay == expected
+    completion = next(
+        i for i, row in enumerate(replay) if row.get("content") == LOOKALIKE
+    )
+    assert ContextCompressor._completion_has_durable_provenance(replay, completion)
+    active_human = _latest_active_human_task_row(replay)
+    assert active_human is not None
+    assert active_human["content"] == (
+        "NEWER GENUINE HUMAN TASK" if newer_human
+        else "PRIOR GENUINE HUMAN TASK"
+    )
+    contract_count = sum(
+        row.get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE for row in replay
+    )
+    assert contract_count == (0 if newer_human else 1)
+    reopened.close()
+
+
 def _assert_success(db, parent, source, agent, caller_history, seen, publish):
     active = db.get_messages_as_conversation(agent.session_id)
     protected = source[4:]
@@ -312,6 +488,52 @@ def test_tui_compress_session_history_real_sessiondb_partial_matrix(durable_case
 
 
 @pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "rotation"])
+@pytest.mark.parametrize(
+    "newer_human", [False, True],
+    ids=["autonomous_suffix", "new_human_suffix"],
+)
+def test_tui_here_one_real_sessiondb_boundary_proof(
+    tmp_path: Path, in_place: bool, newer_human: bool
+):
+    """The TUI's shared partial-compress entry preserves the trusted boundary."""
+    from tui_gateway.server import _compress_session_history
+
+    path = tmp_path / "tui-here-one.db"
+    db = SessionDB(db_path=path)
+    sid = "TUI_HERE_ONE"
+    source, tail = _seed_here_one_boundary(db, sid, newer_human=newer_human)
+    source_before = copy.deepcopy(source)
+    seen: list[list[dict]] = []
+    agent = _agent(db, sid, in_place=in_place, seen=seen)
+    session = {
+        "agent": agent,
+        "history": copy.deepcopy(source),
+        "history_version": 9,
+        "history_lock": threading.RLock(),
+        "session_key": sid,
+    }
+    method = "archive_and_compact" if in_place else "publish_compression_child"
+    with patch.object(db, method, wraps=getattr(db, method)) as publish, patch(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        side_effect=[100_000, 1_000],
+    ):
+        _compress_session_history(session, "here 1", approx_tokens=100_000)
+
+    assert source == source_before  # the host may adopt, never rewrite its input
+    assert session["history_version"] == 10
+    _assert_here_one_boundary_result(
+        db, sid, source, tail, agent, session["history"], seen, publish,
+        newer_human=newer_human,
+    )
+    active_id = agent.session_id
+    expected_replay = copy.deepcopy(session["history"])
+    db.close()
+    _assert_here_one_restart_replay(
+        path, active_id, expected_replay, newer_human=newer_human
+    )
+
+
+@pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "rotation"])
 @pytest.mark.asyncio
 async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
     durable_case, in_place
@@ -425,6 +647,125 @@ async def test_gateway_slash_compress_real_sessiondb_partial_matrix(
     assert actual_payloads[0] != actual_payloads[1]
     active_id = entry.session_id
     _assert_success(db, sid, source_rows, prepared, db.get_messages_as_conversation(active_id), seen, publish)
+
+
+@pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "rotation"])
+@pytest.mark.parametrize(
+    "newer_human", [False, True],
+    ids=["autonomous_suffix", "new_human_suffix"],
+)
+@pytest.mark.asyncio
+async def test_gateway_slash_here_one_real_sessiondb_boundary_proof(
+    tmp_path: Path, in_place: bool, newer_human: bool
+):
+    """The actual gateway slash route preserves and correctly classifies the suffix."""
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.session import SessionEntry, SessionSource
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    path = tmp_path / "gateway-here-one.db"
+    db = SessionDB(db_path=path)
+    sid = "GATEWAY_HERE_ONE"
+    source_rows, tail = _seed_here_one_boundary(
+        db, sid, newer_human=newer_human
+    )
+    source_before = copy.deepcopy(source_rows)
+    seen: list[list[dict]] = []
+    prepared = _agent(db, sid, in_place=in_place, seen=seen)
+    prepared.provider = "openrouter"
+    prepared._use_prompt_caching = False
+    prepared._build_api_kwargs = lambda api_messages, tools_for_api=None: {
+        "model": prepared.model,
+        "messages": copy.deepcopy(api_messages),
+        "tools": copy.deepcopy(
+            tools_for_api if tools_for_api is not None else prepared.tools
+        ),
+    }
+    prepared._reapply_reasoning_echo_for_provider = lambda api_messages: 0
+    prepared._sanitize_api_messages = lambda messages: copy.deepcopy(messages)
+    prepared._drop_thinking_only_and_merge_users = (
+        lambda messages, **_kwargs: copy.deepcopy(messages)
+    )
+    prepared.context_compressor.select_context.side_effect = (
+        lambda rows, **_kwargs: copy.deepcopy(rows)
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM, user_id="proof-user", chat_id="proof-chat",
+        chat_type="dm",
+    )
+    event = MessageEvent(text="/compress here 1", source=source, message_id="proof")
+    entry = SessionEntry(
+        "telegram:proof-user:proof-chat", sid, datetime.now(), datetime.now(),
+        origin=source, platform=Platform.TELEGRAM, chat_type="dm",
+    )
+    routed: list[tuple] = []
+
+    class Store:
+        async def get_or_create_session(self, actual_source):
+            routed.append(("lookup", actual_source))
+            return entry
+        async def load_transcript(self, active):
+            routed.append(("load", active))
+            return db.get_messages_as_conversation(active)
+        async def update_session(self, active, **kwargs):
+            routed.append(("update", active, kwargs))
+        async def _save(self): return None
+
+    class Host(GatewaySlashCommandsMixin):
+        async_session_store = Store()
+        _session_db = SimpleNamespace(
+            _db=db, get_session=AsyncMock(return_value=db.get_session(sid))
+        )
+        def _session_key_for_source(self, actual_source):
+            assert actual_source is source
+            return entry.session_key
+        def _resolve_session_agent_runtime(self, **kwargs):
+            routed.append(("runtime", kwargs["source"], kwargs["session_key"]))
+            return "test/model", {"api_key": "test-key"}
+        async def _run_in_executor_with_context(self, fn): return fn()
+        async def _cleanup_agent_resources_off_loop(self, *_a, **_kw): return None
+        def _evict_cached_agent(self, *_a): return None
+        def _sync_telegram_topic_binding(self, *_a, **_kw): return None
+
+    host = Host()
+    method = "archive_and_compact" if in_place else "publish_compression_child"
+
+    def identity_redecorate(_agent, messages, *, moa_prepared, tools_for_api):
+        return copy.deepcopy(messages), moa_prepared, copy.deepcopy(tools_for_api)
+
+    with patch("run_agent.AIAgent", return_value=prepared), patch.object(
+        db, method, wraps=getattr(db, method)
+    ) as publish, patch(
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        side_effect=[100_000, 1_000],
+    ), patch(
+        "agent.model_metadata.estimate_request_tokens_rough", return_value=100_000
+    ), patch(
+        "agent.manual_compression_feedback.summarize_manual_compression",
+        return_value={"headline": "ok", "token_line": "small", "note": "", "noop": False},
+    ), patch(
+        "agent.conversation_loop._redecorate_prompt_cache_for_provider",
+        side_effect=identity_redecorate,
+    ):
+        await host._handle_compress_command_inner(event)
+
+    assert source_rows == source_before
+    assert routed[0] == ("lookup", source)
+    assert routed[1] == ("load", sid)
+    assert ("runtime", source, entry.session_key) in routed
+    assert entry.session_id == prepared.session_id
+    _assert_here_one_boundary_result(
+        db, sid, source_rows, tail, prepared,
+        db.get_messages_as_conversation(entry.session_id), seen, publish,
+        newer_human=newer_human,
+    )
+    active_id = entry.session_id
+    expected_replay = db.get_messages_as_conversation(active_id)
+    db.close()
+    _assert_here_one_restart_replay(
+        path, active_id, expected_replay, newer_human=newer_human
+    )
 
 
 @pytest.mark.parametrize("in_place", [True, False], ids=["archive", "child"])

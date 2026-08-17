@@ -404,6 +404,58 @@ def test_durable_ladder_survives_restart_caps_and_resets(tmp_path):
         db.close()
 
 
+def test_durable_success_survives_hot_cache_sync_failure(
+    tmp_path, monkeypatch, caplog
+):
+    """A committed higher rung cannot be rewritten by cache-sync recovery."""
+    from hermes_state import SessionDB
+
+    path = tmp_path / "hot-cache-failure.db"
+    db = SessionDB(db_path=path)
+    db.create_session("sid", "gateway")
+    db.record_hygiene_failure("sid", BASE, "first")
+
+    runner = _Runner()
+    runner._session_db = db
+    durable_calls = []
+    fallback_calls = []
+    real_record = db.record_hygiene_failure
+
+    def record(*args, **kwargs):
+        result = real_record(*args, **kwargs)
+        durable_calls.append(result.copy())
+        return result
+
+    monkeypatch.setattr(db, "record_hygiene_failure", record)
+    monkeypatch.setattr(
+        runner,
+        "_session_state",
+        lambda _key: (_ for _ in ()).throw(RuntimeError("hot cache unavailable")),
+    )
+    monkeypatch.setattr(
+        "gateway.run._record_hygiene_cooldown",
+        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
+    )
+
+    _record_hygiene_failure(runner, KEY, "sid", BASE, "second")
+
+    assert len(durable_calls) == 1
+    assert durable_calls[0]["streak"] == 2
+    authoritative_deadline = durable_calls[0]["cooldown_until"]
+    assert fallback_calls == []
+    assert "durable hygiene failure recorded (streak=2" in caplog.text
+    assert "hot-cache synchronization failed" in caplog.text
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    try:
+        assert reopened.get_hygiene_failure_streak("sid") == 2
+        state = reopened.get_compression_failure_cooldown("sid")
+        assert state["cooldown_until"] == pytest.approx(authoritative_deadline)
+    finally:
+        reopened.close()
+
+
 def test_legacy_rotation_inherits_rung_then_recovery_resets_only_child(tmp_path):
     """A rotation cannot erase history until the active child proves recovery."""
     from hermes_state import SessionDB

@@ -253,7 +253,7 @@ class TestInPlaceCompaction:
     def test_rotation_publication_failure_restores_parent_and_all_ephemeral_state(self):
         """A materially admitted child that cannot publish leaves no boundary trace."""
         from hermes_state import SessionDB
-        from agent.conversation_compression import compress_context
+        from agent.conversation_compression import CompressionCommitFence, compress_context
         from agent import relay_runtime
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -279,6 +279,7 @@ class TestInPlaceCompaction:
             agent.event_callback = MagicMock()
             agent.context_compressor.on_session_start = MagicMock()
             boundary_observer = MagicMock()
+            fence = CompressionCommitFence()
             before_rows = db.get_messages(sid, include_inactive=True)
             before_parent = db.get_session(sid)
 
@@ -292,7 +293,11 @@ class TestInPlaceCompaction:
                 side_effect=RuntimeError("atomic publication denied"),
             ):
                 returned, prompt = compress_context(
-                    agent, messages, "sys", approx_tokens=100_000
+                    agent,
+                    messages,
+                    "sys",
+                    approx_tokens=100_000,
+                    commit_fence=fence,
                 )
 
             assert returned is messages
@@ -308,6 +313,8 @@ class TestInPlaceCompaction:
             assert agent._last_compression_attempt_in_place is None
             assert agent._last_compaction_in_place is False
             assert db.get_messages(sid, include_inactive=True) == before_rows
+            assert fence.commit_in_flight is False
+            assert db.get_compression_lock_holder(sid) is None
             after_parent = db.get_session(sid)
             for field in ("parent_session_id", "message_count", "model_config", "system_prompt", "end_reason"):
                 assert after_parent[field] == before_parent[field]
@@ -983,7 +990,7 @@ class TestInPlaceAntiGrowthGuard:
     def test_in_place_publication_failure_has_no_boundary_side_effects(self):
         """A failed durable publication returns the exact pre-attempt boundary."""
         from hermes_state import SessionDB
-        from agent.conversation_compression import compress_context
+        from agent.conversation_compression import CompressionCommitFence, compress_context
         from agent import relay_runtime
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1005,6 +1012,7 @@ class TestInPlaceAntiGrowthGuard:
             agent.event_callback = MagicMock()
             agent.context_compressor.on_session_start = MagicMock()
             boundary_observer = MagicMock()
+            fence = CompressionCommitFence()
             before_rows = db.get_messages(sid, include_inactive=True)
             before_session = db.get_session(sid)
 
@@ -1016,7 +1024,11 @@ class TestInPlaceAntiGrowthGuard:
                 db, "archive_and_compact", side_effect=RuntimeError("disk full")
             ):
                 returned, _prompt = compress_context(
-                    agent, messages, "sys", approx_tokens=100_000
+                    agent,
+                    messages,
+                    "sys",
+                    approx_tokens=100_000,
+                    commit_fence=fence,
                 )
 
             assert returned is messages
@@ -1030,6 +1042,8 @@ class TestInPlaceAntiGrowthGuard:
             assert agent._last_compression_attempt_in_place is None
             assert agent._last_compaction_in_place is False
             assert db.get_messages(sid, include_inactive=True) == before_rows
+            assert fence.commit_in_flight is False
+            assert db.get_compression_lock_holder(sid) is None
             after_session = db.get_session(sid)
             for field in ("message_count", "model_config", "system_prompt", "end_reason"):
                 assert after_session[field] == before_session[field]

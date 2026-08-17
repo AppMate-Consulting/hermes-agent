@@ -106,6 +106,16 @@ _OUTER_TERMINAL_COMPRESSION_OUTCOMES = frozenset({
     "cancelled_host",
 })
 
+# Provider/context-engine boundary callbacks are extension code and may block
+# indefinitely.  Give the normal synchronous ordering a brief opportunity to
+# complete, then let the already-scheduled daemon continue best-effort.  The
+# durable publication and lease release always precede this work.
+_POSTCOMMIT_CALLBACK_WAIT_SECONDS = 1.0
+
+
+class _CompressionPublicationCancelled(Exception):
+    """Commit admission was revoked after candidate preparation."""
+
 
 def _is_outer_terminal_compression_outcome(value: Any) -> bool:
     return isinstance(value, str) and (
@@ -165,6 +175,40 @@ def _emit_compaction_done(agent: Any) -> None:
         status_callback("compacted", status)
     except Exception:
         logger.debug("status_callback error in compaction completion", exc_info=True)
+
+
+def _run_postcommit_callbacks_bounded(
+    callback: Callable[[], None], *, session_id: str
+) -> None:
+    """Schedule one ordered callback chain exactly once without unbounded wait."""
+    finished = threading.Event()
+
+    def _run() -> None:
+        try:
+            callback()
+        except BaseException:
+            # Individual callbacks normally isolate Exception themselves.  Keep
+            # BaseException from becoming an unobservable detached-thread crash.
+            logger.exception(
+                "postcommit compression callback chain failed: session=%s",
+                session_id or "none",
+            )
+        finally:
+            finished.set()
+
+    worker = threading.Thread(
+        target=_run,
+        name=f"compression-postcommit-{session_id or 'none'}",
+        daemon=True,
+    )
+    worker.start()
+    if not finished.wait(_POSTCOMMIT_CALLBACK_WAIT_SECONDS):
+        logger.warning(
+            "postcommit compression callbacks exceeded %.1fs and remain "
+            "detached: session=%s",
+            _POSTCOMMIT_CALLBACK_WAIT_SECONDS,
+            session_id or "none",
+        )
 
 
 # ── Routine compression status templates ────────────────────────────────────
@@ -3510,6 +3554,25 @@ def compress_context(
             _activity_heartbeat.stop("context compression completed")
 
     _commit_fence_entered = False
+
+    def _publish_session_db(operation: Callable[[], None]) -> None:
+        """Fence exactly one SessionDB publication and promptly free its lease."""
+        nonlocal _commit_fence_entered
+        if commit_fence is not None:
+            _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
+            if not _commit_fence_entered:
+                raise _CompressionPublicationCancelled()
+        try:
+            operation()
+        finally:
+            # Publication success/failure is now authoritative.  Neither the
+            # fence nor the durable lease may cover provider or bookkeeping
+            # callbacks that follow this transaction.
+            if _commit_fence_entered:
+                commit_fence.finish_commit()
+                _commit_fence_entered = False
+            _release_lock_holder_only()
+
     try:
         # Capture boundary quality before session-rotation callbacks run. Built-in
         # and plugin lifecycle hooks may reset per-session compressor fields while
@@ -3614,34 +3677,6 @@ def compress_context(
                     )
             _release_lock()
             return messages, _existing_sp
-
-        if commit_fence is not None:
-            _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
-            if not _commit_fence_entered:
-                _restore_compressor_attempt_state(
-                    agent.context_compressor,
-                    _compressor_attempt_snapshot,
-                    durable_cooldown_authoritative=_durable_cooldown_authoritative,
-                    durable_cooldown_state=_durable_cooldown_state,
-                )
-                _restore_uncommitted_input()
-                logger.info(
-                    "Compression commit cancelled before session mutation "
-                    "(session=%s).",
-                    agent.session_id or "none",
-                )
-                agent._last_compaction_in_place = False
-                _set_compression_outcome("cancelled_commit_fence")
-                _existing_sp = _rollback_prompt()
-                _emit_compression_attempt_telemetry(
-                    agent,
-                    started_at=_attempt_started_at,
-                    commit_status="aborted",
-                    split_status="aborted",
-                    failure_class="commit_fence_cancelled",
-                )
-                _release_lock()
-                return messages, _existing_sp
 
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:
@@ -3869,14 +3904,16 @@ def compress_context(
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
 
-                    agent._session_db.archive_and_compact(
-                        agent.session_id,
-                        compressed,
-                        model_config_patch={
-                            PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
-                        },
-                        system_prompt=new_system_prompt,
-                        expected_active_identity=_expected_active_identity,
+                    _publish_session_db(
+                        lambda: agent._session_db.archive_and_compact(
+                            agent.session_id,
+                            compressed,
+                            model_config_patch={
+                                PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                            },
+                            system_prompt=new_system_prompt,
+                            expected_active_identity=_expected_active_identity,
+                        )
                     )
                     agent._compression_durable_commit_occurred = True
                     split_status = "in_place_committed"
@@ -3929,20 +3966,22 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
-                    agent._session_db.publish_compression_child(
-                        parent_session_id=old_session_id,
-                        child_session_id=new_session_id,
-                        source=agent.platform
-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                        model=agent.model,
-                        model_config=agent._session_init_model_config,
-                        system_prompt=new_system_prompt,
-                        messages=compressed,
-                        cwd=getattr(agent, "working_directory", None),
-                        profile_name=_profile_for_child,
-                        compression_lock_holder=_lock_holder,
-                        require_compression_lease=_lock_holder is not None,
-                        expected_active_identity=_expected_active_identity,
+                    _publish_session_db(
+                        lambda: agent._session_db.publish_compression_child(
+                            parent_session_id=old_session_id,
+                            child_session_id=new_session_id,
+                            source=agent.platform
+                            or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                            model=agent.model,
+                            model_config=agent._session_init_model_config,
+                            system_prompt=new_system_prompt,
+                            messages=compressed,
+                            cwd=getattr(agent, "working_directory", None),
+                            profile_name=_profile_for_child,
+                            compression_lock_holder=_lock_holder,
+                            require_compression_lease=_lock_holder is not None,
+                            expected_active_identity=_expected_active_identity,
+                        )
                     )
                     agent._compression_durable_commit_occurred = True
                     agent.session_id = new_session_id
@@ -4046,6 +4085,30 @@ def compress_context(
                         if isinstance(message, dict)
                     }
                 _session_commit_succeeded = True
+            except _CompressionPublicationCancelled:
+                _restore_compressor_attempt_state(
+                    agent.context_compressor,
+                    _compressor_attempt_snapshot,
+                    durable_cooldown_authoritative=_durable_cooldown_authoritative,
+                    durable_cooldown_state=_durable_cooldown_state,
+                )
+                _restore_uncommitted_input()
+                logger.info(
+                    "Compression commit cancelled before session mutation "
+                    "(session=%s).",
+                    agent.session_id or "none",
+                )
+                agent._last_compaction_in_place = False
+                _set_compression_outcome("cancelled_commit_fence")
+                _emit_compression_attempt_telemetry(
+                    agent,
+                    started_at=_attempt_started_at,
+                    commit_status="aborted",
+                    split_status="aborted",
+                    failure_class="commit_fence_cancelled",
+                )
+                _release_lock()
+                return messages, _rollback_prompt()
             except Exception as e:
                 _set_compression_outcome("persistence_failure")
                 _restore_uncommitted_input()
@@ -4127,33 +4190,63 @@ def compress_context(
             agent._last_compaction_in_place = False
             return messages, _rollback_prompt()
 
-        # These callbacks are deliberately post-admission/post-persistence.
-        # Run each exactly once from the immutable pre-attempt transcript and
-        # isolate failures: the database transaction is already authoritative.
-        if agent._memory_manager:
+        # These extension callbacks are deliberately post-persistence AND
+        # post-lease. Schedule their semantically ordered chain exactly once;
+        # a blocking provider may continue on the daemon after the bounded wait
+        # without retaining commit authority or preventing another compaction.
+        def _postcommit_observer_chain() -> None:
+            if agent._memory_manager:
+                try:
+                    _maybe_ctx = agent._memory_manager.on_pre_compress(
+                        copy.deepcopy(_authoritative_pre_compression_snapshot)
+                    )
+                    if isinstance(_maybe_ctx, str):
+                        sanitize_memory_context(_maybe_ctx)
+                except Exception:
+                    logger.debug(
+                        "memory on_pre_compress callback failed", exc_info=True
+                    )
             try:
-                _maybe_ctx = agent._memory_manager.on_pre_compress(
+                agent.commit_memory_session(
                     copy.deepcopy(_authoritative_pre_compression_snapshot)
                 )
-                if isinstance(_maybe_ctx, str):
-                    sanitize_memory_context(_maybe_ctx)
             except Exception:
-                logger.debug("memory on_pre_compress callback failed", exc_info=True)
-        try:
-            agent.commit_memory_session(
-                copy.deepcopy(_authoritative_pre_compression_snapshot)
-            )
-        except Exception:
-            logger.debug("memory boundary extraction failed", exc_info=True)
+                logger.debug("memory boundary extraction failed", exc_info=True)
 
-        # Round-2 #4: the activity heartbeat's terminal "context compression
-        # completed" stamp landed on the PARENT row (force-persisted before
-        # the rotation re-pointed agent.session_id at the child). Without a
-        # cleanup, the archived parent advertises a fresh last_activity_at +
-        # "context compression completed" forever — a permanent false-fresh
-        # row for any activity consumer that scans ended sessions. Clear the
-        # labels on the parent best-effort (keeps last_activity_at so idle
-        # clocks stay continuous; the CHILD carries the live labels).
+            if _context_engine_boundary_committed:
+                if defer_context_engine_notification:
+                    _queue_context_engine_compression_notification(
+                        agent,
+                        new_session_id=agent.session_id or "",
+                        old_session_id=_boundary_parent,
+                    )
+                else:
+                    _notify_context_engine_compression_complete(
+                        agent,
+                        new_session_id=agent.session_id or "",
+                        old_session_id=_boundary_parent,
+                    )
+
+            try:
+                if _is_boundary and agent._memory_manager:
+                    agent._memory_manager.on_session_switch(
+                        agent.session_id or "",
+                        parent_session_id=_boundary_parent,
+                        reset=False,
+                        reason="compression",
+                    )
+            except Exception as _me_err:
+                logger.debug(
+                    "memory manager on_session_switch (compression): %s", _me_err
+                )
+
+        _run_postcommit_callbacks_bounded(
+            _postcommit_observer_chain, session_id=agent.session_id or ""
+        )
+
+        # Clear stale activity labels separately from arbitrary providers. This
+        # local best-effort DB bookkeeping cannot hold the already-released
+        # compression lease.
         if _old_sid and _session_commit_succeeded:
             try:
                 _labels_db = getattr(agent, "_session_db", None)
@@ -4170,43 +4263,6 @@ def compress_context(
                     "labels (ignored)",
                     exc_info=True,
                 )
-
-        # Notify the context engine that a compaction boundary occurred. Plugin
-        # engines (e.g. hermes-lcm) use boundary_reason="compression" to preserve
-        # DAG lineage / checkpoint per-session state across the boundary instead of
-        # re-initializing fresh. See hermes-lcm#68. Built-in ContextCompressor
-        # ignores kwargs. Fires in BOTH modes: rotation passes old→new ids; in-place
-        # passes the SAME id (the boundary is real even though the id didn't move).
-        if _context_engine_boundary_committed:
-            if defer_context_engine_notification:
-                _queue_context_engine_compression_notification(
-                    agent,
-                    new_session_id=agent.session_id or "",
-                    old_session_id=_boundary_parent,
-                )
-            else:
-                _notify_context_engine_compression_complete(
-                    agent,
-                    new_session_id=agent.session_id or "",
-                    old_session_id=_boundary_parent,
-                )
-
-        # Notify memory providers of the compaction boundary so provider-cached
-        # per-session state (Hindsight's _document_id, accumulated turn buffers,
-        # counters) refreshes. reset=False because the logical conversation
-        # continues. See #6672. Fires in BOTH modes: in-place uses the same id as
-        # parent (the conversation didn't fork, but the buffer must still be told
-        # the transcript was compacted so it doesn't double-count dropped turns).
-        try:
-            if _is_boundary and agent._memory_manager:
-                agent._memory_manager.on_session_switch(
-                    agent.session_id or "",
-                    parent_session_id=_boundary_parent,
-                    reset=False,
-                    reason="compression",
-                )
-        except Exception as _me_err:
-            logger.debug("memory manager on_session_switch (compression): %s", _me_err)
 
         # Warn on repeated compressions (quality degrades with each pass).
         # Route through _emit_status (like the other compression warnings above)
@@ -4323,11 +4379,9 @@ def compress_context(
             agent._last_compaction_in_place = False
         raise
     finally:
-        # Release the lock on the OLD session_id only AFTER rotation completed
-        # and all post-rotation bookkeeping (memory manager, context engine,
-        # file dedup) ran. A concurrent path that wakes up the moment we
-        # release will see the NEW session_id in state.db / SessionEntry and
-        # acquire on that — no race against our just-finished work.
+        # Idempotent lifecycle cleanup. Durable publication paths already
+        # released the holder-qualified lease immediately after their SessionDB
+        # transaction; precommit exits and in-memory-only mode release it here.
         try:
             _release_lock()
         finally:

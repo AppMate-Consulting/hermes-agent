@@ -314,15 +314,34 @@ def _record_hygiene_failure(
     if callable(recorder):
         try:
             result = recorder(session_id, base_cooldown_seconds, error)
-            gateway._session_state(
-                session_key
-            ).persistent.hygiene_failure_streak = int(result["streak"])
-            return
         except Exception as exc:
             logger.warning(
                 "durable hygiene failure recording failed; advancing "
                 "process-only safety state: %s", exc,
             )
+        else:
+            # The transaction above is authoritative once it returns.  Hot
+            # state is only a same-process optimization: failure to mirror the
+            # committed streak must never enter the compatibility path and
+            # issue a second, potentially lower-rung durable cooldown write.
+            try:
+                gateway._session_state(
+                    session_key
+                ).persistent.hygiene_failure_streak = int(result["streak"])
+            except Exception as exc:
+                logger.warning(
+                    "durable hygiene failure recorded (streak=%s, "
+                    "cooldown_until=%s), but hot-cache synchronization "
+                    "failed: %s",
+                    result.get("streak") if isinstance(result, dict) else "?",
+                    (
+                        result.get("cooldown_until")
+                        if isinstance(result, dict)
+                        else "?"
+                    ),
+                    exc,
+                )
+            return
     _record_hygiene_cooldown(
         gateway, session_id,
         _hygiene_cooldown_for_failure(

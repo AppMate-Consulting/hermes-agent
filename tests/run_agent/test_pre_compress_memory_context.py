@@ -1,6 +1,8 @@
 """Behavior contracts for the pre-compression memory-context handoff."""
 
 import copy
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -506,3 +508,129 @@ def test_post_commit_pre_compress_exception_does_not_skip_memory_commit(
             "compression_count": 1,
         },
     )
+
+
+def test_blocked_postcommit_provider_is_bounded_and_releases_lease(
+    monkeypatch, tmp_path, request, caplog
+):
+    from agent.conversation_compression import CompressionCommitFence
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    request.addfinalizer(db.close)
+    sid = "blocked-postcommit-provider"
+    db.create_session(sid, "cli", model="test/model")
+    db.append_message(sid, "user", "durable original")
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    class BlockingObserver:
+        def on_pre_compress(self, _messages):
+            entered.set()
+            release.wait()
+
+        def on_session_switch(self, *_args, **_kwargs):
+            completed.set()
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "durable compacted"}
+    ]
+    _configure_engine_state(compressor)
+    agent = _make_agent(BlockingObserver(), compressor)
+    agent._session_db = db
+    agent.session_id = sid
+    agent.compression_in_place = True
+    agent.commit_memory_session = MagicMock()
+    fence = CompressionCommitFence()
+    estimates = iter((100_000, 1_000))
+    monkeypatch.setattr(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: next(estimates),
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression._POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.05
+    )
+
+    started = time.monotonic()
+    returned, _ = agent._compress_context(
+        _messages(), "sys", approx_tokens=100_000, force=True, commit_fence=fence
+    )
+    elapsed = time.monotonic() - started
+
+    assert entered.is_set()
+    assert elapsed < 1.0
+    assert fence.commit_in_flight is False
+    assert db.get_compression_lock_holder(sid) is None
+    assert db.try_acquire_compression_lock(sid, "later-attempt", ttl_seconds=30)
+    db.release_compression_lock(sid, "later-attempt")
+    assert returned[0]["content"].endswith("durable compacted")
+    assert db.get_messages_as_conversation(sid)[0]["content"].endswith(
+        "durable compacted"
+    )
+    assert agent._last_compression_outcome == "committed_materially_shrunk"
+    assert "postcommit compression callbacks exceeded" in caplog.text
+    agent.commit_memory_session.assert_not_called()
+    release.set()
+    assert completed.wait(1.0)
+    agent.commit_memory_session.assert_called_once()
+
+
+def test_prepublication_prompt_work_remains_cancellable(
+    monkeypatch, tmp_path, request
+):
+    from agent.conversation_compression import CompressionCommitFence
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    request.addfinalizer(db.close)
+    sid = "cancel-prepublication-prompt"
+    db.create_session(sid, "cli", model="test/model")
+    db.append_message(sid, "user", "durable original")
+    entered = threading.Event()
+    release = threading.Event()
+    compressor = MagicMock()
+    compressor.compress.return_value = [{"role": "user", "content": "candidate"}]
+    _configure_engine_state(compressor)
+    agent = _make_agent(MagicMock(), compressor)
+    agent._session_db = db
+    agent.session_id = sid
+    agent.compression_in_place = True
+    agent.commit_memory_session = MagicMock()
+    original = _messages()
+    fence = CompressionCommitFence()
+
+    def blocked_prompt(_message):
+        entered.set()
+        release.wait()
+        return "candidate prompt"
+
+    agent._build_system_prompt = blocked_prompt
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            agent._compress_context(
+                original,
+                "sys",
+                approx_tokens=100_000,
+                force=True,
+                commit_fence=fence,
+            )
+        )
+    )
+    worker.start()
+    assert entered.wait(1.0)
+    assert fence.commit_in_flight is False
+    assert fence.cancel_before_commit() is True
+    release.set()
+    worker.join(2.0)
+
+    assert not worker.is_alive()
+    assert result[0][0] is original
+    assert agent._last_compression_outcome == "cancelled_commit_fence"
+    assert db.get_messages_as_conversation(sid)[0]["content"] == "durable original"
+    assert db.get_compression_lock_holder(sid) is None
+    assert fence.commit_in_flight is False
+    agent._memory_manager.on_pre_compress.assert_not_called()
+    agent.commit_memory_session.assert_not_called()

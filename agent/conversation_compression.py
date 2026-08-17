@@ -52,6 +52,7 @@ thread, not the conversation thread. Extension authors must assume:
 from __future__ import annotations
 
 import concurrent.futures
+import collections
 import copy
 import inspect
 import json
@@ -2537,6 +2538,9 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
 _PENDING_CONTEXT_ENGINE_NOTIFICATION = (
     "_pending_context_engine_compression_notification"
 )
+_PENDING_CONTEXT_ENGINE_NOTIFICATION_LOCK = (
+    "_pending_context_engine_compression_notification_lock"
+)
 
 
 def _notify_context_engine_compression_complete(
@@ -2544,6 +2548,9 @@ def _notify_context_engine_compression_complete(
     *,
     new_session_id: str,
     old_session_id: str,
+    callback: Any = None,
+    platform: Optional[str] = None,
+    conversation_id: Any = None,
 ) -> bool:
     """Notify the active context engine after a durable compression commit."""
     # Relay session-span segmentation (opt-in, gateway.telemetry.
@@ -2560,7 +2567,8 @@ def _notify_context_engine_compression_complete(
         )
     except Exception:
         logger.debug("relay segment rotation notification failed", exc_info=True)
-    callback = getattr(agent.context_compressor, "on_session_start", None)
+    if callback is None:
+        callback = getattr(agent.context_compressor, "on_session_start", None)
     if not callable(callback):
         return False
     try:
@@ -2568,8 +2576,8 @@ def _notify_context_engine_compression_complete(
             new_session_id,
             boundary_reason="compression",
             old_session_id=old_session_id,
-            platform=getattr(agent, "platform", None) or "cli",
-            conversation_id=getattr(agent, "_gateway_session_key", None),
+            platform=platform or "cli",
+            conversation_id=conversation_id,
         )
     except Exception:
         # Context-engine hooks are observers. A callback failure must not undo
@@ -2588,18 +2596,39 @@ def _queue_context_engine_compression_notification(
     new_session_id: str,
     old_session_id: str,
 ) -> None:
-    """Stage exactly one existing hook call for an outer host transaction."""
-    if callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)):
-        raise RuntimeError("a compression notification is already pending")
+    """Synchronously stage a frozen hook invocation for an outer transaction.
+
+    Staging happens on the publishing thread, never in the detached observer
+    lane.  A deque is used because a host may publish a second boundary before
+    it finalizes the first; each finalization atomically claims the oldest
+    record and detached work can neither overwrite nor reinstall it.
+    """
+    callback = getattr(agent.context_compressor, "on_session_start", None)
+    platform = str(getattr(agent, "platform", None) or "cli")
+    conversation_id = copy.deepcopy(getattr(agent, "_gateway_session_key", None))
 
     def _notify() -> bool:
         return _notify_context_engine_compression_complete(
             agent,
             new_session_id=new_session_id,
             old_session_id=old_session_id,
+            callback=callback,
+            platform=platform,
+            conversation_id=conversation_id,
         )
-
-    setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, _notify)
+    lock = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION_LOCK, None)
+    if lock is None:
+        with _POSTCOMMIT_LANE_INIT_LOCK:
+            lock = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION_LOCK, None)
+            if lock is None:
+                lock = threading.Lock()
+                setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION_LOCK, lock)
+    with lock:
+        pending = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
+        if not isinstance(pending, collections.deque):
+            pending = collections.deque()
+            setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, pending)
+        pending.append(_notify)
 
 
 def finalize_context_engine_compression_notification(
@@ -2608,8 +2637,14 @@ def finalize_context_engine_compression_notification(
     committed: bool,
 ) -> bool:
     """Emit or discard a deferred notification; repeated calls are no-ops."""
-    pending = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
-    setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
+    lock = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION_LOCK, None)
+    if lock is None:
+        return False
+    with lock:
+        queue = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
+        pending = queue.popleft() if isinstance(queue, collections.deque) and queue else None
+        if isinstance(queue, collections.deque) and not queue:
+            setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
     if not committed or not callable(pending):
         return False
     return bool(pending())
@@ -2625,6 +2660,7 @@ def compress_context(
     focus_topic: Optional[str] = None,
     force: bool = False,
     defer_context_engine_notification: bool = False,
+    protected_tail: Optional[list] = None,
     commit_fence: Optional[CompressionCommitFence] = None,
     rejection_cooldown_seconds: Optional[float] = 60.0,
 ) -> Tuple[list, str]:
@@ -2646,6 +2682,9 @@ def compress_context(
             callers use the default ``False``.
         defer_context_engine_notification: Delay the existing context-engine
             hook until a manual host commits its outer history transaction.
+        protected_tail: Exact suffix that must remain verbatim.  The boundary
+            is validated against the lease-time authoritative transcript and
+            the joined candidate is published by this transaction.
         commit_fence: Optional cooperative fence for executor callers that
             may time out. It prevents a late worker from mutating session state
             after its caller has moved on.
@@ -3465,6 +3504,18 @@ def compress_context(
         messages_before_compression = copy.deepcopy(
             _authoritative_pre_compression_snapshot
         )
+        _protected_tail_snapshot: list = []
+        _compression_input = messages
+        if protected_tail is not None:
+            _requested_tail = copy.deepcopy(protected_tail)
+            if not _requested_tail or len(_requested_tail) >= len(messages):
+                raise ValueError("protected compression tail has no compressible head")
+            if messages[-len(_requested_tail):] != _requested_tail:
+                raise ValueError(
+                    "protected compression tail does not match authoritative transcript"
+                )
+            _protected_tail_snapshot = _requested_tail
+            _compression_input = copy.deepcopy(messages[:-len(_requested_tail)])
         # Snapshot the exact request prompt before any compression hook can
         # invalidate or rebuild prompt state. An uncached request would build
         # this same prompt on its normal request path; sizing against "" would
@@ -3550,7 +3601,7 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
-                    compressed = compress_fn(messages, **compress_kwargs)
+                    compressed = compress_fn(_compression_input, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
@@ -3709,7 +3760,7 @@ def compress_context(
         # legacy/plugin engines may return an equal copy for a no-op, or mutate
         # the live list while returning an unchanged snapshot. Neither case may
         # rotate or rewrite the session.
-        if compressed == messages_before_compression:
+        if compressed == _compression_input:
             _restore_uncommitted_input()
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
@@ -3855,6 +3906,12 @@ def compress_context(
         _ensure_compressed_has_user_turn(
             _authoritative_pre_compression_snapshot, compressed
         )
+        if _protected_tail_snapshot:
+            # The protected suffix is appended byte-for-byte before admission
+            # and before the sole SessionDB publication.  Never run sequence
+            # repair over this join: a malformed seam is rejected below by the
+            # canonical request builder instead of rewriting protected rows.
+            compressed = list(compressed) + copy.deepcopy(_protected_tail_snapshot)
 
         cached_system_prompt = getattr(agent, "_cached_system_prompt", None)
         agent._invalidate_system_prompt()
@@ -3898,7 +3955,10 @@ def compress_context(
         # conversation-loop dependency.  The old and rebuilt prompts are part
         # of their respective complete requests: prompt growth is real request
         # growth and must not be hidden merely to isolate transcript reclaim.
-        from agent.conversation_loop import project_provider_request
+        from agent.conversation_loop import (
+            finalize_provider_request,
+            project_provider_request,
+        )
 
         _provider_request_in = project_provider_request(
             agent,
@@ -3919,13 +3979,37 @@ def compress_context(
             tools=agent.tools or [],
             apply_context_selection=False,
         )
+        _admission_middleware_context = {
+            "task_id": task_id,
+            "turn_id": "compression-admission",
+            "api_request_id": "compression-admission",
+            "session_id": str(agent.session_id or ""),
+            "platform": str(agent.platform or ""),
+            "model": str(agent.model or ""),
+            "provider": str(agent.provider or ""),
+            "base_url": str(agent.base_url or ""),
+            "api_mode": str(agent.api_mode or ""),
+            "api_call_count": 0,
+        }
+        _provider_request_in = finalize_provider_request(
+            agent,
+            _provider_request_in,
+            system_message=_system_prompt_before_compression or "",
+            middleware_context=dict(_admission_middleware_context),
+        )["payload"]
+        _provider_request_out = finalize_provider_request(
+            agent,
+            _provider_request_out,
+            system_message=new_system_prompt or "",
+            middleware_context=dict(_admission_middleware_context),
+        )["payload"]
         _request_in = estimate_request_tokens_rough(
-            _provider_request_in["messages"],
-            tools=_provider_request_in["tools"] or None,
+            _provider_request_in.get("messages") or _provider_request_in.get("input") or [],
+            tools=_provider_request_in.get("tools") or None,
         )
         _request_out = estimate_request_tokens_rough(
-            _provider_request_out["messages"],
-            tools=_provider_request_out["tools"] or None,
+            _provider_request_out.get("messages") or _provider_request_out.get("input") or [],
+            tools=_provider_request_out.get("tools") or None,
         )
         _threshold = int(
             getattr(agent.context_compressor, "threshold_tokens", 0) or 0
@@ -4347,6 +4431,24 @@ def compress_context(
             "in_place": in_place,
             "compression_count": agent.context_compressor.compression_count,
         }
+        _observer_context_callback = getattr(
+            agent.context_compressor, "on_session_start", None
+        )
+        _observer_platform = str(getattr(agent, "platform", None) or "cli")
+        _observer_conversation_id = copy.deepcopy(
+            getattr(agent, "_gateway_session_key", None)
+        )
+
+        # Deferred host notification is commit state, not observer work. Stage
+        # it synchronously before this method can return; a predecessor blocked
+        # in the FIFO lane must not make immediate host finalization race an
+        # absent notification.
+        if _context_engine_boundary_committed and defer_context_engine_notification:
+            _queue_context_engine_compression_notification(
+                agent,
+                new_session_id=_observer_new_session_id,
+                old_session_id=_observer_old_session_id,
+            )
 
         def _postcommit_observer_chain() -> None:
             if _observer_memory_manager:
@@ -4382,17 +4484,14 @@ def compress_context(
                 logger.debug("memory boundary extraction failed", exc_info=True)
 
             if _context_engine_boundary_committed:
-                if defer_context_engine_notification:
-                    _queue_context_engine_compression_notification(
-                        agent,
-                        new_session_id=_observer_new_session_id,
-                        old_session_id=_observer_old_session_id,
-                    )
-                else:
+                if not defer_context_engine_notification:
                     _notify_context_engine_compression_complete(
                         agent,
                         new_session_id=_observer_new_session_id,
                         old_session_id=_observer_old_session_id,
+                        callback=_observer_context_callback,
+                        platform=_observer_platform,
+                        conversation_id=_observer_conversation_id,
                     )
 
             try:
@@ -4457,7 +4556,19 @@ def compress_context(
                 f"accuracy may degrade. Consider /new to start fresh."
             )
             agent._compression_warning = _cc_msg
-            agent._emit_status(_cc_msg)
+            _status_callback = getattr(agent, "status_callback", None)
+            if callable(_status_callback):
+                _frozen_status_callback = _status_callback
+                _frozen_status_message = str(_cc_msg)
+                _run_postcommit_callbacks_bounded(
+                    agent,
+                    lambda: _frozen_status_callback(
+                        "lifecycle", _frozen_status_message
+                    ),
+                    session_id=_observer_new_session_id,
+                )
+            else:
+                agent._emit_status(_cc_msg)
 
         # Surface the compaction mode to the caller (run_conversation / gateway)
         # via a rotation-independent flag. The gateway uses this — NOT an

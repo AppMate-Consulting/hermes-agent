@@ -4105,7 +4105,6 @@ class GatewaySlashCommandsMixin:
         from hermes_cli.partial_compress import (
             extract_compress_flags,
             parse_partial_compress_args,
-            rejoin_compressed_head_and_tail,
             split_history_for_partial_compress,
             summarize_compress_preview,
         )
@@ -4274,12 +4273,13 @@ class GatewaySlashCommandsMixin:
                 # multiplexing.
                 compressed, _ = await self._run_in_executor_with_context(
                     lambda: tmp_agent._compress_context(
-                        head,
+                        msgs,
                         "",
                         approx_tokens=approx_tokens,
                         focus_topic=focus_topic,
                         force=True,
                         defer_context_engine_notification=True,
+                        protected_tail=tail if partial and tail else None,
                     )
                 )
 
@@ -4297,9 +4297,6 @@ class GatewaySlashCommandsMixin:
                         describe_compression_lock_skip,
                     )
                     return describe_compression_lock_skip(_lock_skipped)
-
-                if partial and tail:
-                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
 
                 # _compress_context either rotated (legacy: ended the old
                 # session, created a continuation id — write compressed messages
@@ -4339,13 +4336,10 @@ class GatewaySlashCommandsMixin:
                 # original messages and replace them with only the compressed
                 # summary (permanent data loss #44794, #39704).
                 if rotated:
-                    if not await self.async_session_store.rewrite_transcript(
-                        new_session_id, compressed
-                    ):
-                        raise RuntimeError(
-                            f"failed to persist compressed transcript for "
-                            f"session {new_session_id}"
-                        )
+                    # The authoritative compression transaction published the
+                    # complete head+protected-tail child atomically.  This host
+                    # only repoints its routing entry; a second transcript
+                    # rewrite would reopen the CAS boundary.
                     session_entry.session_id = new_session_id
                     await self.async_session_store._save()
                     await asyncio.to_thread(

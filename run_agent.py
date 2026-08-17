@@ -7857,6 +7857,7 @@ class AIAgent:
         focus_topic: str = None,
         force: bool = False,
         defer_context_engine_notification: bool = False,
+        protected_tail: list | None = None,
         commit_fence=None,
         rejection_cooldown_seconds: float | None = 60.0,
     ) -> tuple:
@@ -7929,6 +7930,7 @@ class AIAgent:
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
+                    protected_tail=protected_tail,
                     commit_fence=fence,
                     rejection_cooldown_seconds=rejection_cooldown_seconds,
                 )

@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -1367,6 +1368,80 @@ def project_provider_request(
     return {"messages": api_messages, "tools": projected_tools}
 
 
+def finalize_provider_request(
+    agent,
+    projected_request: Dict[str, Any],
+    *,
+    system_message: str = "",
+    moa_prepared_request: Any = None,
+    middleware_context: Optional[Dict[str, Any]] = None,
+    consume_user_initiator: bool = False,
+) -> Dict[str, Any]:
+    """Construct the sole provider-wire request consumed by dispatch/admission.
+
+    The input projection is privately cloned.  Every deterministic,
+    model-visible send-path transformation is completed here: provider
+    reasoning echo, cache redecoration, API-mode kwargs shaping, Unicode
+    normalization, Responses transport preflight, and request middleware.
+    Callers must dispatch ``payload`` verbatim.
+    """
+    api_messages = copy.deepcopy(projected_request.get("messages") or [])
+    tools_for_api = copy.deepcopy(projected_request.get("tools") or [])
+    agent._reapply_reasoning_echo_for_provider(api_messages)
+    api_messages, moa_prepared_request, tools_for_api = (
+        _redecorate_prompt_cache_for_provider(
+            agent,
+            api_messages,
+            system_message=system_message,
+            moa_prepared=moa_prepared_request,
+            tools_for_api=tools_for_api,
+        )
+    )
+    if tools_for_api == agent.tools:
+        payload = agent._build_api_kwargs(api_messages)
+    else:
+        payload = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    _sanitize_structure_surrogates(payload)
+    if agent._force_ascii_payload:
+        _sanitize_structure_non_ascii(payload)
+    if agent.api_mode == "codex_responses":
+        payload = agent._get_transport().preflight_kwargs(
+            payload,
+            allow_stream=False,
+            is_github_responses=agent._is_copilot_url(),
+            sanitize_harmony_tokens=agent._is_codex_backend(),
+        )
+    if (
+        consume_user_initiator
+        and getattr(agent, "_is_user_initiated_turn", False)
+        and agent._is_copilot_url()
+    ):
+        headers = dict(payload.get("extra_headers") or {})
+        headers["x-initiator"] = "user"
+        payload["extra_headers"] = headers
+        agent._is_user_initiated_turn = False
+    middleware_trace = []
+    original_payload = copy.deepcopy(payload)
+    if middleware_context is not None:
+        try:
+            from hermes_cli.middleware import apply_llm_request_middleware
+
+            mw = apply_llm_request_middleware(payload, **middleware_context)
+            payload = mw.payload
+            original_payload = mw.original_payload
+            middleware_trace = list(mw.trace)
+        except Exception:
+            pass
+    return {
+        "payload": payload,
+        "messages": api_messages,
+        "tools": tools_for_api,
+        "moa_prepared_request": moa_prepared_request,
+        "original_payload": original_payload,
+        "middleware_trace": middleware_trace,
+    }
+
+
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     """Error-result content for a tool call whose name isn't a real tool.
 
@@ -2656,77 +2731,31 @@ def run_conversation(
                 # echo-back pad for the *current* provider here (idempotent no-op
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
-                agent._reapply_reasoning_echo_for_provider(api_messages)
-                # Same story for prompt-cache decoration (#72626): try_activate_
-                # fallback refreshes the policy flags, but the decorated list
-                # still carries the primary's breakpoints (or none). Strip and
-                # re-render for the current provider before building kwargs.
-                api_messages, _moa_prepared_request, tools_for_api = (
-                    _redecorate_prompt_cache_for_provider(
-                        agent,
-                        api_messages,
-                        system_message=system_message,
-                        moa_prepared=_moa_prepared_request,
-                        tools_for_api=tools_for_api,
-                    )
+                _finalized_request = finalize_provider_request(
+                    agent,
+                    {"messages": api_messages, "tools": tools_for_api},
+                    system_message=system_message or "",
+                    moa_prepared_request=_moa_prepared_request,
+                    middleware_context={
+                        "task_id": effective_task_id,
+                        "turn_id": turn_id,
+                        "api_request_id": api_request_id,
+                        "session_id": agent.session_id or "",
+                        "platform": agent.platform or "",
+                        "model": agent.model,
+                        "provider": agent.provider,
+                        "base_url": agent.base_url,
+                        "api_mode": agent.api_mode,
+                        "api_call_count": api_call_count,
+                    },
+                    consume_user_initiator=True,
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
-                else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
-                    )
-                # Outbound-request surrogate chokepoint (#50959): the messages
-                # were scrubbed above, but the rest of the request body —
-                # tool/function descriptions (session_search's ±-heavy text is
-                # the recorded repro), extra_body, system strings routed via
-                # kwargs — can still carry invalid code points that providers
-                # reject with a non-retryable HTTP 400 ("invalid unicode code
-                # point"). One in-place walk here guarantees the entire
-                # payload json.dumps()-safe regardless of which leaf produced
-                # the string. Fast no-op when the payload is clean.
-                _sanitize_structure_surrogates(api_kwargs)
-                if agent._force_ascii_payload:
-                    _sanitize_structure_non_ascii(api_kwargs)
-                if agent.api_mode == "codex_responses":
-                    api_kwargs = agent._get_transport().preflight_kwargs(
-                        api_kwargs,
-                        allow_stream=False,
-                        is_github_responses=agent._is_copilot_url(),
-                        sanitize_harmony_tokens=agent._is_codex_backend(),
-                    )
-                # Copilot x-initiator: the first API call of a user turn is
-                # marked "user" so Copilot bills a premium request; tool-loop
-                # follow-ups keep the default "agent" header (#3040).
-                if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
-                    _xh = dict(api_kwargs.get("extra_headers") or {})
-                    _xh["x-initiator"] = "user"
-                    api_kwargs["extra_headers"] = _xh
-                    agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
-                    _original_api_kwargs = dict(api_kwargs)
-                    _llm_middleware_trace = []
-
+                api_kwargs = _finalized_request["payload"]
+                api_messages = _finalized_request["messages"]
+                tools_for_api = _finalized_request["tools"]
+                _moa_prepared_request = _finalized_request["moa_prepared_request"]
+                _original_api_kwargs = _finalized_request["original_payload"]
+                _llm_middleware_trace = _finalized_request["middleware_trace"]
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
@@ -2874,13 +2903,6 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
-                    if agent.api_mode == "codex_responses":
-                        next_api_kwargs = agent._get_transport().preflight_kwargs(
-                            next_api_kwargs,
-                            allow_stream=False,
-                            is_github_responses=agent._is_copilot_url(),
-                            sanitize_harmony_tokens=agent._is_codex_backend(),
-                        )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner

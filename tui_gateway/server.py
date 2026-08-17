@@ -5026,7 +5026,6 @@ def _compress_session_history(
     from agent.model_metadata import estimate_request_tokens_rough
     from hermes_cli.partial_compress import (
         parse_partial_compress_args,
-        rejoin_compressed_head_and_tail,
         split_history_for_partial_compress,
     )
 
@@ -5075,7 +5074,7 @@ def _compress_session_history(
     # and gateway handlers.
     try:
         compressed, _ = agent._compress_context(
-            head,
+            history,
             None,
             approx_tokens=approx_tokens,
             # Partial compress has no focus topic (the modes are exclusive;
@@ -5084,6 +5083,7 @@ def _compress_session_history(
             focus_topic=focus_topic or None,
             force=True,
             defer_context_engine_notification=True,
+            protected_tail=tail if partial and tail else None,
         )
     except Exception:
         finalize_context_engine_compression_notification(
@@ -5109,8 +5109,6 @@ def _compress_session_history(
             _lock_skipped if isinstance(_lock_skipped, str) else None
         )
 
-    if partial and tail:
-        compressed = rejoin_compressed_head_and_tail(compressed, tail)
     with session["history_lock"]:
         if int(session.get("history_version", 0)) != history_version:
             # External mutation during compaction — drop the compressed

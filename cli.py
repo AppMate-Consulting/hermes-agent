@@ -12446,7 +12446,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from hermes_cli.partial_compress import (
             extract_compress_flags,
             parse_partial_compress_args,
-            rejoin_compressed_head_and_tail,
             split_history_for_partial_compress,
             summarize_compress_preview,
         )
@@ -12547,12 +12546,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # which already contain the agent identity — resulting in the
                 # identity block appearing twice (issue #15281).
                 compressed, _ = self.agent._compress_context(
-                    head,
+                    original_history,
                     None,
                     approx_tokens=approx_tokens,
                     focus_topic=focus_topic or None,
                     force=True,
                     defer_context_engine_notification=True,
+                    protected_tail=tail if partial and tail else None,
                 )
 
                 # If _compress_context returned unchanged because a
@@ -12587,8 +12587,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     return
 
-                if partial and tail:
-                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
                 self.conversation_history = compressed
                 # _compress_context ends the old session and creates a new child
                 # session on the agent (run_agent.py::_compress_context). Sync the
@@ -12602,10 +12600,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 ):
                     self.session_id = self.agent.session_id
                     self._pending_title = None
-                    # Manual /compress replaces conversation_history with a new
-                    # compressed handoff for the child session. Persist it from
-                    # offset 0 so resume can recover the continuation after exit.
-                    self.agent._flush_messages_to_session_db(self.conversation_history, None)
                 finalize_context_engine_compression_notification(
                     self.agent,
                     committed=True,

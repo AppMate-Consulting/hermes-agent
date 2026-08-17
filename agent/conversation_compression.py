@@ -2320,6 +2320,16 @@ def _latest_active_human_task_row(messages: list) -> Optional[dict]:
                 message, allow_projected=True
             ) is not None
         )
+        if projected_contract:
+            contract = ContextCompressor.parse_active_task_contract(
+                message, allow_projected=True
+            )
+            # The original human row may have been compressed away, but the
+            # complete trusted sequence is its durable, authoritative
+            # replacement.  Reconstruct only the human payload; returning the
+            # synthetic contract row itself would make bridge JSON look like
+            # a task to snapshot or resume.
+            return {"role": "user", "content": contract["content"]}
         incomplete_internal_contract = (
             ContextCompressor.parse_active_task_contract(
                 message, allow_projected=True
@@ -2334,8 +2344,7 @@ def _latest_active_human_task_row(messages: list) -> Optional[dict]:
             )
         )
         if (
-            projected_contract
-            or incomplete_internal_contract
+            incomplete_internal_contract
             or _is_active_task_contract_message(message)
         ):
             continue

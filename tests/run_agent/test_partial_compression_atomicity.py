@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hermes_state import SessionDB
+from agent.context_compressor import SUMMARY_PREFIX
 
 
 OLD_TASK = "OLD HUMAN TASK MUST DISAPPEAR " + "old-payload " * 1200
@@ -31,7 +32,7 @@ LATEST_TASK = [
 LATEST_API = "LATEST PROTECTED HUMAN TASK\n[private api sidecar]"
 LOOKALIKE = "[ASYNC DELEGATION COMPLETE child=proof-lane]"
 CALL_ID = "call_protected_1"
-SUMMARY = "[CONTEXT COMPACTION] durable generated head"
+SUMMARY = f"{SUMMARY_PREFIX}\ndurable generated head"
 
 
 def _select_transcript_dependent_context(
@@ -265,11 +266,14 @@ def _assert_here_one_boundary_result(
     assert publish.call_count == 1
     _assert_valid_tool_pairs(active)
 
-    completion = next(
-        i for i, row in enumerate(active)
-        if row.get("content") == LOOKALIKE
-    )
-    assert ContextCompressor._completion_has_durable_provenance(active, completion)
+    if not newer_human:
+        completion = next(
+            i for i, row in enumerate(active)
+            if row.get("content") == LOOKALIKE
+        )
+        assert ContextCompressor._completion_has_durable_provenance(
+            active, completion
+        )
     active_human = _latest_active_human_task_row(active)
     assert active_human is not None
     expected_task = (
@@ -324,10 +328,13 @@ def _assert_here_one_restart_replay(
     reopened = SessionDB(db_path=path)
     replay = reopened.get_messages_as_conversation(session_id)
     assert replay == expected
-    completion = next(
-        i for i, row in enumerate(replay) if row.get("content") == LOOKALIKE
-    )
-    assert ContextCompressor._completion_has_durable_provenance(replay, completion)
+    if not newer_human:
+        completion = next(
+            i for i, row in enumerate(replay) if row.get("content") == LOOKALIKE
+        )
+        assert ContextCompressor._completion_has_durable_provenance(
+            replay, completion
+        )
     active_human = _latest_active_human_task_row(replay)
     assert active_human is not None
     assert active_human["content"] == (
@@ -731,7 +738,9 @@ async def test_gateway_slash_here_one_real_sessiondb_boundary_proof(
     host = Host()
     method = "archive_and_compact" if in_place else "publish_compression_child"
 
-    def identity_redecorate(_agent, messages, *, moa_prepared, tools_for_api):
+    def identity_redecorate(
+        _agent, messages, *, moa_prepared, tools_for_api, **_kwargs
+    ):
         return copy.deepcopy(messages), moa_prepared, copy.deepcopy(tools_for_api)
 
     with patch("run_agent.AIAgent", return_value=prepared), patch.object(

@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hermes_cli.middleware import RequestMiddlewareResult
+from agent.conversation_compression import (
+    estimate_finalized_payload_tokens_rough as _real_finalized_estimate,
+)
 from run_agent import AIAgent
 
 
@@ -120,6 +123,9 @@ def _run(
     middleware_calls,
     boundary_events=None,
     execution_callbacks=None,
+    middleware_transform=None,
+    finalized_estimator=None,
+    conversation_history=None,
 ):
     boundary_events = boundary_events if boundary_events is not None else []
     response_iter = iter(responses)
@@ -155,6 +161,8 @@ def _run(
             **shaped.get("extra_headers", {}),
             "x-proof-middleware": "applied",
         }
+        if middleware_transform is not None:
+            shaped = middleware_transform(shaped)
         middleware_calls.append((copy.deepcopy(shaped), copy.deepcopy(context)))
         boundary_events.append(("middleware", copy.deepcopy(shaped)))
         return RequestMiddlewareResult(
@@ -164,12 +172,22 @@ def _run(
             trace=[{"middleware": "proof"}],
         )
 
+    if finalized_estimator is None:
+        finalized_estimator = (
+            lambda payload: 1_000
+            if "compact summary" in str(payload) else 100_000
+        )
+
     with (
         patch("agent.turn_context.estimate_request_tokens_rough", return_value=1),
         patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=50),
         patch(
             "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
-            side_effect=lambda payload: 1_000 if "compact summary" in str(payload) else 100_000,
+            side_effect=finalized_estimator,
+        ),
+        patch(
+            "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+            side_effect=finalized_estimator,
         ),
         patch("hermes_cli.middleware.apply_llm_request_middleware", side_effect=middleware),
         patch(
@@ -189,7 +207,7 @@ def _run(
     ):
         return agent.run_conversation(
             copy.deepcopy(STRUCTURED),
-            conversation_history=[
+            conversation_history=conversation_history or [
                 {"role": "user", "content": copy.deepcopy(STRUCTURED)},
                 {"role": "assistant", "content": "older answer " * 20_000},
             ],
@@ -239,6 +257,104 @@ def test_real_compression_admission_dispatches_exact_finalized_payload():
     assert sum("duplicate human content" in str(row) for row in dispatch["messages"]) == 1
     assert all("_compression_turn_anchor" not in row for row in result["messages"])
     assert "_admitted_provider_request" not in vars(agent)
+
+
+def test_finalized_middleware_pressure_triggers_one_old_one_candidate_handoff():
+    agent, compressor = _agent()
+    compressor.threshold_tokens = 1_000
+    compressor.should_compress.side_effect = (
+        lambda tokens: tokens >= compressor.threshold_tokens
+    )
+    observed_payloads = []
+
+    def inflate_old_request(payload):
+        if "older answer" not in str(payload.get("messages", [])):
+            return payload
+        payload["messages"].append(
+            {"role": "system", "content": "middleware-visible " * 2_000}
+        )
+        payload["tools"] = [
+            *payload.get("tools", []),
+            {
+                "type": "function",
+                "function": {
+                    "name": "middleware_tool",
+                    "description": "provider-visible " * 2_000,
+                    "parameters": {"type": "object"},
+                },
+            },
+        ]
+        payload["provider_options"] = {"routing": "middleware " * 2_000}
+        return payload
+
+    def pressure(payload):
+        observed_payloads.append(copy.deepcopy(payload))
+        return _real_finalized_estimate(payload)
+
+    admitted, snapshots, middleware_calls = [], [], []
+    result = _run(
+        agent,
+        [_response()],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        middleware_transform=inflate_old_request,
+        finalized_estimator=pressure,
+        conversation_history=[
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "older answer"},
+        ],
+    )
+
+    assert result["completed"] is True
+    assert compressor.compress.call_count == 1
+    finalized_pressure = compressor.should_compress.call_args_list[0].args[0]
+    assert finalized_pressure >= compressor.threshold_tokens
+    pre_middleware = copy.deepcopy(observed_payloads[0])
+    pre_middleware["messages"].pop()
+    pre_middleware["tools"].pop()
+    pre_middleware.pop("provider_options")
+    assert _real_finalized_estimate(pre_middleware) < compressor.threshold_tokens
+    assert observed_payloads[0]["messages"][-1]["content"].startswith(
+        "middleware-visible"
+    )
+    assert observed_payloads[0]["tools"][-1]["function"]["name"] == (
+        "middleware_tool"
+    )
+    assert "provider_options" in observed_payloads[0]
+    # Exactly one ordinary old transition plus one admitted candidate.
+    assert len(middleware_calls) == 2
+    assert len(admitted) == 1
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    _assert_dispatch_uses_admission(dispatch, admitted[0], snapshots[0])
+
+
+def test_no_compression_finalized_request_invokes_middleware_once():
+    agent, compressor = _agent()
+    compressor.threshold_tokens = 1_000
+    compressor.should_compress.side_effect = lambda tokens: tokens >= 1_000
+
+    def add_visible_option(payload):
+        payload["provider_options"] = {"preview": "small"}
+        return payload
+
+    admitted, snapshots, middleware_calls = [], [], []
+    result = _run(
+        agent,
+        [_response()],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        middleware_transform=add_visible_option,
+        finalized_estimator=lambda payload: 50,
+    )
+
+    assert result["completed"] is True
+    assert compressor.compress.call_count == 0
+    assert len(middleware_calls) == 1
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatch == middleware_calls[0][0]
+    assert dispatch["provider_options"] == {"preview": "small"}
 
 
 def test_same_provider_retry_reuses_admitted_bytes_verbatim():
@@ -483,5 +599,9 @@ def test_tool_iteration_cannot_consume_stale_admission():
     # one ordinary provider request.  Determinism replay must not duplicate
     # side effects.
     assert len(middleware_calls) == 3
-    assert agent.context_compressor.compression_checks == [63, 0]
+    assert len(agent.context_compressor.compression_checks) == 2
+    assert (
+        agent.context_compressor.compression_checks[0]
+        > agent.context_compressor.compression_checks[1]
+    )
     assert "_admitted_provider_request" not in vars(agent)

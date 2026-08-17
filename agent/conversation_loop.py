@@ -36,6 +36,7 @@ from agent.conversation_compression import (
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    estimate_finalized_payload_tokens_rough,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
@@ -69,7 +70,6 @@ from agent.message_sanitization import (
 _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    _estimate_tools_tokens_rough,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
@@ -2572,14 +2572,13 @@ def run_conversation(
         # replayed.
         _admitted_request = _old_finalized_request
 
-        # One image-stripped message estimate feeds both figures. Was: a
-        # str(msg) char walk (re-serialized base64 every call) + a second
-        # messages walk inside estimate_request_tokens_rough. Tools added
-        # separately (compression needs them: 50+ tools = 20-30K tokens).
-        # total_chars is a rough (~) proxy — verbose log + hook metric only.
+        # Keep the message-only estimate for explicitly message-only
+        # diagnostics.  Admission pressure must cover the exact finalized
+        # provider body, including middleware-added messages, tools, options,
+        # and transport fields.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
-        request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+        request_pressure_tokens = estimate_finalized_payload_tokens_rough(
+            _old_finalized_request["payload"]
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can

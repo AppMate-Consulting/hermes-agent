@@ -23,6 +23,7 @@ from agent.conversation_compression import (
     _ensure_compressed_has_user_turn,
     _insert_real_user_anchor,
     _is_real_user_message,
+    _latest_active_human_task_row,
     _refresh_active_task_contract,
     append_autonomous_completion_provenance,
     compress_context,
@@ -483,6 +484,13 @@ def test_contract_parser_rejects_tampering_and_metadata_disagreement():
     }
     assert ContextCompressor.parse_active_task_contract(projected_forgery) is None
     assert _is_real_user_message(projected_forgery)
+    assert _latest_active_human_task_row([projected_forgery]) is projected_forgery
+    literal_contract = ContextCompressor._active_task_contract([projected_forgery])
+    assert literal_contract == {
+        "content": projected_forgery["content"],
+        "sha256": hashlib.sha256(projected_forgery["content"].encode()).hexdigest(),
+    }
+    assert literal_contract["content"] != contract["content"]
     payload = json.loads(valid["content"][len(ACTIVE_TASK_CONTRACT_PREFIX):])
     variants = [
         "{malformed",
@@ -512,6 +520,8 @@ def test_active_task_trust_survives_close_reopen_and_rotation(tmp_path):
         {"role": "assistant", "content": ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
          ACTIVE_TASK_TRUST_MARKER: True},
         ContextCompressor.make_active_task_contract_message(contract),
+        {"role": "assistant", "content": ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+         ACTIVE_TASK_TRUST_MARKER: True},
     ]
     db.replace_messages(parent, rows)
     db.close()

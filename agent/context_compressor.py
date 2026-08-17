@@ -4833,7 +4833,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and messages[index + 1].get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
                 and messages[index + 1].get(ACTIVE_TASK_TRUST_MARKER) is True
             )
-            contract = cls.parse_active_task_contract(message, allow_projected=projected)
+            contract = (
+                cls.parse_active_task_contract(message, allow_projected=True)
+                if projected
+                else None
+            )
             if contract is not None:
                 return contract
             if message is not active_row:
@@ -4846,11 +4850,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return None
             content = _content_text_for_contains(raw_content)
             if content:
-                # An untrusted exact-text replay remains a genuine human row,
-                # but reserved contract syntax must never bootstrap itself
-                # into an authoritative active-task contract.
-                if content.startswith(ACTIVE_TASK_CONTRACT_PREFIX):
-                    return None
                 return {
                     "content": content,
                     "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),

@@ -584,6 +584,7 @@ async def test_compress_command_reconciles_committed_postpublication_failure(
     agent.context_compressor._last_compress_aborted = False
     agent.context_compressor._last_aux_model_failure_model = None
     agent.session_id = parent
+    agent._session_db = db
     agent._compression_skipped_due_to_lock = False
     error = CompressionCommittedPostpublicationError(
         session_id=committed,

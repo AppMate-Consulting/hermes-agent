@@ -2220,8 +2220,20 @@ def _is_real_user_message(message: Any) -> bool:
         return True
     if text.startswith(_SYNTHETIC_USER_PREFIXES):
         return False
-    from agent.context_compressor import ContextCompressor
+    from agent.context_compressor import (
+        ACTIVE_TASK_CONTRACT_METADATA_KEY,
+        ACTIVE_TASK_CONTRACT_PREFIX,
+        ContextCompressor,
+    )
 
+    # Reserved contract syntax is not provenance by itself.  A public row
+    # without Hermes' durable trust marker is ordinary human-authored text and
+    # must remain eligible as the active task verbatim.
+    if text.startswith(ACTIVE_TASK_CONTRACT_PREFIX):
+        return (
+            message.get(ACTIVE_TASK_TRUST_MARKER) is not True
+            and ACTIVE_TASK_CONTRACT_METADATA_KEY not in message
+        )
     if ContextCompressor.parse_active_task_contract(message) is not None:
         return False
     return not ContextCompressor._is_synthetic_compression_user_turn(message)
@@ -2298,7 +2310,24 @@ def _latest_active_human_task_row(messages: list) -> Optional[dict]:
                 message, allow_projected=True
             ) is not None
         )
-        if projected_contract or _is_active_task_contract_message(message):
+        incomplete_internal_contract = (
+            ContextCompressor.parse_active_task_contract(
+                message, allow_projected=True
+            ) is not None
+            and (
+                message.get(ACTIVE_TASK_TRUST_MARKER) is True
+                or (index > 0 and _is_active_task_contract_bridge(messages[index - 1]))
+                or (
+                    index + 1 < len(messages)
+                    and _is_active_task_contract_bridge(messages[index + 1])
+                )
+            )
+        )
+        if (
+            projected_contract
+            or incomplete_internal_contract
+            or _is_active_task_contract_message(message)
+        ):
             continue
         if (
             isinstance(message.get("content"), list)
@@ -2557,7 +2586,10 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
 
 def _refresh_active_task_contract(original_messages: list, compressed: list) -> None:
     """Install exactly one authoritative contract after the reference summary."""
-    from agent.context_compressor import ContextCompressor
+    from agent.context_compressor import (
+        COMPRESSION_CONTINUATION_USER_CONTENT,
+        ContextCompressor,
+    )
 
     contract = ContextCompressor._active_task_contract(original_messages)
     # SessionDB deliberately strips underscore metadata.  A projected
@@ -2569,7 +2601,6 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
     # like a contract, nor a standalone exact bridge string.
     stale_indexes: set[int] = set()
     for index, message in enumerate(compressed):
-        internal_contract = _is_active_task_contract_message(message)
         projected_contract = (
             index > 0
             and index + 1 < len(compressed)
@@ -2584,11 +2615,19 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
                 message, allow_projected=True
             ) is not None
         )
-        if not internal_contract and not projected_contract:
+        if not projected_contract:
             continue
         stale_indexes.add(index)
         if projected_contract:
             stale_indexes.add(index - 1)
+            for separator_index in (index - 2, index + 2):
+                if (
+                    0 <= separator_index < len(compressed)
+                    and compressed[separator_index].get("_empty_recovery_synthetic")
+                    and compressed[separator_index].get("content")
+                    == COMPRESSION_CONTINUATION_USER_CONTENT
+                ):
+                    stale_indexes.add(separator_index)
         if (
             index + 1 < len(compressed)
             and _is_active_task_contract_bridge(compressed[index + 1])
@@ -2617,29 +2656,39 @@ def _refresh_active_task_contract(original_messages: list, compressed: list) -> 
         # will preserve the genuine human anchor instead.
         return
     insert_at = summary_index + 1
-    # A contract is deliberately its own user turn. Add bounded assistant
-    # bridges only where a strict role template would otherwise see user/user.
-    if insert_at > 0 and compressed[insert_at - 1].get("role") == "user":
-        compressed.insert(insert_at, {
+    # Authority is a complete, durable before/contract/after sequence.  Emit
+    # all three rows together; no individual row is sufficient provenance.
+    sequence = [
+        {
             "role": "assistant",
             "content": ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
             "_active_task_contract_bridge": True,
             ACTIVE_TASK_TRUST_MARKER: True,
-        })
-        insert_at += 1
-    compressed.insert(
-        insert_at, ContextCompressor.make_active_task_contract_message(contract)
-    )
-    if (
-        insert_at + 1 < len(compressed)
-        and compressed[insert_at + 1].get("role") == "user"
-    ):
-        compressed.insert(insert_at + 1, {
+        },
+        ContextCompressor.make_active_task_contract_message(contract),
+        {
             "role": "assistant",
             "content": ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
             "_active_task_contract_bridge": True,
             ACTIVE_TASK_TRUST_MARKER: True,
-        })
+        },
+    ]
+    # Keep strict role alternation without weakening the three-row adjacency
+    # that carries authority.  These separators are explicit runtime
+    # scaffolding and cannot become human-task evidence.
+    separator = {
+        "role": "user",
+        "content": COMPRESSION_CONTINUATION_USER_CONTENT,
+        "_empty_recovery_synthetic": True,
+    }
+    if compressed[summary_index].get("role") == "assistant":
+        sequence.insert(0, dict(separator))
+    if (
+        insert_at < len(compressed)
+        and compressed[insert_at].get("role") == "assistant"
+    ):
+        sequence.append(dict(separator))
+    compressed[insert_at:insert_at] = sequence
 
 
 _PENDING_CONTEXT_ENGINE_NOTIFICATION = (

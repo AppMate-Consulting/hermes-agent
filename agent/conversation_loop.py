@@ -2383,14 +2383,15 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
-        _admitted_request = None
+        _handoff_request = None
+        _handoff_admitted = False
         # MoA guidance is the sole live-only dynamic transform. Produce it
         # before canonical projection, then pass the resulting text into the
         # current-turn composition below; compression never replays advisors.
         api_messages = []
         _moa_context = None
 
-        if moa_config and _admitted_request is None:
+        if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
@@ -2456,10 +2457,7 @@ def run_conversation(
             if callable(_selector_preview_snapshotter) else None
         )
         _provider_request = (
-            {"messages": copy.deepcopy(_admitted_request["messages"]),
-             "tools": copy.deepcopy(_admitted_request["tools"])}
-            if _admitted_request is not None
-            else _project_provider_request(
+            _project_provider_request(
                 agent,
                 messages,
                 system_prompt=effective_system,
@@ -2485,11 +2483,8 @@ def run_conversation(
         # Preparing here makes the pre-API guard measure the exact prompt the
         # aggregator will receive; ``create()`` consumes this private prepared
         # request later without running the advisors a second time.
-        _moa_prepared_request = (
-            _admitted_request.get("moa_prepared_request")
-            if _admitted_request is not None else None
-        )
-        if agent.provider == "moa" and _admitted_request is None:
+        _moa_prepared_request = None
+        if agent.provider == "moa":
             _moa_completions = getattr(getattr(agent.client, "chat", None), "completions", None)
             if pending_moa_prepared_request is not None:
                 _rebase_moa_request = getattr(_moa_completions, "rebase_prepared_request", None)
@@ -2567,10 +2562,11 @@ def run_conversation(
                 )
         else:
             _request_middleware_preview_post = None
-        # Unless compression replaces it with an admitted candidate, this
-        # exact object owns dispatch (including retry) and middleware is never
-        # replayed.
-        _admitted_request = _old_finalized_request
+        # This exact object owns the first dispatch without replaying request
+        # middleware.  It is only an ordinary finalized handoff: compression
+        # may replace it with an admitted immutable candidate below.
+        _handoff_request = _old_finalized_request
+        _handoff_admitted = False
 
         # Keep the message-only estimate for explicitly message-only
         # diagnostics.  Admission pressure must cover the exact finalized
@@ -2730,7 +2726,10 @@ def run_conversation(
             # reanchor_current_turn_user_idx deliberately chooses the last
             # structurally equal human row, which is the active turn when old
             # and current structured contents are equal.
-            _admission_handoff = {}
+            _admission_handoff = {
+                "request": _old_finalized_request,
+                "admitted": False,
+            }
             messages, active_system_prompt = agent._compress_context(
                 messages,
                 system_message,
@@ -2768,7 +2767,8 @@ def run_conversation(
                         "middleware_context": _live_middleware_context,
                 },
             )
-            _admitted_request = _admission_handoff.pop("request", None)
+            _handoff_request = _admission_handoff.pop("request", None)
+            _handoff_admitted = bool(_admission_handoff.pop("admitted", False))
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
                 # compression lock, so this pass no-oped. That is a temporary
@@ -2820,7 +2820,7 @@ def run_conversation(
                     agent._api_call_count = api_call_count
                     agent.iteration_budget.refund()
                     break
-                if _admitted_request is None:
+                if _handoff_request is None:
                     # A no-op/failed publication has no exact request to own.
                     # Rebuild on a fresh iteration; never dispatch the
                     # speculative pre-compression projection below.
@@ -2828,12 +2828,13 @@ def run_conversation(
                     agent._api_call_count = api_call_count
                     agent.iteration_budget.refund()
                     continue
-                # Successful admission owns this SAME dispatch.  Refresh only
-                # diagnostics; provider kwargs below come verbatim from the
-                # frozen admitted object and run no selector/advisor/middleware.
-                api_messages = _admitted_request["messages"]
-                tools_for_api = _admitted_request["tools"]
-                _moa_prepared_request = _admitted_request.get(
+                # The explicit handoff owns this SAME dispatch.  A committed
+                # candidate is admitted/immutable; an abort retains the exact
+                # ordinary old finalized object in compatibility mode.  In
+                # either case request middleware must not run again here.
+                api_messages = _handoff_request["messages"]
+                tools_for_api = _handoff_request["tools"]
+                _moa_prepared_request = _handoff_request.get(
                     "moa_prepared_request"
                 )
                 approx_tokens = estimate_messages_tokens_rough(api_messages)
@@ -2971,11 +2972,15 @@ def run_conversation(
                     agent.provider, agent.model, agent.base_url, agent.api_mode,
                     _sanitize_model,
                 )
-                _using_admitted_request = _admitted_request is not None
-                if _using_admitted_request:
-                    _finalized_request = _admitted_request
-                    _admitted_retry_request = _admitted_request
-                    _admitted_retry_semantics = _request_semantics
+                _using_handoff_request = _handoff_request is not None
+                _using_admitted_request = (
+                    _using_handoff_request and _handoff_admitted
+                )
+                if _using_handoff_request:
+                    _finalized_request = _handoff_request
+                    if _using_admitted_request:
+                        _admitted_retry_request = _handoff_request
+                        _admitted_retry_semantics = _request_semantics
                 elif (
                     _admitted_retry_request is not None
                     and _admitted_retry_semantics == _request_semantics
@@ -3024,12 +3029,13 @@ def run_conversation(
                 # Move the one-shot handoff into the retry transaction before
                 # dispatch. It remains reusable only under the semantics gate
                 # above and cannot survive this provider-attempt loop.
-                _admitted_request = None
+                _handoff_request = None
+                _handoff_admitted = False
                 _immutable_admitted_payload = (
                     _admitted_retry_request is not None
                     and _finalized_request is _admitted_retry_request
                 )
-                if _using_admitted_request and _finalized_request.get(
+                if _using_handoff_request and _finalized_request.get(
                     "_consumes_user_initiator"
                 ):
                     agent._is_user_initiated_turn = False

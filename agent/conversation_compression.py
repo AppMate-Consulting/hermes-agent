@@ -3009,6 +3009,7 @@ def compress_context(
             and _old_finalized_handoff is not None
         ):
             _old_handoff_target["request"] = _old_finalized_handoff
+            _old_handoff_target["admitted"] = False
         if _caller_messages != _caller_rollback_snapshot:
             _caller_messages[:] = copy.deepcopy(_caller_rollback_snapshot)
         # Adoption rebinds the working transcript.  Abort paths must return
@@ -4978,6 +4979,7 @@ def compress_context(
         _admission_handoff = _live.get("admission_handoff")
         if isinstance(_admission_handoff, dict):
             _admission_handoff["request"] = _admitted_finalized_request
+            _admission_handoff["admitted"] = True
 
         # These extension callbacks are deliberately post-persistence AND
         # post-lease. Schedule their semantically ordered chain exactly once;

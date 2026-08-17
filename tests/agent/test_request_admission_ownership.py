@@ -126,6 +126,7 @@ def _run(
     middleware_transform=None,
     finalized_estimator=None,
     conversation_history=None,
+    ownership_handoffs=None,
 ):
     boundary_events = boundary_events if boundary_events is not None else []
     response_iter = iter(responses)
@@ -150,7 +151,16 @@ def _run(
         result = real_compress_context(*args, **kwargs)
         handoff = kwargs["live_request_context"]["admission_handoff"]
         request = handoff.get("request")
-        if request is not None and not admitted:
+        if ownership_handoffs is not None:
+            ownership_handoffs.append({
+                "request": request,
+                "admitted": handoff.get("admitted"),
+            })
+        if (
+            request is not None
+            and handoff.get("admitted") is True
+            and not admitted
+        ):
             admitted.append(request)
             admitted_snapshots.append(copy.deepcopy(request))
         return result
@@ -228,11 +238,13 @@ def test_real_compression_admission_dispatches_exact_finalized_payload():
     agent, compressor = _agent()
     admitted, admitted_snapshots, middleware_calls = [], [], []
     events = []
+    ownership = []
 
     result = _run(
         agent, [_response()], admitted=admitted,
         admitted_snapshots=admitted_snapshots,
         middleware_calls=middleware_calls, boundary_events=events,
+        ownership_handoffs=ownership,
     )
 
     assert result["completed"] is True
@@ -242,6 +254,7 @@ def test_real_compression_admission_dispatches_exact_finalized_payload():
     # depending on obsolete context-free projection totals.
     assert compressor.select_context.call_count == 2
     assert len(admitted) == 1
+    assert ownership == [{"request": admitted[0], "admitted": True}]
     dispatch_index = next(i for i, event in enumerate(events) if event[0] == "dispatch")
     admission_index = max(
         i for i, event in enumerate(events[:dispatch_index])
@@ -355,6 +368,111 @@ def test_no_compression_finalized_request_invokes_middleware_once():
     dispatch = agent.client.chat.completions.create.call_args.kwargs
     assert dispatch == middleware_calls[0][0]
     assert dispatch["provider_options"] == {"preview": "small"}
+
+
+def test_no_compression_execution_middleware_may_replace_finalized_old_request():
+    agent, compressor = _agent()
+    compressor.threshold_tokens = 1_000
+    compressor.should_compress.side_effect = lambda _tokens: False
+    observed = {}
+
+    def replace(request, next_call, **_context):
+        replacement = copy.deepcopy(request)
+        replacement["provider_options"] = {"execution": "replacement"}
+        observed["old"] = request
+        observed["replacement"] = replacement
+        return next_call(replacement)
+
+    admitted, snapshots, middleware_calls = [], [], []
+    result = _run(
+        agent,
+        [_response()],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        execution_callbacks=[replace],
+        finalized_estimator=lambda _payload: 50,
+    )
+
+    assert result["completed"] is True
+    assert compressor.compress.call_count == 0
+    assert len(middleware_calls) == 1
+    assert admitted == []
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatch["messages"] is observed["replacement"]["messages"]
+    assert dispatch["messages"] is not observed["old"]["messages"]
+    assert dispatch["provider_options"] == {"execution": "replacement"}
+
+
+def test_ordinary_old_retry_remains_non_admitted_and_refinalizes():
+    agent, compressor = _agent()
+    compressor.should_compress.side_effect = lambda _tokens: False
+    execution_requests = []
+
+    def replace(request, next_call, **_context):
+        execution_requests.append(request)
+        replacement = copy.deepcopy(request)
+        replacement["provider_options"] = {"attempt": len(execution_requests)}
+        return next_call(replacement)
+
+    admitted, snapshots, middleware_calls = [], [], []
+    result = _run(
+        agent,
+        [_response(invalid=True), _response()],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        execution_callbacks=[replace],
+    )
+
+    assert result["completed"] is True
+    assert admitted == []
+    assert len(middleware_calls) == 2
+    assert len(execution_requests) == 2
+    assert execution_requests[1] is not execution_requests[0]
+    calls = agent.client.chat.completions.create.call_args_list
+    assert calls[0].kwargs["provider_options"] == {"attempt": 1}
+    assert calls[1].kwargs["provider_options"] == {"attempt": 2}
+
+
+def test_rejected_compression_hands_off_old_as_mutable_without_middleware_replay():
+    agent, compressor = _agent()
+    ownership = []
+    observed = {}
+
+    def replace(request, next_call, **_context):
+        replacement = copy.deepcopy(request)
+        replacement["provider_options"] = {"rejected": "replacement"}
+        observed["old"] = request
+        observed["replacement"] = replacement
+        return next_call(replacement)
+
+    admitted, snapshots, middleware_calls = [], [], []
+    result = _run(
+        agent,
+        [_response()],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        execution_callbacks=[replace],
+        # Equal old/candidate pressure rejects the candidate for no reclaim.
+        finalized_estimator=lambda _payload: 100_000,
+        ownership_handoffs=ownership,
+    )
+
+    assert result["completed"] is True
+    assert compressor.compress.call_count == 1
+    assert len(ownership) == 1
+    assert ownership[0]["admitted"] is False
+    assert ownership[0]["request"]["payload"] is observed["old"]
+    assert admitted == []
+    # One old transition and one speculative candidate transition; dispatch
+    # consumes the exact restored old object without a third request callback.
+    assert len(middleware_calls) == 2
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatch["messages"] is observed["replacement"]["messages"]
+    assert dispatch["messages"] is not observed["old"]["messages"]
+    assert dispatch["provider_options"] == {"rejected": "replacement"}
 
 
 def test_same_provider_retry_reuses_admitted_bytes_verbatim():
@@ -605,3 +723,33 @@ def test_tool_iteration_cannot_consume_stale_admission():
         > agent.context_compressor.compression_checks[1]
     )
     assert "_admitted_provider_request" not in vars(agent)
+
+
+def test_tool_iteration_cannot_consume_stale_prepared_old_handoff():
+    agent, compressor = _agent()
+    compressor.should_compress.side_effect = lambda _tokens: False
+    execution_requests = []
+
+    def observe(request, next_call, **_context):
+        execution_requests.append(request)
+        return next_call()
+
+    admitted, snapshots, middleware_calls = [], [], []
+    result = _run(
+        agent,
+        [_response(tool=True), _response()],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        execution_callbacks=[observe],
+    )
+
+    assert result["completed"] is True
+    assert admitted == []
+    assert len(execution_requests) == 2
+    first, second = execution_requests
+    assert second is not first
+    assert second["messages"] is not first["messages"]
+    assert second["tools"] is not first["tools"]
+    assert second["messages"][-1]["role"] == "tool"
+    assert len(middleware_calls) == 2

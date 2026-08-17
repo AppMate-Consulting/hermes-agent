@@ -453,19 +453,18 @@ def _run_execution_chain(
                     "next_call() more than once; downstream execution is single-use"
                 )
             assert_admitted_unchanged(callback)
-            if immutable_payload and next_payload is not None:
-                try:
-                    replacement_changed = next_payload != admitted_snapshot
-                except Exception:
-                    replacement_changed = True
-                if replacement_changed:
-                    restore_admitted_graph()
-                    raise ImmutableRequestMiddlewareError(
-                        f"Middleware '{kind}' callback "
-                        f"{getattr(callback, '__name__', repr(callback))} tried "
-                        "to replace the immutable admitted request; provider "
-                        "dispatch was refused"
-                    )
+            if (
+                immutable_payload
+                and next_payload is not None
+                and next_payload is not admitted_payload
+            ):
+                restore_admitted_graph()
+                raise ImmutableRequestMiddlewareError(
+                    f"Middleware '{kind}' callback "
+                    f"{getattr(callback, '__name__', repr(callback))} tried "
+                    "to replace the immutable admitted request; provider "
+                    "dispatch was refused"
+                )
             next_called = True
             try:
                 next_result = call_at(

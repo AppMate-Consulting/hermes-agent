@@ -635,30 +635,49 @@ def test_admitted_execution_wrapper_observes_exact_object_and_wraps_call():
     assert dispatch["tools"] is observed[0]["tools"]
 
 
-def test_admitted_retry_wrapper_cannot_statefully_replace_payload():
+def test_admitted_execution_rejects_deep_equal_replacement_before_dispatch():
     agent, _ = _agent()
     admitted, snapshots, middleware_calls = [], [], []
     attempts = []
 
     def stateful_wrapper(request, next_call, **_context):
         attempts.append(request)
-        # Semantically equal replacements are ignored: every terminal call
-        # must still receive the exact admitted object and nested objects.
         return next_call(copy.deepcopy(request))
 
     result = _run(
-        agent, [_response(invalid=True), _response()], admitted=admitted,
+        agent, [_response()], admitted=admitted,
         admitted_snapshots=snapshots, middleware_calls=middleware_calls,
         execution_callbacks=[stateful_wrapper],
     )
 
+    assert result["failed"] is True
+    assert "replace the immutable admitted request" in result["error"]
+    assert attempts == [admitted[0]["payload"]]
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_admitted_execution_accepts_exact_admitted_object():
+    agent, _ = _agent()
+    admitted, snapshots, middleware_calls = [], [], []
+    observed = []
+
+    def wrapper(request, next_call, **_context):
+        observed.append(request)
+        return next_call(request)
+
+    result = _run(
+        agent, [_response()], admitted=admitted,
+        admitted_snapshots=snapshots, middleware_calls=middleware_calls,
+        execution_callbacks=[wrapper],
+    )
+
     assert result["completed"] is True
-    assert attempts == [admitted[0]["payload"], admitted[0]["payload"]]
-    assert attempts[0] is attempts[1]
-    calls = agent.client.chat.completions.create.call_args_list
-    assert len(calls) == 2
-    assert calls[0].kwargs["messages"] is calls[1].kwargs["messages"]
-    assert calls[0].kwargs["tools"] is calls[1].kwargs["tools"]
+    assert observed == [admitted[0]["payload"]]
+    assert observed[0] is admitted[0]["payload"]
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatch is not observed[0]
+    assert dispatch["messages"] is observed[0]["messages"]
+    assert dispatch["tools"] is observed[0]["tools"]
 
 
 def test_admitted_retry_refuses_statefully_changed_second_payload():

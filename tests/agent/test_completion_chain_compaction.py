@@ -250,7 +250,10 @@ def test_durable_completion_provenance_is_independent_of_presentation_kind(
 ):
     db = SessionDB(db_path=tmp_path / "provenance.db")
     db.create_session("sid", "tui")
-    messages = []
+    messages = [
+        {"role": "user", "content": "real human task"},
+        {"role": "assistant", "content": "task started"},
+    ]
     append_autonomous_completion_provenance(messages)
     messages.append({
         "role": "user",
@@ -316,6 +319,9 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
             display_kind=message.get("display_kind"),
+            autonomous_completion_provenance=(
+                message.get("_autonomous_completion_bridge") is True
+            ),
         )
     projected = db.get_messages_as_conversation(sid)[0]
     assert json.dumps(
@@ -338,6 +344,9 @@ def test_multipart_human_task_survives_two_durable_compaction_cycles(tmp_path):
                     tool_calls=message.get("tool_calls"),
                     tool_call_id=message.get("tool_call_id"),
                     display_kind=message.get("display_kind"),
+                    autonomous_completion_provenance=(
+                        message.get("_autonomous_completion_bridge") is True
+                    ),
                 )
             resumed = db.get_messages_as_conversation(sid)
         cycle_agent = _agent(db, sid)

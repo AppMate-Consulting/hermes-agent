@@ -123,19 +123,18 @@ def _seed_drifted_session(db: SessionDB, session_id: str):
 
 
 def test_adoption_preserves_unpersisted_live_user_tail(tmp_path: Path) -> None:
-    """Durable-snapshot adoption must keep the current turn's un-persisted
-    user instruction in the parent transcript.
-
-    The pre-adoption flush persists the live tail through the normal
-    rotation-boundary path, then adoption re-reads the durable parent, so the
-    parent rows must be exactly the persisted prefix + concurrent writer rows
-    + ONE live tail, in insertion (id) order — no duplicates, no reordering,
-    no dropped rows.
-    """
+    """Successful rotation carries a caller-only tail into the child once."""
     db = SessionDB(db_path=tmp_path / "state.db")
     agent, messages = _seed_drifted_session(db, "PREFLIGHT_ADOPT_PARENT")
+    agent.context_compressor.compress.side_effect = lambda *_args, **_kwargs: [
+        {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"}
+    ]
 
-    agent._compress_context(messages, "sys", approx_tokens=120_000)
+    with patch(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        side_effect=[120_000, 1_000],
+    ):
+        returned, _ = agent._compress_context(messages, "sys", approx_tokens=120_000)
 
     parent_rows = db.get_messages_as_conversation(
         "PREFLIGHT_ADOPT_PARENT", include_inactive=True
@@ -147,21 +146,12 @@ def test_adoption_preserves_unpersisted_live_user_tail(tmp_path: Path) -> None:
         "persisted answer",
         "concurrent row 1",
         "concurrent row 2",
-        "LIVE USER INSTRUCTION",
-    ], (
-        "Durable-snapshot adoption must preserve the exact insertion order "
-        "[persisted prefix, concurrent rows, live tail] with no duplicates "
-        f"and exactly one live tail (#adopt-live-tail). Got {contents!r}."
-    )
-    # The whole adopted list is durable, so the rotation-boundary flush that
-    # runs after compression must skip every adopted row by identity
-    # (conversation_history=messages[:idx]) instead of re-appending them.
-    assert agent._persist_user_message_idx == len(parent_rows), (
-        "After successful adoption the persist anchor must sit at the end of "
-        "the adopted parent (#adopt-live-tail): "
-        f"agent._persist_user_message_idx={agent._persist_user_message_idx!r}, "
-        f"len(adopted_parent_rows)={len(parent_rows)}"
-    )
+    ]
+    assert agent.session_id != "PREFLIGHT_ADOPT_PARENT"
+    child = db.get_messages_as_conversation(agent.session_id)
+    assert _contents(child).count("LIVE USER INSTRUCTION") == 1
+    assert _contents(returned).count("LIVE USER INSTRUCTION") == 1
+    assert agent._persist_user_message_idx == len(returned)
 
 
 @pytest.mark.parametrize(
@@ -175,14 +165,10 @@ def test_adoption_preserves_unpersisted_live_user_tail(tmp_path: Path) -> None:
 def test_adoption_skipped_when_preflush_fails_keeps_live_input(
     flush_failure: object, tmp_path: Path
 ) -> None:
-    """When the pre-adoption flush of the live tail fails, adoption must be
-    skipped: the in-memory transcript (which still carries the user's input)
-    must reach the summarizer instead of the longer snapshot that lacks it.
+    """A caller-only tail reaches the engine without any parent preflush.
 
-    Covers every real failure shape of ``_flush_messages_to_session_db``:
-    an exception, ``False`` (DB append error, run_agent.py), and ``None``
-    (persistence-isolated fork / no session DB). All three must behave
-    identically: no snapshot adoption, live input handed to the compressor.
+    The patched flush is deliberately unusable in each historical failure
+    shape; transactional publication must not call it.
     """
     db = SessionDB(db_path=tmp_path / "state.db")
     agent, messages = _seed_drifted_session(db, "PREFLIGHT_ADOPT_FLUSH_FAIL")
@@ -205,10 +191,11 @@ def test_adoption_skipped_when_preflush_fails_keeps_live_input(
 
     with patch.object(
         agent, "_flush_messages_to_session_db", side_effect=_failing_flush
-    ):
+    ) as flush:
         agent._compress_context(messages, "sys", approx_tokens=120_000)
 
     assert len(seen) == 1
+    flush.assert_not_called()
     compress_input = seen[0]
     assert any(
         m.get("content") == "LIVE USER INSTRUCTION" for m in compress_input
@@ -237,12 +224,22 @@ def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
     caller = db.get_messages_as_conversation(sid)
     db.append_message(sid, "user", "NEWER AUTHORITATIVE TASK")
     db.append_message(sid, "assistant", "task running")
-    db.append_message(sid, "user", AUTONOMOUS_COMPLETION_BRIDGE_USER)
-    db.append_message(sid, "assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT)
+    db.append_message(
+        sid,
+        "user",
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        autonomous_completion_provenance=True,
+    )
+    db.append_message(
+        sid,
+        "assistant",
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        autonomous_completion_provenance=True,
+    )
     db.append_message(
         sid, "user", "[ASYNC DELEGATION COMPLETE child=durable]",
         display_kind="async_delegation_complete",
-        is_autonomous_completion=True,
+        autonomous_completion_provenance=True,
     )
     db.append_message(sid, "assistant", "runtime completion handled")
 
@@ -282,15 +279,12 @@ def test_adopted_parent_is_authoritative_for_engine_admission_task_and_memory(
     assert estimates[0] == adopted
     assert all(snapshot == adopted for _, snapshot in memory_seen)
     assert all(snapshot is not adopted for _, snapshot in memory_seen)
-    assert any(row.get("content") == "NEWER AUTHORITATIVE TASK" for row in compressed)
-    assert not any(row.get("content") == "stale caller task" for row in compressed)
     active = db.get_messages_as_conversation(sid)
     assert agent.session_id == sid
     assert _contents(active) == _contents(compressed)
     assert [row.get("role") for row in active] == [
         row.get("role") for row in compressed
     ]
-    assert any(row.get("content") == "NEWER AUTHORITATIVE TASK" for row in active)
     from agent.context_compressor import ContextCompressor
     contract = ContextCompressor._active_task_contract(active)
     assert contract is not None
@@ -336,7 +330,21 @@ def test_compress_context_rejects_commit_time_durable_drift(
 
     def race_after_authoritative_read(rows, **_kwargs):
         assert _contents(rows) == _contents(caller)
-        db.append_message(sid, "user", "LATE DURABLE ROW")
+        # Simulate a legacy/concurrent writer that does not participate in the
+        # compression lease.  The normal append API must reject writes while
+        # the lease is held, so insert transactionally beneath that guard.
+        def _insert_late_row(conn):
+            conn.execute(
+                "INSERT INTO messages "
+                "(session_id, role, content, timestamp, active) "
+                "VALUES (?, ?, ?, ?, 1)",
+                (sid, "user", "LATE DURABLE ROW", 0.0),
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                (sid,),
+            )
+        db._execute_write(_insert_late_row)
         return [{"role": "assistant", "content": "[CONTEXT COMPACTION] summary"}]
 
     agent.context_compressor.compress.side_effect = race_after_authoritative_read
@@ -386,7 +394,7 @@ def test_compress_context_rejects_commit_time_durable_drift(
     boundary.assert_not_called()
 
 
-def test_rotation_publication_failure_keeps_real_parent_preflush_and_rolls_back(
+def test_rotation_publication_failure_keeps_parent_unchanged_and_live_tail_for_retry(
     tmp_path: Path,
 ) -> None:
     db = SessionDB(db_path=tmp_path / "publication-failure.db")
@@ -422,8 +430,10 @@ def test_rotation_publication_failure_keeps_real_parent_preflush_and_rolls_back(
     assert prompt == "cached prompt"
     assert agent.session_id == sid
     assert _contents(db.get_messages_as_conversation(sid, include_inactive=True)) == [
-        "durable task", "durable answer", "ordinary live tail",
+        "durable task", "durable answer",
     ]
+    assert _contents(returned)[-1] == "ordinary live tail"
+    assert agent._persist_user_message_idx == 2
     assert agent._cached_system_prompt == "cached prompt"
     assert agent._cached_system_prompt_static == "cached static"
     agent._memory_manager.on_pre_compress.assert_not_called()

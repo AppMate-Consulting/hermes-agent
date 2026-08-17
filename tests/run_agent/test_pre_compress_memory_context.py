@@ -314,7 +314,8 @@ def test_stateful_in_place_boundary_orders_durable_publish_before_memory(
     request.addfinalizer(db.close)
     sid = "ordered-memory-boundary"
     db.create_session(sid, "cli", model="test/model")
-    db.append_message(sid, "user", "durable original")
+    for message in _messages():
+        db.append_message(sid, message["role"], message["content"])
     calls = []
     observer = _BoundaryObserver(calls)
     compressor = MagicMock()
@@ -327,7 +328,7 @@ def test_stateful_in_place_boundary_orders_durable_publish_before_memory(
     compressor.on_session_start.side_effect = lambda *_args, **kwargs: calls.append(
         ("boundary_callback", kwargs)
     )
-    original = _messages()
+    original = db.get_messages_as_conversation(sid)
     real_publish = db.archive_and_compact
 
     def publish(*args, **kwargs):
@@ -352,8 +353,8 @@ def test_stateful_in_place_boundary_orders_durable_publish_before_memory(
         "atomic_db_publication", "on_pre_compress", "commit_memory_session",
         "boundary_callback", "on_session_switch",
     ]
-    assert calls[1][1] == _messages()
-    assert calls[2][1] == _messages()
+    assert calls[1][1] == original
+    assert calls[2][1] == original
     assert len([item for item in calls if item[0] == "on_pre_compress"]) == 1
     assert len([item for item in calls if item[0] == "commit_memory_session"]) == 1
 

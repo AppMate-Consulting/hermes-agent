@@ -4003,6 +4003,10 @@ def compress_context(
                     agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)
+                    # The child transcript was published atomically in full.
+                    # Re-anchor current-turn persistence to that durable child,
+                    # not to the parent prefix captured before rotation.
+                    agent._persist_user_message_idx = len(compressed)
                     agent._flushed_db_message_session_id = agent.session_id
                     agent._flushed_db_message_ids = {
                         id(message)

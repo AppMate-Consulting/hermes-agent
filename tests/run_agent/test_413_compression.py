@@ -346,8 +346,14 @@ def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
         ("assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT, None),
         ("user", "[ASYNC DELEGATION COMPLETE child=real]", "internal_notification"),
     ]
-    for role, content, display_kind in rows:
-        db.append_message(sid, role, content, display_kind=display_kind)
+    for index, (role, content, display_kind) in enumerate(rows):
+        db.append_message(
+            sid,
+            role,
+            content,
+            display_kind=display_kind,
+            autonomous_completion_provenance=index in (4, 5, 6),
+        )
     db.append_message(
         sid,
         "assistant",

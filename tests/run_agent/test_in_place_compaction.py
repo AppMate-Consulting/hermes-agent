@@ -56,16 +56,8 @@ def _seed(db, sid, title, n=8):
         db.append_message(
             session_id=sid,
             role="user" if i % 2 == 0 else "assistant",
-            content=f"msg {i}",
+            content=f"m{i} " + ("payload " * 2_999) + "payload",
         )
-
-
-def _materially_compressible_messages(n=8):
-    """Input whose like-for-like estimate can reclaim the 4K token floor."""
-    return [
-        {"role": "user", "content": f"m{i} " + ("payload " * 3_000)}
-        for i in range(n)
-    ]
 
 
 class TestInPlaceCompaction:
@@ -110,7 +102,7 @@ class TestInPlaceCompaction:
             db.patch_session_model_config(sid, {"authority": "parent"})
             db.update_system_prompt(sid, "durable-parent-prompt")
             agent = _make_agent(db, sid, in_place=False)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             original = copy.deepcopy(messages)
             agent._cached_system_prompt = "cached-parent\x00"
             vars(agent).pop("_cached_system_prompt_static", None)
@@ -189,7 +181,8 @@ class TestInPlaceCompaction:
             ]
             all_rows = db.get_messages(sid, include_inactive=True)
             assert [m["content"] for m in all_rows if not m["active"]] == [
-                "msg 0", "msg 1"
+                "m0 " + ("payload " * 2_999) + "payload",
+                "m1 " + ("payload " * 2_999) + "payload",
             ]
             row = db.get_session(sid)
             model_config = json.loads(row["model_config"])
@@ -243,7 +236,7 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -270,7 +263,7 @@ class TestInPlaceCompaction:
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
-                messages[-1]["content"].strip(),
+                messages[-2]["content"],
             ]
             assert row["message_count"] == 3  # live (active) count
             # NON-DESTRUCTIVE: the 8 seeded originals survive at active=0
@@ -283,7 +276,7 @@ class TestInPlaceCompaction:
             # preserving UPDATE; the fts triggers don't key on active).
             hit = db._conn.execute(
                 "SELECT 1 FROM messages_fts f JOIN messages m ON m.id = f.rowid "
-                "WHERE m.session_id = ? AND messages_fts MATCH 'msg' AND m.active = 0 "
+                "WHERE m.session_id = ? AND messages_fts MATCH 'payload' AND m.active = 0 "
                 "LIMIT 1",
                 (sid,),
             ).fetchone()
@@ -307,7 +300,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -315,9 +308,8 @@ class TestInPlaceCompaction:
             assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
 
 
-    def test_rotation_still_preflushes(self):
-        """Rotation MUST pre-flush so current-turn messages survive in the
-        preserved old (parent) session before it is ended (#47202)."""
+    def test_rotation_does_not_preflush_after_candidate_generation(self):
+        """Rotation keeps publication fencing valid by not mutating its parent."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
@@ -330,10 +322,10 @@ class TestInPlaceCompaction:
                 "n", calls["n"] + 1
             )
             compress_context(
-                agent, _materially_compressible_messages(),
+                agent, db.get_messages_as_conversation("rot_flush"),
                 approx_tokens=100_000, system_message="sys",
             )
-            assert calls["n"] == 1
+            assert calls["n"] == 0
 
 
 class TestRotationFallbackWhenFlagOff:
@@ -351,7 +343,7 @@ class TestRotationFallbackWhenFlagOff:
             agent = _make_agent(db, sid, in_place=False)
             agent._last_flushed_db_idx = 5
 
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -375,7 +367,7 @@ class TestRotationFallbackWhenFlagOff:
             assert [m.get("content") for m in db.get_messages_as_conversation(agent.session_id)] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
-                messages[-1]["content"].strip(),
+                messages[-2]["content"],
             ]
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
@@ -395,7 +387,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, _materially_compressible_messages(),
+                a_ip, db.get_messages_as_conversation("s_ip"),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True
@@ -404,7 +396,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_rot", "rot")
             a_rot = _make_agent(db, "s_rot", in_place=False)
             compress_context(
-                a_rot, _materially_compressible_messages(),
+                a_rot, db.get_messages_as_conversation("s_rot"),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_rot._last_compaction_in_place is False
@@ -447,7 +439,7 @@ class TestInPlaceAntiGrowthGuard:
                 ]
 
             agent.context_compressor.compress = _growing_compress
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -459,7 +451,9 @@ class TestInPlaceAntiGrowthGuard:
             # Durable state is byte-for-byte the pre-compression live set:
             # nothing archived, nothing inserted.
             reloaded = db.get_messages_as_conversation(sid)
-            assert [m["content"] for m in reloaded] == [f"msg {i}" for i in range(8)]
+            assert [m["content"] for m in reloaded] == [
+                f"m{i} " + ("payload " * 2_999) + "payload" for i in range(8)
+            ]
             all_rows = db.get_messages(sid, include_inactive=True)
             assert len(all_rows) == 8
             assert not any(not m.get("active", 1) for m in all_rows)
@@ -477,7 +471,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = "20260619_request_estimator"
             _seed(db, sid, "request")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             before_rows = db.get_messages(sid, include_inactive=True)
 
             estimates = []
@@ -529,7 +523,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = f"policy_{outcome}"
             _seed(db, sid, "policy")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             before = [(r["id"], r["active"]) for r in db.get_messages(
                 sid, include_inactive=True
             )]
@@ -580,7 +574,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = f"compressor_no_progress_{rejection_cooldown_seconds}"
             _seed(db, sid, "no-progress")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             agent.context_compressor.compress = lambda current, **kwargs: current
             before = [(r["id"], r["active"]) for r in db.get_messages(
                 sid, include_inactive=True
@@ -623,7 +617,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = "uncached_prompt"
             _seed(db, sid, "prompt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             agent._cached_system_prompt = None
             agent._cached_system_prompt_static = None
             agent._build_system_prompt = MagicMock(return_value="EXACT BUILT PROMPT")
@@ -665,7 +659,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = f"mutating-{outcome}"
             _seed(db, sid, "mutating")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             original = copy.deepcopy(messages)
             cached, static = "old prompt\x00", "old static\U0001f680"
             agent._cached_system_prompt = cached
@@ -714,7 +708,7 @@ class TestInPlaceAntiGrowthGuard:
                     str(message.get("content", "")) for message in estimates[1]
                 )
                 assert "mutated candidate" in admitted_content
-                assert original[-1]["content"] in admitted_content
+                assert original[-2]["content"] in admitted_content
             assert returned is messages
             assert messages == original
             assert prompt == cached
@@ -737,7 +731,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = "uncached-noop"
             _seed(db, sid, "uncached")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             vars(agent).pop("_cached_system_prompt", None)
             vars(agent).pop("_cached_system_prompt_static", None)
             agent._build_system_prompt = MagicMock(return_value="logical built prompt")
@@ -774,7 +768,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = "candidate-preparation-rollback"
             _seed(db, sid, "candidate")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             original = copy.deepcopy(messages)
             vars(agent).pop("_cached_system_prompt", None)
             vars(agent).pop("_cached_system_prompt_static", None)
@@ -835,7 +829,7 @@ class TestInPlaceAntiGrowthGuard:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "in-place-publication-failure"
             _seed(db, sid, "failure")
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             original = copy.deepcopy(messages)
             agent = _make_agent(db, sid, in_place=True)
             vars(agent).pop("_cached_system_prompt", None)
@@ -894,7 +888,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = "cached_prompt_restore"
             _seed(db, sid, "prompt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             cached = "cached\x00prompt\U0001f642"
             static = "static\x00prefix\U0001f680"
             agent._cached_system_prompt = cached
@@ -921,7 +915,7 @@ class TestInPlaceAntiGrowthGuard:
             sid = "20260619_manual_reject"
             _seed(db, sid, "manual")
             agent = _make_agent(db, sid, in_place=True)
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             estimates = iter((100_000, 97_000))
             with patch(
                 "agent.conversation_compression.estimate_request_tokens_rough",
@@ -946,7 +940,7 @@ class TestInPlaceAntiGrowthGuard:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = _materially_compressible_messages()
+            messages = db.get_messages_as_conversation(sid)
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -957,7 +951,7 @@ class TestInPlaceAntiGrowthGuard:
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
-                messages[-1]["content"].strip(),
+                messages[-2]["content"],
             ]
 
 

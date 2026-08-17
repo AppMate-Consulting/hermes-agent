@@ -2625,27 +2625,20 @@ def run_conversation(
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
-            # Both objects are transaction-local capabilities.  The anchor
-            # identifies the exact current-turn row through compressor copies;
-            # the handoff can be filled only after successful publication and
-            # is consumed by this same dispatch (never agent state / next loop).
+            # The handoff is a transaction-local capability.  Current-turn
+            # identity stays out of band: private provenance must never be
+            # inserted into the transcript that the auxiliary compressor sees.
+            # reanchor_current_turn_user_idx deliberately chooses the last
+            # structurally equal human row, which is the active turn when old
+            # and current structured contents are equal.
             _admission_handoff = {}
-            _turn_anchor = f"{turn_id}:compression:{compression_attempts}:{api_call_count}"
-            _anchored_turn_row = (
-                messages[current_turn_user_idx]
-                if 0 <= current_turn_user_idx < len(messages) else None
-            )
-            if isinstance(_anchored_turn_row, dict):
-                _anchored_turn_row["_compression_turn_anchor"] = _turn_anchor
-            try:
-                messages, active_system_prompt = agent._compress_context(
-                    messages,
-                    system_message,
-                    approx_tokens=request_pressure_tokens,
-                    task_id=effective_task_id,
-                    live_request_context={
+            messages, active_system_prompt = agent._compress_context(
+                messages,
+                system_message,
+                approx_tokens=request_pressure_tokens,
+                task_id=effective_task_id,
+                live_request_context={
                         "admission_handoff": _admission_handoff,
-                        "current_turn_anchor": _turn_anchor,
                         "frozen_projection": _provider_request,
                         "current_turn_user_idx": current_turn_user_idx,
                         "current_turn_identity": copy.deepcopy(
@@ -2677,17 +2670,8 @@ def run_conversation(
                             "api_mode": agent.api_mode,
                             "api_call_count": api_call_count,
                         },
-                    },
-                )
-            finally:
-                # Rejection/cancellation paths return caller-owned rows.  The
-                # marker is private transaction provenance and must never
-                # survive into transcript persistence or a later iteration.
-                for _anchor_row in messages:
-                    if isinstance(_anchor_row, dict):
-                        _anchor_row.pop("_compression_turn_anchor", None)
-                if isinstance(_anchored_turn_row, dict):
-                    _anchored_turn_row.pop("_compression_turn_anchor", None)
+                },
+            )
             _admitted_request = _admission_handoff.pop("request", None)
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
@@ -2823,6 +2807,8 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        _admitted_retry_request = None
+        _admitted_retry_semantics = None
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -2885,38 +2871,63 @@ def run_conversation(
                 # echo-back pad for the *current* provider here (idempotent no-op
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
+                _request_semantics = (
+                    agent.provider, agent.model, agent.base_url, agent.api_mode,
+                    _sanitize_model,
+                )
                 _using_admitted_request = _admitted_request is not None
-                _finalized_request = (_admitted_request if _using_admitted_request else finalize_provider_request(
-                    agent,
-                    messages,
-                    system_message=effective_system,
-                    tools=agent.tools or [],
-                    current_turn_user_idx=current_turn_user_idx,
-                    external_prefetch=_ext_prefetch_cache,
-                    plugin_user_context=_plugin_user_context,
-                    incoming_message=_incoming,
-                    sanitize_model=_sanitize_model,
-                    current_turn_suffix=_moa_context,
-                    _frozen_projection=_provider_request,
-                    moa_prepared_request=_moa_prepared_request,
-                    middleware_context={
-                        "task_id": effective_task_id,
-                        "turn_id": turn_id,
-                        "api_request_id": api_request_id,
-                        "session_id": agent.session_id or "",
-                        "platform": agent.platform or "",
-                        "model": agent.model,
-                        "provider": agent.provider,
-                        "base_url": agent.base_url,
-                        "api_mode": agent.api_mode,
-                        "api_call_count": api_call_count,
-                    },
-                    consume_user_initiator=True,
-                ))
-                # Admission authorizes exactly one provider attempt.  Clear
-                # the local capability before any network call so an SDK
-                # retry, fallback, exception, or later tool iteration cannot
-                # consume it again against changed provider/transcript state.
+                if _using_admitted_request:
+                    _finalized_request = _admitted_request
+                    _admitted_retry_request = _admitted_request
+                    _admitted_retry_semantics = _request_semantics
+                elif (
+                    _admitted_retry_request is not None
+                    and _admitted_retry_semantics == _request_semantics
+                ):
+                    # A transport retry in this provider transaction must send
+                    # the exact bytes admission authorized.  This local is born
+                    # after compression and dies with this retry loop, so it
+                    # cannot cross a fallback rebuild, tool iteration, or turn.
+                    _finalized_request = _admitted_retry_request
+                elif _admitted_retry_request is not None:
+                    # Provider/request semantics changed after admission.  Do
+                    # not silently finalize and dispatch an unauthorised body
+                    # inside this transaction; restart the iteration so the
+                    # new provider projection receives its own pressure check
+                    # and, when required, a fresh compression admission.
+                    _retry.restart_with_rebuilt_messages = True
+                    break
+                else:
+                    _finalized_request = finalize_provider_request(
+                        agent,
+                        messages,
+                        system_message=effective_system,
+                        tools=agent.tools or [],
+                        current_turn_user_idx=current_turn_user_idx,
+                        external_prefetch=_ext_prefetch_cache,
+                        plugin_user_context=_plugin_user_context,
+                        incoming_message=_incoming,
+                        sanitize_model=_sanitize_model,
+                        current_turn_suffix=_moa_context,
+                        _frozen_projection=_provider_request,
+                        moa_prepared_request=_moa_prepared_request,
+                        middleware_context={
+                            "task_id": effective_task_id,
+                            "turn_id": turn_id,
+                            "api_request_id": api_request_id,
+                            "session_id": agent.session_id or "",
+                            "platform": agent.platform or "",
+                            "model": agent.model,
+                            "provider": agent.provider,
+                            "base_url": agent.base_url,
+                            "api_mode": agent.api_mode,
+                            "api_call_count": api_call_count,
+                        },
+                        consume_user_initiator=True,
+                    )
+                # Move the one-shot handoff into the retry transaction before
+                # dispatch. It remains reusable only under the semantics gate
+                # above and cannot survive this provider-attempt loop.
                 _admitted_request = None
                 if _using_admitted_request and _finalized_request.get(
                     "_consumes_user_initiator"

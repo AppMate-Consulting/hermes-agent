@@ -1,4 +1,4 @@
-"""Production-loop ownership regressions for compression request admission."""
+"""Production-boundary ownership regressions for compression admission."""
 
 from __future__ import annotations
 
@@ -7,18 +7,27 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from hermes_cli.middleware import RequestMiddlewareResult
 from run_agent import AIAgent
 
 
-def _response(*, tool=False):
-    call = None
+STRUCTURED = [
+    {"type": "text", "text": "duplicate human content"},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+]
+
+
+def _response(*, tool=False, invalid=False):
+    if invalid:
+        return SimpleNamespace(choices=[], model="test/model", usage=None)
+    calls = None
     if tool:
-        call = [SimpleNamespace(
+        calls = [SimpleNamespace(
             id="call-1", type="function",
             function=SimpleNamespace(name="web_search", arguments='{"query":"x"}'),
         )]
     message = SimpleNamespace(
-        content=None if tool else "done", tool_calls=call,
+        content=None if tool else "done", tool_calls=calls,
         reasoning_content=None, reasoning=None,
     )
     return SimpleNamespace(
@@ -55,58 +64,74 @@ def _agent():
     agent._cached_system_prompt = "system"
     agent._use_prompt_caching = False
     agent._disable_streaming = True
+    agent._api_max_retries = 3
     agent.tool_delay = 0
     agent.save_trajectories = False
     agent.compression_enabled = True
+
     compressor = MagicMock()
     compressor.threshold_tokens = 10
     compressor.context_length = 100
     compressor.should_defer_preflight_to_real_usage.return_value = False
     compressor.get_active_compression_failure_cooldown.return_value = None
-    compressor.should_compress.side_effect = [True, False, False]
+    compressor.should_compress.side_effect = [True, False, False, False]
     compressor.should_compress_info.return_value = (False, None)
     compressor.protect_first_n = 0
     compressor.protect_last_n = 0
+    compressor.compression_count = 0
+    compressor.last_prompt_tokens = 0
+    compressor.last_completion_tokens = 0
+    compressor._last_summary_error = None
+    compressor._last_compress_aborted = False
+    compressor._last_aux_model_failure_model = None
+    compressor._last_aux_model_failure_error = None
+    compressor.select_context.side_effect = lambda rows, **_kw: copy.deepcopy(rows)
+
+    def deterministic_summary(rows, **_kwargs):
+        # This is the sole mocked summary boundary.  The real
+        # compress_context transaction, finalizer, policy and publication run.
+        assert all("_compression_turn_anchor" not in row for row in rows)
+        return [
+            {"role": "assistant", "content": "compact summary"},
+            {"role": "user", "content": copy.deepcopy(STRUCTURED)},
+        ]
+
+    compressor.compress.side_effect = deterministic_summary
     agent.context_compressor = compressor
-    return agent
+    agent._compression_feasibility_checked = True
+    agent._invalidate_system_prompt = lambda: None
+    agent._build_system_prompt = lambda _message: "system"
+    return agent, compressor
 
 
-def _install_admitting_compressor(agent):
-    admitted = {}
-    calls = []
-
-    def compress(messages, system_message, *, live_request_context, **_kwargs):
-        calls.append(copy.deepcopy(live_request_context))
-        compacted = [dict(row) for row in messages]
-        for row in compacted:
-            row.pop("_compression_turn_anchor", None)
-        payload = {
-            "model": "test/model",
-            "messages": [{"role": "user", "content": "ADMITTED EXACT BYTES"}],
-            "tools": copy.deepcopy(agent.tools),
-        }
-        frozen = {
-            "payload": payload,
-            "original_payload": copy.deepcopy(payload),
-            "messages": copy.deepcopy(payload["messages"]),
-            "tools": copy.deepcopy(payload["tools"]),
-            "moa_prepared_request": None,
-            "middleware_trace": [],
-            "_consumes_user_initiator": False,
-        }
-        admitted.update(copy.deepcopy(frozen))
-        live_request_context["admission_handoff"]["request"] = frozen
-        return compacted, system_message
-
-    agent._compress_context = compress
-    return admitted, calls
-
-
-def _run(agent, responses):
+def _run(agent, responses, *, admitted, middleware_calls):
     agent.client.chat.completions.create.side_effect = responses
+
+    def middleware(payload, **context):
+        shaped = copy.deepcopy(payload)
+        shaped["extra_headers"] = {
+            **shaped.get("extra_headers", {}),
+            "x-proof-middleware": "applied",
+        }
+        middleware_calls.append((copy.deepcopy(shaped), copy.deepcopy(context)))
+        if "compact summary" in str(shaped):
+            admitted[:] = [copy.deepcopy(shaped)]
+        return RequestMiddlewareResult(
+            payload=shaped,
+            original_payload=copy.deepcopy(payload),
+            changed=True,
+            trace=[{"middleware": "proof"}],
+        )
+
     with (
         patch("agent.turn_context.estimate_request_tokens_rough", return_value=1),
         patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=50),
+        patch(
+            "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+            side_effect=lambda payload: 1_000 if "compact summary" in str(payload) else 100_000,
+        ),
+        patch("hermes_cli.middleware.apply_llm_request_middleware", side_effect=middleware),
+        patch("agent.conversation_loop.jittered_backoff", return_value=0),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -116,38 +141,63 @@ def _run(agent, responses):
         ),
     ):
         return agent.run_conversation(
-            "same structured content",
+            copy.deepcopy(STRUCTURED),
             conversation_history=[
-                {"role": "user", "content": "same structured content"},
-                {"role": "assistant", "content": "older answer"},
+                {"role": "user", "content": copy.deepcopy(STRUCTURED)},
+                {"role": "assistant", "content": "older answer " * 20_000},
             ],
         )
 
 
-def test_successful_admission_is_dispatched_verbatim_in_same_iteration():
-    agent = _agent()
-    admitted, compression_calls = _install_admitting_compressor(agent)
+def test_real_compression_admission_dispatches_exact_finalized_payload():
+    agent, compressor = _agent()
+    admitted, middleware_calls = [], []
 
-    result = _run(agent, [_response()])
+    result = _run(agent, [_response()], admitted=admitted, middleware_calls=middleware_calls)
 
     assert result["completed"] is True
-    assert len(compression_calls) == 1
-    assert agent.client.chat.completions.create.call_args.kwargs == admitted["payload"]
+    assert compressor.compress.call_count == 1
+    # Before/candidate plus deterministic replays: no construction occurs
+    # between the admitted candidate and its first provider dispatch.
+    assert compressor.select_context.call_count == 2
+    assert len(middleware_calls) == 4
+    assert len(admitted) == 1
+    assert agent.client.chat.completions.create.call_args.kwargs == admitted[0]
+    assert admitted[0]["extra_headers"]["x-proof-middleware"] == "applied"
+    assert sum("duplicate human content" in str(row) for row in admitted[0]["messages"]) == 1
+    assert all("_compression_turn_anchor" not in row for row in result["messages"])
     assert "_admitted_provider_request" not in vars(agent)
-    assert all(
-        "_compression_turn_anchor" not in row for row in result["messages"]
+
+
+def test_same_provider_retry_reuses_admitted_bytes_verbatim():
+    agent, _ = _agent()
+    admitted, middleware_calls = [], []
+
+    result = _run(
+        agent, [_response(invalid=True), _response()],
+        admitted=admitted, middleware_calls=middleware_calls,
     )
-
-
-def test_tool_iteration_cannot_consume_stale_admission():
-    agent = _agent()
-    admitted, _ = _install_admitting_compressor(agent)
-
-    result = _run(agent, [_response(tool=True), _response()])
 
     assert result["completed"] is True
     calls = agent.client.chat.completions.create.call_args_list
-    assert calls[0].kwargs == admitted["payload"]
-    assert calls[1].kwargs != admitted["payload"]
+    assert len(calls) == 2
+    assert calls[0].kwargs == calls[1].kwargs == admitted[0]
+    assert len(middleware_calls) == 4
+
+
+def test_tool_iteration_cannot_consume_stale_admission():
+    agent, _ = _agent()
+    admitted, middleware_calls = [], []
+
+    result = _run(
+        agent, [_response(tool=True), _response()],
+        admitted=admitted, middleware_calls=middleware_calls,
+    )
+
+    assert result["completed"] is True
+    calls = agent.client.chat.completions.create.call_args_list
+    assert calls[0].kwargs == admitted[0]
+    assert calls[1].kwargs != admitted[0]
     assert calls[1].kwargs["messages"][-1]["role"] == "tool"
+    assert len(middleware_calls) == 5
     assert "_admitted_provider_request" not in vars(agent)

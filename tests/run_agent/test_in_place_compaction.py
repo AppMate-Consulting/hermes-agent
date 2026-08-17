@@ -871,12 +871,17 @@ class TestInPlaceAntiGrowthGuard:
             estimates = []
             tools_before = copy.deepcopy(agent.tools)
 
-            def estimate(candidate, *, tools=None):
-                estimates.append((copy.deepcopy(candidate), copy.deepcopy(tools)))
+            def estimate(payload):
+                estimates.append(
+                    (
+                        copy.deepcopy(payload["messages"]),
+                        copy.deepcopy(payload.get("tools")),
+                    )
+                )
                 return 100_000 if len(estimates) == 1 else request_out
 
             with patch(
-                "agent.conversation_compression.estimate_request_tokens_rough",
+                "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
                 side_effect=estimate,
             ), patch.object(db, "archive_and_compact") as archive, patch.object(
                 db, "publish_compression_child"
@@ -1002,7 +1007,10 @@ class TestInPlaceAntiGrowthGuard:
             fence = CompressionCommitFence()
 
             def mutate(candidate, **_kwargs):
-                candidate[:] = [{"role": "user", "content": "candidate"}]
+                candidate[:] = [
+                    {"role": "user", "content": "candidate"},
+                    {"role": "assistant", "content": "candidate answer"},
+                ]
                 return candidate
 
             agent.context_compressor.compress = mutate

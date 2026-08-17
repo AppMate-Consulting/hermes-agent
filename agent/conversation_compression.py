@@ -3765,9 +3765,11 @@ def compress_context(
     _caller_publication_authoritative = False
     _host_claim_exception: Optional[BaseException] = None
 
-    def _publish_session_db(operation: Callable[[], None]) -> None:
+    def _publish_session_db(
+        operation: Callable[[], None], *, active_session_id: str
+    ) -> None:
         """Fence exactly one SessionDB publication and promptly free its lease."""
-        nonlocal _commit_fence_entered, _host_claim_exception
+        nonlocal compressed, _commit_fence_entered, _host_claim_exception
         # A host whose transcript has an independent in-memory generation may
         # claim that generation immediately before the durable transaction.
         # The claim returns an optional release callback so the host can hold
@@ -3793,6 +3795,40 @@ def compress_context(
                 if not _commit_fence_entered:
                     raise _CompressionPublicationCancelled()
             operation()
+            # The durable replay projection is authoritative.  Persisting a
+            # generated row can replace its speculative ``_row_id`` with the
+            # canonical generated timestamp, so adopting ``compressed`` here
+            # would leave caller/host bookkeeping divergent from SessionDB.
+            durable = agent._session_db.get_messages_as_conversation(
+                active_session_id
+            )
+            if (
+                not isinstance(durable, list)
+                or not durable
+                or len(durable) != len(compressed)
+            ):
+                raise RuntimeError(
+                    "Compression publication durable readback mismatched"
+                )
+            for speculative_row, durable_row in zip(compressed, durable):
+                if not isinstance(speculative_row, dict) or not isinstance(
+                    durable_row, dict
+                ):
+                    raise RuntimeError(
+                        "Compression publication durable readback mismatched"
+                    )
+                expected = {
+                    key: value for key, value in speculative_row.items()
+                    if key != "_row_id"
+                }
+                actual = copy.deepcopy(durable_row)
+                if "timestamp" not in expected:
+                    actual.pop("timestamp", None)
+                if actual != expected:
+                    raise RuntimeError(
+                        "Compression publication durable readback mismatched"
+                    )
+            compressed = copy.deepcopy(durable)
             _adopt_host_publication = getattr(
                 agent, "_adopt_compression_host_publication", None
             )
@@ -4264,7 +4300,8 @@ def compress_context(
                             },
                             system_prompt=new_system_prompt,
                             expected_active_identity=_expected_active_identity,
-                        )
+                        ),
+                        active_session_id=agent.session_id,
                     )
                     agent._compression_durable_commit_occurred = True
                     split_status = "in_place_committed"
@@ -4332,7 +4369,8 @@ def compress_context(
                             compression_lock_holder=_lock_holder,
                             require_compression_lease=_lock_holder is not None,
                             expected_active_identity=_expected_active_identity,
-                        )
+                        ),
+                        active_session_id=new_session_id,
                     )
                     agent._compression_durable_commit_occurred = True
                     agent.session_id = new_session_id

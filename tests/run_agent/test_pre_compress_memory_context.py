@@ -271,6 +271,7 @@ def test_complete_projection_matches_live_send_and_is_non_mutating(
     agent._use_prompt_caching = mode == "anthropic-native"
     agent._use_native_cache_layout = mode == "anthropic-native"
     agent._cache_ttl = "5m"
+    agent.context_length = 200_000
     agent._direct_native_anthropic_tool_cache_capability = (
         lambda: mode == "anthropic-native"
     )
@@ -768,7 +769,6 @@ def test_real_compressions_deferred_notification_is_claimed_and_fifo_frozen(
     def status_callback(_kind, _message):
         order.append("b-status")
 
-    agent.status_callback = status_callback
     monkeypatch.setattr(
         "agent.conversation_compression._POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.02
     )
@@ -783,6 +783,7 @@ def test_real_compressions_deferred_notification_is_claimed_and_fifo_frozen(
     )
     child_a = agent.session_id
     assert a_entered.is_set()
+    agent.status_callback = status_callback
 
     db.append_message(child_a, "assistant", "large B " * 20_000)
     db.append_message(child_a, "user", "latest B")
@@ -1489,8 +1490,8 @@ def test_materially_admitted_candidate_honors_precommit_fence_cancel(
 
     estimates = iter((CancelOnAdmission(100_000), 1_000))
     monkeypatch.setattr(
-        "agent.conversation_compression.estimate_request_tokens_rough",
-        lambda *_args, **_kwargs: next(estimates),
+        "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+        lambda _payload: next(estimates),
     )
 
     returned, _ = agent._compress_context(

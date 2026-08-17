@@ -105,6 +105,7 @@ def _agent(db: SessionDB, sid: str, *, in_place: bool, seen: list[list[dict]]):
     compressor._last_aux_model_failure_model = None
     compressor._last_aux_model_failure_error = None
     agent.context_compressor = compressor
+    agent._context_engine = None
     agent.compression_in_place = in_place
     agent._compression_feasibility_checked = True
     agent._cached_system_prompt = "stable proof prompt"
@@ -313,10 +314,24 @@ def test_durable_generation_mutation_after_suffix_snapshot_fails_cas(durable_cas
     with patch(
         "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
         side_effect=[100_000, 1_000],
-    ), pytest.raises(RuntimeError, match="transcript changed"):
-        agent._compress_context(source, None, approx_tokens=100_000, force=True, protected_tail=source[4:])
+    ):
+        returned, _ = agent._compress_context(
+            source,
+            None,
+            approx_tokens=100_000,
+            force=True,
+            protected_tail=source[4:],
+        )
     active = db.get_messages_as_conversation(sid)
+    assert returned is source
+    assert source == before
     assert active[:-1] == before and active[-1]["content"] == "RACING DURABLE GENERATION"
+    assert agent._last_compression_outcome == "persistence_failure"
+    assert db.find_live_compression_child(sid) is None
+    assert (
+        getattr(agent, "_pending_context_engine_compression_notification", None)
+        is None
+    )
     assert db.get_compression_lock_holder(sid) is None
 
 

@@ -819,7 +819,15 @@ class SessionSchemaMixin:
         # generation column. Presentation-only fields are intentionally
         # excluded; every listed field can affect provider replay or task
         # semantics.
+        # DROP/CREATE is deliberate: CREATE IF NOT EXISTS would leave an older
+        # trigger definition installed forever when the model-visible column
+        # set grows. Rebuilding these idempotently on every open also heals
+        # partially migrated databases without rewriting any transcript row.
         cursor.executescript("""
+            DROP TRIGGER IF EXISTS messages_transcript_generation_insert;
+            DROP TRIGGER IF EXISTS messages_transcript_generation_delete;
+            DROP TRIGGER IF EXISTS messages_transcript_generation_update;
+            DROP TRIGGER IF EXISTS messages_transcript_generation_move;
             CREATE TRIGGER IF NOT EXISTS messages_transcript_generation_insert
             AFTER INSERT ON messages BEGIN
                 UPDATE sessions SET transcript_generation =
@@ -837,10 +845,21 @@ class SessionSchemaMixin:
                 effect_disposition, finish_reason, reasoning, reasoning_content,
                 reasoning_details, codex_reasoning_items, codex_message_items,
                 observed, active, compacted, api_content,
-                autonomous_completion_provenance ON messages BEGIN
+                autonomous_completion_provenance ON messages
+            WHEN OLD.session_id = NEW.session_id BEGIN
                 UPDATE sessions SET transcript_generation =
                     COALESCE(transcript_generation, 0) + 1
                 WHERE id = NEW.session_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_transcript_generation_move
+            AFTER UPDATE OF session_id ON messages
+            WHEN OLD.session_id != NEW.session_id BEGIN
+                -- Moving a row changes both model transcripts. Fence both the
+                -- source snapshot (row disappeared) and destination snapshot
+                -- (row appeared), even for a non-cooperating legacy writer.
+                UPDATE sessions SET transcript_generation =
+                    COALESCE(transcript_generation, 0) + 1
+                WHERE id IN (OLD.session_id, NEW.session_id);
             END;
         """)
 

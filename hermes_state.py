@@ -10263,7 +10263,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # Columns every conversation projection decodes. Shared by
     # get_messages_as_conversation and get_resume_conversations so a single
-    # SELECT can feed both the model-fed and display views.
+    # SELECT can feed both the model-fed and display views. Generation policy:
+    # role/content/api_content, tool + reasoning payloads, observed/effect and
+    # finish provenance, active membership, and autonomous-completion
+    # provenance are provider/model/task relevant and are fenced by the schema
+    # triggers. id/session_id affect membership/order and are immutable through
+    # public APIs (legacy moves fence both sessions). platform_message_id,
+    # timestamp, display_kind and display_metadata are presentation-only and
+    # intentionally do not invalidate a model snapshot.
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "

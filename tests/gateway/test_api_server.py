@@ -981,8 +981,15 @@ class TestChatCompletionsEndpoint:
         if trusted:
             headers["X-Hermes-Internal-Wake"] = auth_adapter._internal_wake_token
         app = _create_app(auth_adapter)
+        before_tasks = set(asyncio.all_tasks())
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(auth_adapter, "_run_agent", side_effect=run_agent):
+            with patch.object(
+                auth_adapter, "_run_agent", side_effect=run_agent
+            ), patch.object(
+                auth_adapter,
+                "_write_sse_chat_completion",
+                wraps=auth_adapter._write_sse_chat_completion,
+            ) as writer:
                 response = await cli.post(
                     "/v1/chat/completions",
                     headers=headers,
@@ -993,12 +1000,22 @@ class TestChatCompletionsEndpoint:
                     },
                 )
                 body = await response.text()
+                await asyncio.sleep(0)
 
         assert response.status == 200
         assert body.count("data: [DONE]") == 1
         assert '"content": "streamed answer"' in body
         assert len(calls) == 1
         assert calls[0]["trusted_autonomous_completion"] is trusted
+        writer.assert_awaited_once()
+        assert "trusted_autonomous_completion" not in writer.await_args.kwargs
+        # The handler owns and awaits/reaps its background agent task. No task
+        # created by this request may remain live after the response drains.
+        leaked = [
+            task for task in set(asyncio.all_tasks()) - before_tasks
+            if not task.done() and task is not asyncio.current_task()
+        ]
+        assert leaked == []
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):

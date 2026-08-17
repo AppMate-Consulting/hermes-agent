@@ -103,11 +103,18 @@ def test_identical_tail_text_with_opposite_provenance_is_not_overlap(
     tmp_path: Path, in_place: bool, durable_trusted: bool, caller_trusted: bool
 ) -> None:
     """Trust-bearing model semantics participate in live-tail identity."""
-    from agent.conversation_compression import _latest_active_human_task_row
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        _latest_active_human_task_row,
+    )
 
     db = SessionDB(db_path=tmp_path / f"provenance-{in_place}-{durable_trusted}.db")
     sid = "PROVENANCE_PARENT"
-    text = "identical completion or human task text"
+    text = (
+        AUTONOMOUS_COMPLETION_BRIDGE_USER
+        if durable_trusted
+        else "[ASYNC DELEGATION COMPLETE child=exact-provenance-regression]"
+    )
     db.create_session(sid, source="desktop")
     db.append_message(
         sid, "user", text,
@@ -146,6 +153,18 @@ def test_identical_tail_text_with_opposite_provenance_is_not_overlap(
     assert [row.get("_autonomous_completion_bridge", False) for row in matching_active] == [
         durable_trusted, caller_trusted
     ]
+    durable_matching = [
+        row for row in db.get_messages(agent.session_id, include_inactive=False)
+        if row.get("content") == text
+    ]
+    assert len(durable_matching) == 2
+    assert [
+        bool(row.get("autonomous_completion_provenance"))
+        for row in durable_matching
+    ] == [durable_trusted, caller_trusted]
+    active_human = _latest_active_human_task_row(active)
+    assert active_human is not None and active_human["content"] == text
+    assert active_human.get("_autonomous_completion_bridge") is not True
     assert _contents(returned).count(text) == 2
 
 
@@ -528,3 +547,116 @@ def test_rotation_publication_failure_keeps_parent_unchanged_and_live_tail_for_r
     assert agent._cached_system_prompt_static == "cached static"
     agent._memory_manager.on_pre_compress.assert_not_called()
     agent.commit_memory_session.assert_not_called()
+
+    # The restored bookkeeping must remain usable, not merely look right.
+    assert agent._flush_messages_to_session_db(
+        messages, conversation_history=messages[:2]
+    ) is True
+    assert agent._flush_messages_to_session_db(
+        messages, conversation_history=messages[:2]
+    ) is True
+    rows = db.get_messages(sid, include_inactive=True)
+    landed = [row for row in rows if row.get("content") == "clean ordinary live tail"]
+    assert len(landed) == 1
+    assert landed[0]["timestamp"] == 1234.5
+    assert landed[0]["api_content"] == "ordinary live tail"
+
+
+@pytest.mark.parametrize(
+    "exit_kind",
+    ["policy-rejection", "in-place-publication", "rotation-publication"],
+)
+def test_reconciled_parent_rollback_preserves_subsequent_tail_persistence(
+    tmp_path: Path, exit_kind: str
+) -> None:
+    """Every precommit exit restores the complete per-turn persistence state."""
+    sid = f"ROLLBACK_{exit_kind}"
+    db = SessionDB(db_path=tmp_path / f"{exit_kind}.db")
+    db.create_session(sid, source="desktop")
+    db.append_message(sid, "user", "durable task")
+    db.append_message(sid, "assistant", "durable answer")
+    messages = db.get_messages_as_conversation(sid)
+    live = {"role": "user", "content": "WIRE live user"}
+    messages.append(live)
+    original = copy.deepcopy(messages)
+    original_identity = id(messages)
+    # Authoritative durable parent is longer than the caller, while the caller
+    # alone owns the current user row and its clean-content metadata.
+    db.append_message(sid, "user", "concurrent durable task")
+    db.append_message(sid, "assistant", "concurrent durable answer")
+    durable_before = copy.deepcopy(db.get_messages(sid, include_inactive=True))
+
+    in_place = exit_kind != "rotation-publication"
+    agent = _build_agent_with_db(db, sid, in_place=in_place)
+    agent.context_compressor.compress.side_effect = lambda rows, **kw: [
+        {"role": "assistant", "content": "small summary"},
+        copy.deepcopy(rows[-1]),
+    ]
+    agent._persist_user_message_idx = 2
+    agent._persist_user_message_override = "CLEAN live user"
+    agent._persist_user_message_timestamp = 2468.0
+    agent._last_flushed_db_idx = 2
+    agent._flushed_db_message_ids = {101, 202}
+    agent._flushed_db_message_session_id = sid
+    agent._db_flush_scan_prefix = [messages[0]]
+    agent._pending_cli_user_message = live
+    agent._cached_system_prompt = "cached prompt"
+    agent._cached_system_prompt_static = "cached static"
+    state_before = {
+        name: copy.deepcopy(getattr(agent, name))
+        for name in (
+            "_persist_user_message_idx", "_persist_user_message_override",
+            "_persist_user_message_timestamp", "_last_flushed_db_idx",
+            "_flushed_db_message_ids", "_flushed_db_message_session_id",
+            "_db_flush_scan_prefix", "_pending_cli_user_message",
+            "_cached_system_prompt", "_cached_system_prompt_static",
+        )
+    }
+
+    publication_patch = (
+        patch.object(db, "archive_and_compact", side_effect=RuntimeError("publish denied"))
+        if exit_kind == "in-place-publication"
+        else patch.object(db, "publish_compression_child", side_effect=RuntimeError("publish denied"))
+        if exit_kind == "rotation-publication"
+        else patch.object(db, "get_session", wraps=db.get_session)
+    )
+    estimates = [20_000, 20_000] if exit_kind == "policy-rejection" else [20_000, 1_000]
+    with publication_patch, patch(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        side_effect=estimates,
+    ):
+        returned, prompt = agent._compress_context(messages, "sys", approx_tokens=1)
+
+    assert returned is messages and id(returned) == original_identity
+    assert messages == original
+    assert prompt == "cached prompt"
+    assert agent._last_compression_outcome == (
+        "rejected_no_progress"
+        if exit_kind == "policy-rejection"
+        else "persistence_failure"
+    )
+    assert agent._last_compaction_in_place is False
+    for name, expected in state_before.items():
+        assert getattr(agent, name) == expected, name
+    assert db.get_messages(sid, include_inactive=True) == durable_before
+    assert agent.session_id == sid
+    assert db._conn.execute(
+        "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+    ).fetchall() == []
+
+    # The ordinary turn-end persistence path must land the caller-only row
+    # exactly once, with overrides applied to that row and nowhere else.
+    assert agent._flush_messages_to_session_db(
+        messages, conversation_history=messages[:2]
+    ) is True
+    assert agent._flush_messages_to_session_db(
+        messages, conversation_history=messages[:2]
+    ) is True
+    final_rows = db.get_messages(sid, include_inactive=True)
+    landed = [row for row in final_rows if row.get("content") == "CLEAN live user"]
+    assert len(landed) == 1
+    assert landed[0]["timestamp"] == 2468.0
+    assert landed[0]["api_content"] == "WIRE live user"
+    assert [row["content"] for row in final_rows[:-1]] == [
+        row["content"] for row in durable_before
+    ]

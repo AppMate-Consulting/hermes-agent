@@ -1321,6 +1321,88 @@ async def test_hygiene_terminal_failure_ladder_advances_after_expiry_and_restart
 
 
 @pytest.mark.asyncio
+async def test_empty_transcript_rejection_has_restart_safe_three_rung_cooldown(
+    monkeypatch, tmp_path
+):
+    """Empty summaries advance once per attempt and remain truthful on restart.
+
+    The gateway deliberately passes ``rejection_cooldown_seconds=None`` to the
+    compressor, making the gateway the sole durable recorder. This binds that
+    single-recording contract as well as the real SessionDB ladder.
+    """
+    from hermes_state import SessionDB
+
+    path = tmp_path / "empty-transcript-ladder.db"
+    sid = "empty-transcript-ladder"
+
+    class EmptyTranscriptAgent:
+        attempts = 0
+        local_cooldown_args = []
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = False
+            self._last_compression_outcome = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(), _last_compress_aborted=False,
+                _last_summary_error="empty transcript", _last_aux_model_failure_model=None,
+                _record_compression_failure_cooldown=lambda *args: (
+                    type(self).local_cooldown_args.append(args)
+                ),
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **kwargs):
+            type(self).attempts += 1
+            # This is the actual terminal outcome produced by an empty
+            # compressor result; gateway ownership disables compressor-local
+            # persistence so one attempt cannot advance twice.
+            assert kwargs["rejection_cooldown_seconds"] is None
+            self._last_compression_outcome = "rejected_empty_transcript"
+            return messages, ""
+
+    deadlines = []
+    for expected_streak, multiplier in ((1, 1), (2, 3), (3, 9)):
+        db = SessionDB(db_path=path)
+        if expected_streak == 1:
+            db.create_session(sid, "telegram")
+        else:
+            db._conn.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = 0 WHERE id = ?",
+                (sid,),
+            )
+            db._conn.commit()
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, EmptyTranscriptAgent, db, sid
+        )
+        before = time.time()
+        assert await runner._handle_message(event) == "ok"
+        state = db.get_compression_failure_cooldown(sid)
+        assert db.get_hygiene_failure_streak(sid) == expected_streak
+        assert state["error"] == "empty_transcript"
+        assert state["cooldown_until"] - before == pytest.approx(
+            min(300 * multiplier, 3600), abs=5
+        )
+        deadlines.append(state["cooldown_until"])
+        assert EmptyTranscriptAgent.attempts == expected_streak
+        assert EmptyTranscriptAgent.local_cooldown_args == []
+
+        # Same runner and a newly reconstructed runner both suppress the next
+        # attempt while this rung is live.
+        assert await runner._handle_message(event) == "ok"
+        fresh, _adapter2, fresh_event = _make_cooldown_runner(
+            monkeypatch, tmp_path, EmptyTranscriptAgent, db, sid
+        )
+        assert await fresh._handle_message(fresh_event) == "ok"
+        assert EmptyTranscriptAgent.attempts == expected_streak
+        assert db.get_hygiene_failure_streak(sid) == expected_streak
+        db.close()
+    assert deadlines[0] < deadlines[1] < deadlines[2]
+
+
+@pytest.mark.asyncio
 async def test_hygiene_host_cancellation_wins_over_late_worker_outcome(
     monkeypatch, tmp_path, caplog
 ):

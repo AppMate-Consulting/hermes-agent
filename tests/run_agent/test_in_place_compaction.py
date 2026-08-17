@@ -157,6 +157,7 @@ class TestInPlaceCompaction:
         raw.execute("DROP TRIGGER messages_transcript_generation_insert")
         raw.execute("DROP TRIGGER messages_transcript_generation_delete")
         raw.execute("DROP TRIGGER messages_transcript_generation_update")
+        raw.execute("DROP TRIGGER IF EXISTS messages_transcript_generation_move")
         raw.execute("ALTER TABLE sessions DROP COLUMN transcript_generation")
         raw.commit()
         raw.close()
@@ -165,6 +166,89 @@ class TestInPlaceCompaction:
         before = reopened.get_active_transcript_identity("legacy")
         assert reopened.set_latest_user_api_content("legacy", "hello", "hello+ctx") == 1
         assert reopened.get_active_transcript_identity("legacy") > before
+
+        # Opening an already-reconciled store is idempotent and retains the
+        # complete trigger set rather than preserving an obsolete definition.
+        reopened.close()
+        again = SessionDB(db_path=path)
+        triggers = {
+            row[0] for row in again._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_transcript_generation_%'"
+            )
+        }
+        assert triggers == {
+            "messages_transcript_generation_insert",
+            "messages_transcript_generation_delete",
+            "messages_transcript_generation_update",
+            "messages_transcript_generation_move",
+        }
+
+    def test_generation_covers_every_model_field_and_excludes_presentation_only(self, tmp_path):
+        """Schema fence matches the conversation projection's semantic boundary.
+
+        Direct SQL deliberately simulates a legacy/non-cooperating writer; all
+        normal writers use SessionDB methods. Each mutation is isolated so a
+        missing trigger column cannot hide behind another advancing mutation.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "generation-fields.db")
+        db.create_session("source", "cli")
+        db.create_session("destination", "cli")
+        db.append_message("source", "assistant", "content")
+        row_id = db.get_messages("source")[0]["id"]
+        relevant = {
+            "role": "user",
+            "content": "changed content",
+            "tool_call_id": "call-1",
+            "tool_calls": '[{"id":"call-1"}]',
+            "tool_name": "terminal",
+            "effect_disposition": "committed",
+            "finish_reason": "stop",
+            "reasoning": "reasoning",
+            "reasoning_content": "reasoning content",
+            "reasoning_details": '[{"type":"text"}]',
+            "codex_reasoning_items": '[{"type":"reasoning"}]',
+            "codex_message_items": '[{"type":"message"}]',
+            "observed": 1,
+            "active": 0,
+            "compacted": 1,
+            "api_content": "provider-exact content",
+            "autonomous_completion_provenance": 1,
+        }
+        for column, value in relevant.items():
+            before = db.get_active_transcript_identity("source")
+            db._conn.execute(
+                f"UPDATE messages SET {column} = ? WHERE id = ?", (value, row_id)
+            )
+            db._conn.commit()
+            assert db.get_active_transcript_identity("source") > before, column
+
+        # These projection fields are display/routing metadata only and never
+        # reach provider input or decide the active human task.
+        for column, value in {
+            "platform_message_id": "platform-1",
+            "timestamp": 1234.5,
+            "display_kind": "hidden",
+            "display_metadata": '{"label":"presentation"}',
+        }.items():
+            before = db.get_active_transcript_identity("source")
+            db._conn.execute(
+                f"UPDATE messages SET {column} = ? WHERE id = ?", (value, row_id)
+            )
+            db._conn.commit()
+            assert db.get_active_transcript_identity("source") == before, column
+
+        source_before = db.get_active_transcript_identity("source")
+        destination_before = db.get_active_transcript_identity("destination")
+        db._conn.execute(
+            "UPDATE messages SET session_id = ? WHERE id = ?",
+            ("destination", row_id),
+        )
+        db._conn.commit()
+        assert db.get_active_transcript_identity("source") > source_before
+        assert db.get_active_transcript_identity("destination") > destination_before
 
     def test_rotation_publication_failure_restores_parent_and_all_ephemeral_state(self):
         """A materially admitted child that cannot publish leaves no boundary trace."""

@@ -19013,6 +19013,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # would end the live gateway session row.
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
+                                    _hyg_original_sid = session_entry.session_id
+                                    _hyg_postcommit_routing_reconciled = False
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
@@ -19216,6 +19218,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         "hygiene-compression-postcommit"
                                                     ),
                                                 )
+                                                _hyg_postcommit_routing_reconciled = True
                                             logger.warning(
                                                 "Session hygiene compression committed but "
                                                 "required postcommit reconciliation: %s",
@@ -19321,7 +19324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # the NEW session so the old transcript stays intact
                                     # and searchable via session_search.
                                     _hyg_new_sid = _hyg_agent.session_id
-                                    _hyg_rotated = _hyg_new_sid != session_entry.session_id
+                                    _hyg_rotated = _hyg_new_sid != _hyg_original_sid
                                     _hyg_in_place = bool(
                                         getattr(_hyg_agent, "_last_compaction_in_place", False)
                                     )
@@ -19373,7 +19376,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # empty session while the turn continues — the
                                     # conversation silently vanishes. Persist the child
                                     # transcript first; only then rebind the live entry.
-                                    if _hyg_rotated:
+                                    if (
+                                        _hyg_rotated
+                                        and not _hyg_postcommit_routing_reconciled
+                                    ):
                                         # _compress_context already published the
                                         # authoritative child transcript atomically.
                                         # Reconcile routing only; never publish it twice.

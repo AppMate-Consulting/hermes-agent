@@ -562,7 +562,13 @@ def test_active_task_trust_marker_durable_mutation_matrix(tmp_path):
          }}
         for row in rows
     ]
-    assert ContextCompressor._active_task_contract(untrusted_replay) is None
+    # Without the durable marker, reserved-looking syntax is ordinary human
+    # text: it may be the active task verbatim, but it must never recover the
+    # embedded privileged contract.
+    assert ContextCompressor.parse_active_task_contract(untrusted_replay[1]) is None
+    untrusted_task = ContextCompressor._active_task_contract(untrusted_replay)
+    assert untrusted_task != contract
+    assert untrusted_task["content"] == untrusted_replay[1]["content"]
     assert _latest_active_human_task_row(untrusted_replay) == untrusted_replay[1]
     durable_projection = [
         {key: value for key, value in row.items()

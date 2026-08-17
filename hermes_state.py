@@ -5548,7 +5548,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
-        expected_active_identity: Optional[tuple[int, int]] = None,
+        expected_active_identity: Optional[int] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -5559,12 +5559,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             if expected_active_identity is not None:
                 identity_row = conn.execute(
-                    "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
-                    "FROM messages WHERE session_id = ? AND active = 1",
+                    "SELECT COALESCE(transcript_generation, 0) AS generation "
+                    "FROM sessions WHERE id = ?",
                     (parent_session_id,),
                 ).fetchone()
                 actual_identity = (
-                    int(identity_row["n"]), int(identity_row["max_id"])
+                    int(identity_row["generation"]) if identity_row else None
                 )
                 if actual_identity != expected_active_identity:
                     raise RuntimeError(
@@ -9705,20 +9705,48 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
-    def get_active_transcript_identity(self, session_id: str) -> tuple[int, int]:
+    def get_active_transcript_snapshot(
+        self, session_id: str
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Read the active model transcript and CAS generation atomically."""
+        with self._read_ctx() as conn:
+            conn.execute("BEGIN")
+            try:
+                generation_row = conn.execute(
+                    "SELECT COALESCE(transcript_generation, 0) AS generation "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                rows = conn.execute(
+                    f"SELECT {self._CONVERSATION_ROW_COLUMNS} FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            finally:
+                conn.execute("ROLLBACK")
+        generation = int(generation_row["generation"]) if generation_row else 0
+        messages = self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+        )
+        return messages, generation
+
+    def get_active_transcript_identity(self, session_id: str) -> int:
         """Return the compare-and-swap identity of the active transcript.
 
-        Message ids are monotonic and active compaction replaces the complete
-        active set, so ``(count, max_id)`` changes for every append or rewrite
-        that could make a generated candidate stale.
+        The generation is advanced atomically by database triggers for every
+        provider/model-relevant message append, delete, or update. Display
+        metadata is deliberately outside this identity boundary.
         """
         with self._read_ctx() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
-                "FROM messages WHERE session_id = ? AND active = 1",
+                "SELECT COALESCE(transcript_generation, 0) AS generation "
+                "FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
-        return (int(row["n"]), int(row["max_id"]))
+        return int(row["generation"]) if row else 0
 
     def archive_and_compact(
         self,
@@ -9726,7 +9754,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
         system_prompt: Optional[str] = None,
-        expected_active_identity: Optional[tuple[int, int]] = None,
+        expected_active_identity: Optional[int] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -9758,11 +9786,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             if expected_active_identity is not None:
                 row = conn.execute(
-                    "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
-                    "FROM messages WHERE session_id = ? AND active = 1",
+                    "SELECT COALESCE(transcript_generation, 0) AS generation "
+                    "FROM sessions WHERE id = ?",
                     (session_id,),
                 ).fetchone()
-                actual = (int(row["n"]), int(row["max_id"]))
+                actual = int(row["generation"]) if row else None
                 if actual != expected_active_identity:
                     raise RuntimeError(
                         f"Compression transcript changed before publication: {session_id}"

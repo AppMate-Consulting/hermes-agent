@@ -61,6 +61,58 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
+    @pytest.mark.parametrize("in_place", [True, False], ids=["in-place", "rotation"])
+    def test_api_content_mutation_after_generation_rejects_stale_publication(
+        self, tmp_path, in_place
+    ):
+        """An in-place prompt-cache sidecar update trips the generation CAS."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / f"api-race-{in_place}.db")
+        sid = f"api-race-{in_place}"
+        _seed(db, sid, "api race", n=4)
+        agent = _make_agent(db, sid, in_place=in_place)
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = "memory"
+        agent.commit_memory_session = MagicMock()
+        agent.event_callback = MagicMock()
+        before = db.get_messages(sid, include_inactive=True)
+        messages = db.get_messages_as_conversation(sid)
+        calls = 0
+
+        def estimate(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                assert db.set_latest_user_api_content(
+                    sid, messages[2]["content"], "new provider bytes"
+                ) == 1
+            return 100_000 if calls == 1 else 1_000
+
+        with patch(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            side_effect=estimate,
+        ):
+            returned, _ = agent._compress_context(
+                messages, "sys", approx_tokens=100_000
+            )
+
+        assert returned is messages
+        assert agent.session_id == sid
+        active = db.get_messages_as_conversation(sid)
+        assert active[2]["api_content"] == "new provider bytes"
+        assert [r["id"] for r in db.get_messages(sid, include_inactive=True)] == [
+            r["id"] for r in before
+        ]
+        assert all(r["active"] for r in db.get_messages(sid, include_inactive=True))
+        assert db._conn.execute(
+            "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+        ).fetchall() == []
+        agent._memory_manager.on_pre_compress.assert_not_called()
+        agent._memory_manager.on_session_switch.assert_not_called()
+        agent.commit_memory_session.assert_not_called()
+        agent.event_callback.assert_not_called()
+
     def test_sessiondb_rejects_append_after_candidate_for_both_publications(self, tmp_path):
         """A newer durable row can never be archived into a stale candidate."""
         from hermes_state import SessionDB
@@ -88,6 +140,31 @@ class TestInPlaceCompaction:
             )
         assert db.get_session("stale-child") is None
         assert db.get_messages_as_conversation("rotation")[-1]["content"] == "late durable truth"
+
+    def test_existing_store_auto_initializes_generation_and_api_content_advances_it(
+        self, tmp_path
+    ):
+        """Declarative reconciliation upgrades old SessionDB files in place."""
+        import sqlite3
+        from hermes_state import SessionDB
+
+        path = tmp_path / "legacy.db"
+        db = SessionDB(db_path=path)
+        db.create_session("legacy", "cli")
+        db.append_message("legacy", "user", "hello")
+        db.close()
+        raw = sqlite3.connect(path)
+        raw.execute("DROP TRIGGER messages_transcript_generation_insert")
+        raw.execute("DROP TRIGGER messages_transcript_generation_delete")
+        raw.execute("DROP TRIGGER messages_transcript_generation_update")
+        raw.execute("ALTER TABLE sessions DROP COLUMN transcript_generation")
+        raw.commit()
+        raw.close()
+
+        reopened = SessionDB(db_path=path)
+        before = reopened.get_active_transcript_identity("legacy")
+        assert reopened.set_latest_user_api_content("legacy", "hello", "hello+ctx") == 1
+        assert reopened.get_active_transcript_identity("legacy") > before
 
     def test_rotation_publication_failure_restores_parent_and_all_ephemeral_state(self):
         """A materially admitted child that cannot publish leaves no boundary trace."""

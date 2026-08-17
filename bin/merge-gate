@@ -17,6 +17,7 @@ fi
   tests/gateway/test_buzz_adapter.py \
   tests/gateway/test_buzz_websocket.py \
   tests/gateway/test_wake_delivery.py \
+  tests/gateway/test_api_server.py \
   tests/gateway/test_session_hygiene.py \
   tests/gateway/test_hygiene_failure_cooldown_ladder.py \
   tests/tui_gateway/test_completion_provenance.py \

@@ -4375,7 +4375,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
-                trusted_autonomous_completion=_trusted_internal_completion,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)

@@ -93,6 +93,86 @@ def _contents(rows):
     return [r.get("content") for r in rows]
 
 
+@pytest.mark.parametrize("in_place", [True, False], ids=["in-place", "rotation"])
+@pytest.mark.parametrize(
+    "durable_trusted,caller_trusted",
+    [(True, False), (False, True)],
+    ids=["durable-autonomous-caller-human", "durable-human-caller-autonomous"],
+)
+def test_identical_tail_text_with_opposite_provenance_is_not_overlap(
+    tmp_path: Path, in_place: bool, durable_trusted: bool, caller_trusted: bool
+) -> None:
+    """Trust-bearing model semantics participate in live-tail identity."""
+    from agent.conversation_compression import _latest_active_human_task_row
+
+    db = SessionDB(db_path=tmp_path / f"provenance-{in_place}-{durable_trusted}.db")
+    sid = "PROVENANCE_PARENT"
+    text = "identical completion or human task text"
+    db.create_session(sid, source="desktop")
+    db.append_message(
+        sid, "user", text,
+        autonomous_completion_provenance=durable_trusted,
+    )
+    messages = db.get_messages_as_conversation(sid)
+    caller = {"role": "user", "content": text}
+    if caller_trusted:
+        caller["_autonomous_completion_bridge"] = True
+    messages.append(caller)
+    agent = _build_agent_with_db(db, sid, in_place=in_place)
+    agent._persist_user_message_idx = 1
+    seen = []
+
+    def compress(rows, **_kwargs):
+        seen.append(copy.deepcopy(rows))
+        return [{"role": "assistant", "content": "summary"}, *copy.deepcopy(rows)]
+
+    agent.context_compressor.compress.side_effect = compress
+    with patch(
+        "agent.conversation_compression.estimate_request_tokens_rough",
+        side_effect=[100_000, 1_000],
+    ):
+        returned, _ = agent._compress_context(messages, "sys", approx_tokens=100_000)
+
+    matching = [row for row in seen[0] if row.get("content") == text]
+    assert len(matching) == 2
+    assert [row.get("_autonomous_completion_bridge", False) for row in matching] == [
+        durable_trusted, caller_trusted
+    ]
+    human = _latest_active_human_task_row(seen[0])
+    assert human is not None and human["content"] == text
+    active = db.get_messages_as_conversation(agent.session_id)
+    matching_active = [row for row in active if row.get("content") == text]
+    assert len(matching_active) == 2
+    assert [row.get("_autonomous_completion_bridge", False) for row in matching_active] == [
+        durable_trusted, caller_trusted
+    ]
+    assert _contents(returned).count(text) == 2
+
+
+def test_empty_transcript_records_one_truthful_terminal_rejection(tmp_path: Path) -> None:
+    """Empty output is a cooldown-bearing rejection, never a silent retry."""
+    db = SessionDB(db_path=tmp_path / "empty.db")
+    sid = "EMPTY_PARENT"
+    db.create_session(sid, source="desktop")
+    db.append_message(sid, "user", "keep me")
+    messages = db.get_messages_as_conversation(sid)
+    agent = _build_agent_with_db(db, sid, in_place=True)
+    agent.context_compressor.compress.side_effect = lambda *_a, **_kw: []
+    agent.context_compressor._record_compression_failure_cooldown = MagicMock()
+
+    returned, _ = agent._compress_context(
+        messages, "sys", approx_tokens=100_000,
+        rejection_cooldown_seconds=37.0,
+    )
+
+    assert returned is messages
+    assert agent._last_compression_outcome == "rejected_empty_transcript"
+    agent.context_compressor._record_compression_failure_cooldown.assert_called_once_with(
+        37.0, "empty_transcript"
+    )
+    assert _contents(db.get_messages_as_conversation(sid)) == ["keep me"]
+
+
 def _seed_drifted_session(db: SessionDB, session_id: str):
     """Seed the RED shape: in-memory transcript + a longer durable parent.
 
@@ -407,6 +487,11 @@ def test_rotation_publication_failure_keeps_parent_unchanged_and_live_tail_for_r
     original = copy.deepcopy(messages)
     agent = _build_agent_with_db(db, sid)
     agent._persist_user_message_idx = 2
+    agent._persist_user_message_override = "clean ordinary live tail"
+    agent._persist_user_message_timestamp = 1234.5
+    agent._last_flushed_db_idx = 2
+    agent._flushed_db_message_ids = {11, 22}
+    agent._flushed_db_message_session_id = sid
     agent._cached_system_prompt = "cached prompt"
     agent._cached_system_prompt_static = "cached static"
     agent._memory_manager = MagicMock()
@@ -434,6 +519,11 @@ def test_rotation_publication_failure_keeps_parent_unchanged_and_live_tail_for_r
     ]
     assert _contents(returned)[-1] == "ordinary live tail"
     assert agent._persist_user_message_idx == 2
+    assert agent._persist_user_message_override == "clean ordinary live tail"
+    assert agent._persist_user_message_timestamp == 1234.5
+    assert agent._last_flushed_db_idx == 2
+    assert agent._flushed_db_message_ids == {11, 22}
+    assert agent._flushed_db_message_session_id == sid
     assert agent._cached_system_prompt == "cached prompt"
     assert agent._cached_system_prompt_static == "cached static"
     agent._memory_manager.on_pre_compress.assert_not_called()

@@ -19378,6 +19378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         "rejected_no_progress",
                                         "rejected_would_grow",
                                         "rejected_below_minimum_reclaim",
+                                        "rejected_empty_transcript",
                                     }
                                     _hyg_terminal_failure = bool(
                                         _hyg_outcome == "persistence_failure"

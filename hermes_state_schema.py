@@ -814,6 +814,36 @@ class SessionSchemaMixin:
         # column gets created here.
         self._reconcile_columns(cursor)
 
+        # Durable CAS fence for model-visible transcript state. Keep these
+        # triggers after reconciliation so legacy stores first receive the
+        # generation column. Presentation-only fields are intentionally
+        # excluded; every listed field can affect provider replay or task
+        # semantics.
+        cursor.executescript("""
+            CREATE TRIGGER IF NOT EXISTS messages_transcript_generation_insert
+            AFTER INSERT ON messages BEGIN
+                UPDATE sessions SET transcript_generation =
+                    COALESCE(transcript_generation, 0) + 1
+                WHERE id = NEW.session_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_transcript_generation_delete
+            AFTER DELETE ON messages BEGIN
+                UPDATE sessions SET transcript_generation =
+                    COALESCE(transcript_generation, 0) + 1
+                WHERE id = OLD.session_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_transcript_generation_update
+            AFTER UPDATE OF role, content, tool_call_id, tool_calls, tool_name,
+                effect_disposition, finish_reason, reasoning, reasoning_content,
+                reasoning_details, codex_reasoning_items, codex_message_items,
+                observed, active, compacted, api_content,
+                autonomous_completion_provenance ON messages BEGIN
+                UPDATE sessions SET transcript_generation =
+                    COALESCE(transcript_generation, 0) + 1
+                WHERE id = NEW.session_id;
+            END;
+        """)
+
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
         # the one table-shape repair reconciliation can't express.

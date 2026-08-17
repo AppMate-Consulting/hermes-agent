@@ -2590,6 +2590,19 @@ def compress_context(
         name: vars(agent).get(name, _missing_cache_field)
         for name in ("_cached_system_prompt", "_cached_system_prompt_static")
     }
+    _persistence_snapshot = {
+        name: copy.deepcopy(vars(agent).get(name, _missing_cache_field))
+        for name in (
+            "_persist_user_message_idx",
+            "_persist_user_message_override",
+            "_persist_user_message_timestamp",
+            "_last_flushed_db_idx",
+            "_flushed_db_message_ids",
+            "_flushed_db_message_session_id",
+            "_db_flush_scan_prefix",
+            "_pending_cli_user_message",
+        )
+    }
 
     def _restore_uncommitted_input() -> None:
         """Restore all caller-visible input state on a non-commit path."""
@@ -2604,6 +2617,11 @@ def compress_context(
                 vars(agent).pop(name, None)
             else:
                 setattr(agent, name, value)
+        for name, value in _persistence_snapshot.items():
+            if value is _missing_cache_field:
+                vars(agent).pop(name, None)
+            else:
+                setattr(agent, name, copy.deepcopy(value))
 
     def _rollback_prompt() -> str:
         """Return the logical request prompt without retaining cache writes."""
@@ -3147,14 +3165,13 @@ def compress_context(
         # current-turn tail; retain that tail exactly once.
         _expected_active_identity = None
         if _lock_db is not None and _lock_sid:
-            durable_loader = getattr(
-                type(_lock_db), "get_messages_as_conversation", None
+            snapshot_loader = getattr(
+                type(_lock_db), "get_active_transcript_snapshot", None
             )
-            identity_loader = getattr(
-                type(_lock_db), "get_active_transcript_identity", None
-            )
-            if callable(durable_loader) and callable(identity_loader):
-                durable_parent = durable_loader(_lock_db, _lock_sid)
+            if callable(snapshot_loader):
+                durable_parent, _expected_active_identity = snapshot_loader(
+                    _lock_db, _lock_sid
+                )
                 if isinstance(durable_parent, list):
                     live_tail = []
                     tail_idx = getattr(agent, "_persist_user_message_idx", None)
@@ -3172,7 +3189,13 @@ def compress_context(
                     def _same_row(left: Any, right: Any) -> bool:
                         if not isinstance(left, dict) or not isinstance(right, dict):
                             return left == right
-                        keys = ("role", "content", "tool_call_id", "tool_calls", "tool_name")
+                        keys = (
+                            "role", "content", "api_content", "tool_call_id",
+                            "tool_calls", "tool_name", "effect_disposition",
+                            "reasoning", "reasoning_content", "reasoning_details",
+                            "codex_reasoning_items", "codex_message_items", "observed",
+                            "_autonomous_completion_bridge",
+                        )
                         return all(left.get(key) == right.get(key) for key in keys)
                     for overlap in range(min(len(live_tail), len(durable_parent)), 0, -1):
                         if all(
@@ -3185,7 +3208,6 @@ def compress_context(
                     _pre_msg_count = len(messages)
                     approx_tokens = 0
                     agent._persist_user_message_idx = len(durable_parent)
-                    _expected_active_identity = identity_loader(_lock_db, _lock_sid)
 
         # The caller's history snapshot predates lease acquisition. Reload the
         # durable parent after the lease is live; MORE durable rows than the
@@ -3580,6 +3602,16 @@ def compress_context(
                 pass
             _existing_sp = _rollback_prompt()
             _set_compression_outcome("rejected_empty_transcript")
+            if not force and rejection_cooldown_seconds is not None:
+                _record_rejection = getattr(
+                    agent.context_compressor,
+                    "_record_compression_failure_cooldown",
+                    None,
+                )
+                if callable(_record_rejection):
+                    _record_rejection(
+                        rejection_cooldown_seconds, "empty_transcript"
+                    )
             _release_lock()
             return messages, _existing_sp
 

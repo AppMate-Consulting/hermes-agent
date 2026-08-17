@@ -962,6 +962,45 @@ class TestToolsetsEndpoint:
 
 class TestChatCompletionsEndpoint:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("trusted", [False, True], ids=["ordinary", "internal-wake"])
+    async def test_authenticated_stream_real_sse_lifecycle_runs_agent_once(
+        self, auth_adapter, trusted
+    ):
+        """The real handler/writer contract accepts both trustedness paths."""
+        calls = []
+
+        async def run_agent(**kwargs):
+            calls.append(kwargs)
+            kwargs["stream_delta_callback"]("streamed answer")
+            return (
+                {"final_response": "streamed answer", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            )
+
+        headers = {"Authorization": "Bearer sk-secret"}
+        if trusted:
+            headers["X-Hermes-Internal-Wake"] = auth_adapter._internal_wake_token
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", side_effect=run_agent):
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "wake text"}],
+                        "stream": True,
+                    },
+                )
+                body = await response.text()
+
+        assert response.status == 200
+        assert body.count("data: [DONE]") == 1
+        assert '"content": "streamed answer"' in body
+        assert len(calls) == 1
+        assert calls[0]["trusted_autonomous_completion"] is trusted
+
+    @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -2865,4 +2904,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

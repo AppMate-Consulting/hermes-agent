@@ -7863,6 +7863,7 @@ class AIAgent:
         protected_tail: list | None = None,
         commit_fence=None,
         rejection_cooldown_seconds: float | None = 60.0,
+        live_request_context: dict | None = None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
@@ -7936,6 +7937,7 @@ class AIAgent:
                     protected_tail=protected_tail,
                     commit_fence=fence,
                     rejection_cooldown_seconds=rejection_cooldown_seconds,
+                    live_request_context=live_request_context,
                 )
 
             # Callers that already own a progress-aware wait (gateway session

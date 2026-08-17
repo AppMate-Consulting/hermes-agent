@@ -1386,6 +1386,7 @@ def finalize_provider_request(
     moa_prepared_request: Any = None,
     middleware_context: Optional[Dict[str, Any]] = None,
     consume_user_initiator: bool = False,
+    user_initiated_turn: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Construct the sole provider-wire request consumed by dispatch/admission.
 
@@ -1444,15 +1445,20 @@ def finalize_provider_request(
             is_github_responses=agent._is_copilot_url(),
             sanitize_harmony_tokens=agent._is_codex_backend(),
         )
-    if (
-        consume_user_initiator
-        and getattr(agent, "_is_user_initiated_turn", False)
-        and agent._is_copilot_url()
-    ):
+    _include_user_initiator = (
+        bool(
+            consume_user_initiator
+            and getattr(agent, "_is_user_initiated_turn", False)
+        )
+        if user_initiated_turn is None
+        else bool(user_initiated_turn)
+    )
+    if _include_user_initiator and agent._is_copilot_url():
         headers = dict(payload.get("extra_headers") or {})
         headers["x-initiator"] = "user"
         payload["extra_headers"] = headers
-        agent._is_user_initiated_turn = False
+        if consume_user_initiator:
+            agent._is_user_initiated_turn = False
     # This snapshot is the completed provider projection: selection, provider
     # shaping and transport preflight have all happened exactly once.  Keep it
     # private from middleware so determinism checks can replay *only* the
@@ -2364,13 +2370,14 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
+        _admitted_request = vars(agent).pop("_admitted_provider_request", None)
         # MoA guidance is the sole live-only dynamic transform. Produce it
         # before canonical projection, then pass the resulting text into the
         # current-turn composition below; compression never replays advisors.
         api_messages = []
         _moa_context = None
 
-        if moa_config:
+        if moa_config and _admitted_request is None:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
@@ -2424,17 +2431,22 @@ def run_conversation(
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        _provider_request = _project_provider_request(
-            agent,
-            messages,
-            system_prompt=effective_system,
-            tools=agent.tools or [],
-            current_turn_user_idx=current_turn_user_idx,
-            external_prefetch=_ext_prefetch_cache,
-            plugin_user_context=_plugin_user_context,
-            incoming_message=_incoming,
-            sanitize_model=_sanitize_model,
-            current_turn_suffix=_moa_context,
+        _provider_request = (
+            {"messages": copy.deepcopy(_admitted_request["messages"]),
+             "tools": copy.deepcopy(_admitted_request["tools"])}
+            if _admitted_request is not None
+            else _project_provider_request(
+                agent,
+                messages,
+                system_prompt=effective_system,
+                tools=agent.tools or [],
+                current_turn_user_idx=current_turn_user_idx,
+                external_prefetch=_ext_prefetch_cache,
+                plugin_user_context=_plugin_user_context,
+                incoming_message=_incoming,
+                sanitize_model=_sanitize_model,
+                current_turn_suffix=_moa_context,
+            )
         )
         api_messages = _provider_request["messages"]
         tools_for_api = _provider_request["tools"]
@@ -2445,8 +2457,11 @@ def run_conversation(
         # Preparing here makes the pre-API guard measure the exact prompt the
         # aggregator will receive; ``create()`` consumes this private prepared
         # request later without running the advisors a second time.
-        _moa_prepared_request = None
-        if agent.provider == "moa":
+        _moa_prepared_request = (
+            _admitted_request.get("moa_prepared_request")
+            if _admitted_request is not None else None
+        )
+        if agent.provider == "moa" and _admitted_request is None:
             _moa_completions = getattr(getattr(agent.client, "chat", None), "completions", None)
             if pending_moa_prepared_request is not None:
                 _rebase_moa_request = getattr(_moa_completions, "rebase_prepared_request", None)
@@ -2611,6 +2626,39 @@ def run_conversation(
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
+                live_request_context={
+                    "frozen_projection": _provider_request,
+                    "current_turn_user_idx": current_turn_user_idx,
+                    "current_turn_identity": copy.deepcopy(
+                        messages[current_turn_user_idx].get("content")
+                        if 0 <= current_turn_user_idx < len(messages) else None
+                    ),
+                    "incoming_message": copy.deepcopy(_incoming),
+                    "external_prefetch": copy.deepcopy(_ext_prefetch_cache),
+                    "plugin_user_context": copy.deepcopy(_plugin_user_context),
+                    "prefill_messages": copy.deepcopy(
+                        getattr(agent, "prefill_messages", None)
+                    ),
+                    "sanitize_model": _sanitize_model,
+                    "current_turn_suffix": _moa_context,
+                    "moa_prepared_request": _moa_prepared_request,
+                    "tools": copy.deepcopy(agent.tools or []),
+                    "user_initiated_turn": bool(
+                        getattr(agent, "_is_user_initiated_turn", False)
+                    ),
+                    "middleware_context": {
+                        "task_id": effective_task_id,
+                        "turn_id": turn_id,
+                        "api_request_id": f"{turn_id}:api:{api_call_count}",
+                        "session_id": agent.session_id or "",
+                        "platform": agent.platform or "",
+                        "model": agent.model,
+                        "provider": agent.provider,
+                        "base_url": agent.base_url,
+                        "api_mode": agent.api_mode,
+                        "api_call_count": api_call_count,
+                    },
+                },
             )
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
@@ -2799,7 +2847,7 @@ def run_conversation(
                 # echo-back pad for the *current* provider here (idempotent no-op
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
-                _finalized_request = finalize_provider_request(
+                _finalized_request = (_admitted_request if _admitted_request is not None else finalize_provider_request(
                     agent,
                     messages,
                     system_message=effective_system,
@@ -2825,7 +2873,11 @@ def run_conversation(
                         "api_call_count": api_call_count,
                     },
                     consume_user_initiator=True,
-                )
+                ))
+                if _admitted_request is not None and _admitted_request.get(
+                    "_consumes_user_initiator"
+                ):
+                    agent._is_user_initiated_turn = False
                 api_kwargs = _finalized_request["payload"]
                 api_messages = _finalized_request["messages"]
                 tools_for_api = _finalized_request["tools"]

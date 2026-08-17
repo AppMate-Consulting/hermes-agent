@@ -208,7 +208,14 @@ def _seed_here_one_boundary(
     )
     db.append_message(sid, "assistant", "trusted completion consumed")
     if newer_human:
-        db.append_message(sid, "user", "NEWER GENUINE HUMAN TASK")
+        db.append_message(
+            sid,
+            "user",
+            copy.deepcopy(LATEST_TASK),
+            api_content=LATEST_API,
+            display_kind="human_task",
+            display_metadata={"private": {"multimodal": True}},
+        )
         db.append_message(
             sid, "assistant", None,
             tool_calls=[{
@@ -277,7 +284,7 @@ def _assert_here_one_boundary_result(
     active_human = _latest_active_human_task_row(active)
     assert active_human is not None
     expected_task = (
-        "NEWER GENUINE HUMAN TASK" if newer_human
+        LATEST_TASK if newer_human
         else "PRIOR GENUINE HUMAN TASK"
     )
     assert active_human["content"] == expected_task
@@ -293,10 +300,11 @@ def _assert_here_one_boundary_result(
     if newer_human:
         assert before_indexes == []
         assert after_indexes == []
-        assert ContextCompressor._active_task_contract(active) == {
-            "content": expected_task,
-            "sha256": hashlib.sha256(expected_task.encode("utf-8")).hexdigest(),
-        }
+        # Structured human authority suppresses head restoration even though
+        # it cannot be represented by the text-only trusted contract.
+        assert ContextCompressor._active_task_contract(active) is None
+        assert active[:-len(protected_tail)].count(protected_tail[0]) == 0
+        assert active.count(protected_tail[0]) == 1
     else:
         assert len(before_indexes) == len(after_indexes) == 1
         before = before_indexes[0]
@@ -338,7 +346,7 @@ def _assert_here_one_restart_replay(
     active_human = _latest_active_human_task_row(replay)
     assert active_human is not None
     assert active_human["content"] == (
-        "NEWER GENUINE HUMAN TASK" if newer_human
+        LATEST_TASK if newer_human
         else "PRIOR GENUINE HUMAN TASK"
     )
     contract_count = sum(

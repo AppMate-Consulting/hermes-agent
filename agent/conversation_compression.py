@@ -2867,6 +2867,7 @@ def compress_context(
     protected_tail: Optional[list] = None,
     commit_fence: Optional[CompressionCommitFence] = None,
     rejection_cooldown_seconds: Optional[float] = 60.0,
+    live_request_context: Optional[dict] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2928,10 +2929,53 @@ def compress_context(
             "_pending_cli_user_message",
         )
     }
+    _selector_state_snapshot: Optional[tuple[set[str], dict[str, Any]]] = None
+
+    def _copyable_selector_values(values: dict[str, Any]) -> dict[str, Any]:
+        copied: dict[str, Any] = {}
+        for name, value in values.items():
+            if not isinstance(
+                value, (str, bytes, int, float, bool, type(None), dict, list, set, tuple)
+            ):
+                continue
+            try:
+                copied[name] = copy.deepcopy(value)
+            except Exception:
+                continue
+        return copied
+
+    def _restore_selector_state() -> None:
+        """Undo selector-owned mutations when candidate admission aborts."""
+        nonlocal _selector_state_snapshot
+        if _selector_state_snapshot is None:
+            return
+        original_keys, copied_values = _selector_state_snapshot
+        try:
+            live_values = vars(agent.context_compressor)
+        except TypeError:
+            _selector_state_snapshot = None
+            return
+        for name, value in copied_values.items():
+            live_values[name] = copy.deepcopy(value)
+        # Only remove newly-created fields whose current value is safely
+        # copyable.  Opaque locks/clients are never touched by this rollback.
+        for name in set(live_values) - original_keys:
+            if not isinstance(
+                live_values[name],
+                (str, bytes, int, float, bool, type(None), dict, list, set, tuple),
+            ):
+                continue
+            try:
+                copy.deepcopy(live_values[name])
+            except Exception:
+                continue
+            live_values.pop(name, None)
+        _selector_state_snapshot = None
 
     def _restore_uncommitted_input() -> None:
         """Restore all caller-visible input state on a non-commit path."""
         nonlocal messages
+        _restore_selector_state()
         if _caller_messages != _caller_rollback_snapshot:
             _caller_messages[:] = copy.deepcopy(_caller_rollback_snapshot)
         # Adoption rebinds the working transcript.  Abort paths must return
@@ -4213,9 +4257,13 @@ def compress_context(
         # task without misclassifying the completion notification as human.
         from agent.context_compressor import ContextCompressor
 
-        suffix_has_task = bool(
-            _protected_tail_snapshot
-            and ContextCompressor._active_task_contract(
+        # Human authority and text-contract serializability are deliberately
+        # different predicates.  A multimodal human turn cannot be serialized
+        # as the text-only trusted contract, but it is still the newest task
+        # authority and must suppress restoration from the compressed head.
+        suffix_has_task = bool(_protected_tail_snapshot) and (
+            any(_is_real_user_message(row) for row in _protected_tail_snapshot)
+            or ContextCompressor._active_task_contract(
                 _protected_tail_snapshot
             ) is not None
         )
@@ -4304,7 +4352,12 @@ def compress_context(
         # for both bodies.  IDs are deliberately equal: they are request
         # metadata, not transcript state.  Non-deterministic middleware is
         # detected by replay below and admission fails closed.
-        _admission_middleware_context = {
+        # The prepared MoA request may contain an opaque client-owned handle.
+        # Keep the envelope shallow and clone only JSON-shaped fields at their
+        # normal projection boundaries; replaying or deep-copying the handle
+        # would violate the single-preparation contract.
+        _live = dict(live_request_context or {})
+        _admission_middleware_context = _live.get("middleware_context") or {
             "task_id": str(task_id),
             "turn_id": "compression-admission",
             "api_request_id": "compression-admission",
@@ -4316,25 +4369,66 @@ def compress_context(
             "api_mode": str(agent.api_mode or ""),
             "api_call_count": 0,
         }
+        _common_live = {
+            "tools": _live.get("tools", agent.tools or []),
+            "external_prefetch": _live.get("external_prefetch"),
+            "plugin_user_context": _live.get("plugin_user_context"),
+            "prefill_messages": _live.get("prefill_messages"),
+            "sanitize_model": _live.get("sanitize_model"),
+            "current_turn_suffix": _live.get("current_turn_suffix"),
+            "middleware_context": dict(_admission_middleware_context),
+        }
         _finalized_in = finalize_provider_request(
             agent,
             _authoritative_pre_compression_snapshot,
             system_message=_system_prompt_before_compression or "",
-            tools=agent.tools or [],
+            current_turn_user_idx=_live.get("current_turn_user_idx"),
+            incoming_message=_live.get("incoming_message"),
             static_system_prefix=(
                 _cached_static_before_compression
                 if isinstance(_cached_static_before_compression, str)
                 else None
             ),
-            middleware_context=dict(_admission_middleware_context),
+            _frozen_projection=_live.get("frozen_projection"),
+            moa_prepared_request=_live.get("moa_prepared_request"),
+            user_initiated_turn=_live.get("user_initiated_turn"),
+            **_common_live,
         )
         _provider_request_in = _finalized_in["payload"]
+        from agent.turn_context import reanchor_current_turn_user_idx
+
+        _turn_identity = _live.get("current_turn_identity")
+        _candidate_turn_idx = (
+            reanchor_current_turn_user_idx(compressed, _turn_identity)
+            if _turn_identity is not None
+            else None
+        )
+        _candidate_incoming = (
+            compressed[_candidate_turn_idx]
+            if isinstance(_candidate_turn_idx, int)
+            and 0 <= _candidate_turn_idx < len(compressed)
+            else None
+        )
+        try:
+            _selector_values = vars(agent.context_compressor)
+            _selector_state_snapshot = (
+                set(_selector_values),
+                _copyable_selector_values(_selector_values),
+            )
+        except TypeError:
+            _selector_state_snapshot = (set(), {})
         _finalized_out = finalize_provider_request(
             agent,
             compressed,
             system_message=new_system_prompt or "",
-            tools=agent.tools or [],
-            middleware_context=dict(_admission_middleware_context),
+            current_turn_user_idx=_candidate_turn_idx,
+            incoming_message=_candidate_incoming,
+            moa_prepared_request=_live.get("moa_prepared_request"),
+            user_initiated_turn=_live.get("user_initiated_turn"),
+            **_common_live,
+        )
+        _finalized_out["_consumes_user_initiator"] = bool(
+            _live.get("user_initiated_turn") and agent._is_copilot_url()
         )
         _provider_request_out = _finalized_out["payload"]
         _finalized_in_replay = _apply_finalized_request_middleware(
@@ -4415,6 +4509,11 @@ def compress_context(
             _restore_uncommitted_input()
             _release_lock()
             return messages, _system_prompt_before_compression
+
+        # Keep this transaction-local until durable publication succeeds.
+        # Cancellation and DB failure paths must not leak an admitted request
+        # into a later turn.
+        _admitted_finalized_request = _finalized_out
 
         # Exact checkpoint after request sizing and material-admission, before
         # begin_commit() can admit the sole SessionDB transaction.  Candidate
@@ -4767,6 +4866,11 @@ def compress_context(
             agent._last_compression_attempt_in_place = None
             agent._last_compaction_in_place = False
             return messages, _rollback_prompt()
+
+        # The conversation loop consumes this object verbatim on the next
+        # provider dispatch; it must not re-run a stateful selector, MoA
+        # preparation, transport preflight, or middleware after admission.
+        agent._admitted_provider_request = _admitted_finalized_request
 
         # These extension callbacks are deliberately post-persistence AND
         # post-lease. Schedule their semantically ordered chain exactly once;

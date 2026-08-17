@@ -26,6 +26,7 @@ fi
   tests/tui_gateway/test_completion_provenance.py \
   tests/tui_gateway/test_compress_lock_skip.py \
   tests/run_agent/test_compression_persistence.py \
+  tests/run_agent/test_partial_compression_atomicity.py \
   tests/run_agent/test_in_place_compaction.py \
   tests/run_agent/test_pre_compress_memory_context.py \
   tests/run_agent/test_413_compression.py \

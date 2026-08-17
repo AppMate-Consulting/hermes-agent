@@ -5072,21 +5072,38 @@ def _compress_session_history(
     # auto-compaction runs inside the agent loop, not here. Manual
     # compaction bypasses the summary-failure cooldown, matching the CLI
     # and gateway handlers.
-    # The durable publication happens inside _compress_context.  Keep the
-    # host-history mutex from the final version check through that publication
-    # and the host adoption below.  Checking history_version only *after* the
-    # SessionDB CAS committed was too late: a typed prompt could make this
-    # helper report a noncommit while the database had already compacted.
-    # Holding this narrow host transaction also guarantees that the returned
-    # in-memory history and the active durable transcript become visible as one
-    # state transition.  Direct SessionDB writers remain covered by the
-    # transcript-generation CAS in archive_and_compact/publish_compression_child.
-    with session["history_lock"]:
+    # Claim the host generation at the last possible pre-publication boundary.
+    # compress_context calls this only after summary generation and request
+    # admission, then retains the returned release callback across the single
+    # SessionDB transaction.  Thus typed input cannot slip between the version
+    # check and durable commit, while the potentially slow provider call never
+    # owns history_lock.
+    _missing_claim = object()
+    _previous_claim = vars(agent).get(
+        "_claim_compression_host_publication", _missing_claim
+    )
+    _previous_adopt = vars(agent).get(
+        "_adopt_compression_host_publication", _missing_claim
+    )
+
+    def _claim_host_publication():
+        session["history_lock"].acquire()
         if int(session.get("history_version", 0)) != history_version:
-            finalize_context_engine_compression_notification(agent, committed=False)
-            return 0, _get_usage(agent)
-        try:
-            compressed, _ = agent._compress_context(
+            session["history_lock"].release()
+            raise RuntimeError("TUI history changed before compression publication")
+        return session["history_lock"].release
+
+    def _adopt_host_publication(candidate):
+        # Called by compress_context after SQLite succeeds and before it
+        # releases the claim above, making durable and host publication one
+        # externally indivisible transition.
+        session["history"] = candidate
+        session["history_version"] = history_version + 1
+
+    agent._claim_compression_host_publication = _claim_host_publication
+    agent._adopt_compression_host_publication = _adopt_host_publication
+    try:
+        compressed, _ = agent._compress_context(
                 history,
                 None,
                 approx_tokens=approx_tokens,
@@ -5098,29 +5115,41 @@ def _compress_session_history(
                 defer_context_engine_notification=True,
                 protected_tail=tail if partial and tail else None,
             )
-        except Exception:
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=False,
-            )
-            raise
-        # If _compress_context returned unchanged because a concurrent
-        # compression lock is held, raise so callers can surface a clear
-        # message instead of the misleading "No changes from compression".
-        _lock_skipped = getattr(agent, "_compression_skipped_due_to_lock", None)
-        if _lock_skipped is True or isinstance(_lock_skipped, str):
-            agent._compression_skipped_due_to_lock = None
-            finalize_context_engine_compression_notification(
-                agent, committed=False
-            )
-            raise CompressionLockHeld(
-                _lock_skipped if isinstance(_lock_skipped, str) else None
-            )
+    except Exception:
+        finalize_context_engine_compression_notification(agent, committed=False)
+        raise
+    finally:
+        if _previous_claim is _missing_claim:
+            vars(agent).pop("_claim_compression_host_publication", None)
+        else:
+            agent._claim_compression_host_publication = _previous_claim
+        if _previous_adopt is _missing_claim:
+            vars(agent).pop("_adopt_compression_host_publication", None)
+        else:
+            agent._adopt_compression_host_publication = _previous_adopt
 
-        # Still under history_lock: no prompt can interleave between the
-        # authoritative SessionDB publication and host adoption.
-        session["history"] = compressed
-        session["history_version"] = history_version + 1
+    # If _compress_context returned unchanged because a concurrent
+    # compression lock is held, raise so callers can surface a clear message.
+    _lock_skipped = getattr(agent, "_compression_skipped_due_to_lock", None)
+    if _lock_skipped is True or isinstance(_lock_skipped, str):
+        agent._compression_skipped_due_to_lock = None
+        finalize_context_engine_compression_notification(agent, committed=False)
+        raise CompressionLockHeld(
+            _lock_skipped if isinstance(_lock_skipped, str) else None
+        )
+
+    with session["history_lock"]:
+        # A no-DB/test double never invokes the publication claim. Preserve the
+        # ordinary post-summary generation guard for that route.
+        current_version = int(session.get("history_version", 0))
+        if current_version == history_version + 1 and session.get("history") == compressed:
+            pass  # durable route adopted under the prepublication claim
+        elif current_version != history_version:
+            finalize_context_engine_compression_notification(agent, committed=False)
+            return 0, _get_usage(agent)
+        else:
+            session["history"] = compressed
+            session["history_version"] = history_version + 1
     usage = _get_usage(agent)
     return len(history) - len(compressed), usage
 

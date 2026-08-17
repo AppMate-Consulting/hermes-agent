@@ -3767,12 +3767,32 @@ def compress_context(
     def _publish_session_db(operation: Callable[[], None]) -> None:
         """Fence exactly one SessionDB publication and promptly free its lease."""
         nonlocal _commit_fence_entered
+        # A host whose transcript has an independent in-memory generation may
+        # claim that generation immediately before the durable transaction.
+        # The claim returns an optional release callback so the host can hold
+        # only its tiny publication mutex across SQLite -- never across the
+        # summary/provider call above.  TUI uses this to linearize typed input
+        # against durable publication without freezing its composer while the
+        # summarizer runs.
+        _release_host_claim = None
+        _claim_host_publication = getattr(
+            agent, "_claim_compression_host_publication", None
+        )
+        if callable(_claim_host_publication):
+            _release_host_claim = _claim_host_publication()
         if commit_fence is not None:
             _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
             if not _commit_fence_entered:
+                if callable(_release_host_claim):
+                    _release_host_claim()
                 raise _CompressionPublicationCancelled()
         try:
             operation()
+            _adopt_host_publication = getattr(
+                agent, "_adopt_compression_host_publication", None
+            )
+            if callable(_adopt_host_publication):
+                _adopt_host_publication(copy.deepcopy(compressed))
         finally:
             # Publication success/failure is now authoritative.  Neither the
             # fence nor the durable lease may cover provider or bookkeeping
@@ -3780,6 +3800,8 @@ def compress_context(
             if _commit_fence_entered:
                 commit_fence.finish_commit()
                 _commit_fence_entered = False
+            if callable(_release_host_claim):
+                _release_host_claim()
             _release_lock_holder_only()
 
     try:

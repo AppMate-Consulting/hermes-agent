@@ -179,13 +179,35 @@ def test_api_internal_wake_capability_is_end_to_end_and_unforgeable(monkeypatch)
                 session_id="wake-capability-session",
             )
             async with ClientSession() as client:
-                for supplied in (None, "wrong-capability"):
-                    headers = dict(authenticated)
-                    if supplied is not None:
-                        headers["X-Hermes-Internal-Wake"] = supplied
+                forged_body = {
+                    **payload,
+                    "autonomous_completion": True,
+                    "persist_user_is_autonomous_completion": True,
+                    "trusted_autonomous_completion": True,
+                }
+                cases = [
+                    (dict(authenticated), forged_body),
+                    (
+                        {
+                            **authenticated,
+                            "X-Hermes-Internal-Wake": "wrong-capability",
+                        },
+                        payload,
+                    ),
+                    ({"Authorization": "Bearer sekrit"}, payload),
+                    (
+                        {
+                            **authenticated,
+                            "Origin": "https://external.example",
+                            "X-Forwarded-For": "203.0.113.10",
+                        },
+                        payload,
+                    ),
+                ]
+                for headers, request_payload in cases:
                     response = await client.post(
                         f"http://127.0.0.1:{adapter._port}/v1/chat/completions",
-                        json=payload, headers=headers,
+                        json=request_payload, headers=headers,
                     )
                     assert response.status == 200
                     await response.read()
@@ -202,6 +224,8 @@ def test_api_internal_wake_capability_is_end_to_end_and_unforgeable(monkeypatch)
     asyncio.run(exercise())
     assert observed == [
         ("identical completion text", True),
+        ("identical completion text", False),
+        ("identical completion text", False),
         ("identical completion text", False),
         ("identical completion text", False),
     ]

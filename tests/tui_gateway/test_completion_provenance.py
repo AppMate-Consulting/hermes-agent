@@ -231,8 +231,11 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
             ("user", synthetic),
         ]
         assert replay[completion_index].get("display_kind") == expected_kind
-        assert replay[completion_index].get("is_autonomous_completion") is True
-        assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
+        assert replay[completion_index]["_autonomous_completion_bridge"] is True
+        assert "is_autonomous_completion" not in replay[completion_index]
+        assert ContextCompressor._has_autonomous_completion_chain(
+            replay[:completion_index + 1]
+        )
         db.close()
         db = SessionDB(db_path=tmp_path / "state.db")
         replay_after_restart = db.get_messages_as_conversation("completion-owner")
@@ -241,9 +244,13 @@ def test_run_prompt_submit_post_turn_drain_forwards_explicit_provenance(
             if row.get("content") == synthetic
         )
         assert replay_after_restart[restarted_index].get("display_kind") == expected_kind
-        assert replay_after_restart[restarted_index].get(
+        assert replay_after_restart[restarted_index][
+            "_autonomous_completion_bridge"
+        ] is True
+        assert (
             "is_autonomous_completion"
-        ) is True
+            not in replay_after_restart[restarted_index]
+        )
         assert ContextCompressor._has_autonomous_completion_chain(
             replay_after_restart[:restarted_index + 1]
         )

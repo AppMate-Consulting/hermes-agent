@@ -4388,6 +4388,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                trusted_autonomous_completion=_trusted_internal_completion,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")

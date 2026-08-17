@@ -1284,8 +1284,12 @@ async def test_hygiene_terminal_failure_ladder_advances_after_expiry_and_restart
             self.close = MagicMock()
 
         def _compress_context(self, messages, *_args, **_kwargs):
-            self._last_compression_outcome = outcome
-            return messages, ""
+            if outcome == "persistence_failure":
+                self._last_compression_outcome = outcome
+                return messages, ""
+            if outcome == "compression_exception_RuntimeError":
+                self._last_compression_outcome = outcome
+            raise RuntimeError("synthetic hygiene failure")
 
     deadlines = []
     for expected_streak, multiplier in ((1, 1), (2, 3), (3, 9)):

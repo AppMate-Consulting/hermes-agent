@@ -13,11 +13,15 @@ exec "$repo_root/scripts/run_tests.sh" \
   tests/agent/test_request_admission_ownership.py \
   tests/agent/test_compression_anti_thrash_persistence.py \
   tests/agent/test_compression_anti_thrash_recovery.py \
+  tests/agent/test_compression_concurrent_fork.py \
   tests/gateway/test_buzz_adapter.py \
   tests/gateway/test_buzz_websocket.py \
   tests/gateway/test_wake_delivery.py \
   tests/gateway/test_api_server.py \
   tests/gateway/test_session_hygiene.py \
+  tests/gateway/test_session_race_guard.py \
+  tests/gateway/test_delivery_ledger.py \
+  tests/gateway/test_delivery_ledger_producer.py \
   tests/gateway/test_hygiene_failure_cooldown_ladder.py \
   tests/gateway/test_compress_command.py \
   tests/cli/test_manual_compress.py \

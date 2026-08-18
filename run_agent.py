@@ -3205,23 +3205,34 @@ class AIAgent:
             event = getattr(self, "_hard_interrupt_requested", None)
             if event is None:
                 return
-            fence = vars(self).get("_active_compression_commit_fence")
-            cancel_before_commit = getattr(
-                type(fence), "cancel_before_commit", None
+            registration_lock = vars(self).setdefault(
+                "_compression_commit_fence_lock", threading.RLock()
             )
-            if callable(cancel_before_commit):
+            with registration_lock:
+                fences = tuple(
+                    vars(self).get("_active_compression_commit_fences", {}).values()
+                )
+                # Close admission before releasing the registry lock. A
+                # compression attempt registered after this snapshot will see
+                # the event in begin_commit(), while every attempt registered
+                # before it is cancelled or joined below.
+                event.set()
+            for fence in fences:
+                cancel_before_commit = getattr(
+                    type(fence), "cancel_before_commit", None
+                )
+                if not callable(cancel_before_commit):
+                    continue
                 try:
-                    # This sets the Event while holding the same lock used by
-                    # begin_commit(). If commit already won, it waits for that
-                    # tracked mutation to finish before publishing the stop.
+                    # If commit already won, this waits for that attempt's
+                    # mutation to finish. Pending attempts are cancelled.
                     cancel_before_commit(fence, event)
-                    return
                 except Exception:
                     logger.debug(
                         "Compression hard-cancel fence admission failed",
                         exc_info=True,
                     )
-            event.set()
+            return
 
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
@@ -7911,17 +7922,17 @@ class AIAgent:
         # cancel admission against begin_commit().
         active_fence = commit_fence or CompressionCommitFence()
         # A single agent can receive overlapping automatic/manual entrypoints.
-        # Serialize fence publication so a waiter cannot replace the fence of
-        # the attempt currently generating/committing a summary.
+        # Register every attempt by identity so a hard stop can join all
+        # already-admitted commits and cancel every pending one.
         fence_registration_lock = vars(self).setdefault(
             "_compression_commit_fence_lock", threading.RLock()
         )
+        fence_registration_token = object()
         with fence_registration_lock:
-            missing_fence = object()
-            previous_fence = vars(self).get(
-                "_active_compression_commit_fence", missing_fence
+            active_fences = vars(self).setdefault(
+                "_active_compression_commit_fences", {}
             )
-            self._active_compression_commit_fence = active_fence
+            active_fences[fence_registration_token] = active_fence
         try:
             def _run(fence=None, target_messages=None):
                 return compress_context(
@@ -8111,10 +8122,12 @@ class AIAgent:
             return result
         finally:
             with fence_registration_lock:
-                if previous_fence is missing_fence:
-                    vars(self).pop("_active_compression_commit_fence", None)
-                else:
-                    self._active_compression_commit_fence = previous_fence
+                active_fences = vars(self).get(
+                    "_active_compression_commit_fences", {}
+                )
+                active_fences.pop(fence_registration_token, None)
+                if not active_fences:
+                    vars(self).pop("_active_compression_commit_fences", None)
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.
             if token is not None:

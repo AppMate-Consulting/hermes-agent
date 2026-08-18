@@ -1700,6 +1700,104 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
     assert db.get_compression_lock_holder(session_id) is None
 
 
+@pytest.mark.parametrize("completion_order", ["older_first", "newer_first"])
+def test_hard_stop_fences_all_overlapping_compression_attempts(
+    tmp_path: Path, monkeypatch, completion_order: str
+) -> None:
+    """A latest registration cannot hide an older admitted commit from stop."""
+    from agent import conversation_compression as compression_module
+    from agent.conversation_compression import CompressionCommitFence
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = f"OVERLAPPING_FENCES_{completion_order}"
+    db.create_session(session_id, source="tui")
+    agent = _build_agent_with_db(db, session_id)
+    messages = [{"role": "user", "content": "unchanged"}]
+    older_fence = CompressionCommitFence()
+    newer_fence = CompressionCommitFence()
+    older_committing = threading.Event()
+    newer_entered = threading.Event()
+    release_older = threading.Event()
+    release_newer = threading.Event()
+    newer_admitted: list[bool] = []
+
+    def _controlled_compress(_agent, current, _system, *, commit_fence, **_kwargs):
+        if commit_fence is older_fence:
+            assert commit_fence.begin_commit(agent._hard_interrupt_requested)
+            older_committing.set()
+            assert release_older.wait(timeout=5)
+            commit_fence.finish_commit()
+        else:
+            newer_entered.set()
+            assert release_newer.wait(timeout=5)
+            admitted = commit_fence.begin_commit(agent._hard_interrupt_requested)
+            newer_admitted.append(admitted)
+            if admitted:
+                commit_fence.finish_commit()
+        return current, "sys"
+
+    monkeypatch.setattr(compression_module, "compress_context", _controlled_compress)
+    results: dict[str, tuple] = {}
+    older = threading.Thread(
+        target=lambda: results.setdefault(
+            "older",
+            agent._compress_context(messages, "sys", commit_fence=older_fence),
+        ),
+        daemon=True,
+    )
+    newer = threading.Thread(
+        target=lambda: results.setdefault(
+            "newer",
+            agent._compress_context(messages, "sys", commit_fence=newer_fence),
+        ),
+        daemon=True,
+    )
+    older.start()
+    assert older_committing.wait(timeout=2)
+    newer.start()
+    assert newer_entered.wait(timeout=2)
+    assert set(agent._active_compression_commit_fences.values()) == {
+        older_fence,
+        newer_fence,
+    }
+
+    stop_returned = threading.Event()
+    stop = threading.Thread(
+        target=lambda: (
+            agent.hard_interrupt("stop every overlapping compression"),
+            stop_returned.set(),
+        ),
+        daemon=True,
+    )
+    stop.start()
+    assert not stop_returned.wait(timeout=0.1)
+
+    if completion_order == "newer_first":
+        release_newer.set()
+        newer.join(timeout=2)
+        assert not newer.is_alive()
+        assert not stop_returned.is_set()
+        release_older.set()
+    else:
+        release_older.set()
+        older.join(timeout=2)
+        assert not older.is_alive()
+        stop.join(timeout=2)
+        assert stop_returned.is_set()
+        release_newer.set()
+
+    older.join(timeout=5)
+    newer.join(timeout=5)
+    stop.join(timeout=5)
+    assert not older.is_alive()
+    assert not newer.is_alive()
+    assert not stop.is_alive()
+    assert stop_returned.is_set()
+    assert newer_admitted == [False]
+    assert results == {"older": (messages, "sys"), "newer": (messages, "sys")}
+    assert "_active_compression_commit_fences" not in vars(agent)
+
+
 @pytest.mark.parametrize("deadline_offset", [-10.0, 0.05, None])
 def test_force_cancel_restores_exact_expired_or_expiring_cooldown_row(
     tmp_path: Path,

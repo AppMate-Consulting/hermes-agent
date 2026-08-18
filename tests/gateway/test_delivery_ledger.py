@@ -36,6 +36,8 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         chat_id=kw.get("chat_id", "C1"),
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
+        routing_metadata=kw.get("routing_metadata"),
+        reply_to=kw.get("reply_to"),
     )
 
 
@@ -180,10 +182,63 @@ class TestGatewayRedeliverySweep:
         sent = adapter.send.call_args.kwargs
         assert sent["content"] == "the final answer"  # no marker
         assert sent["metadata"] == {"thread_id": "171.001"}
+        assert sent["reply_to"] is None
         assert _row("ob-1")["state"] == "delivered"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )
+
+    @pytest.mark.asyncio
+    async def test_recovery_preserves_exact_reply_anchor_and_routing(self):
+        _record(
+            chat_id="C-exact",
+            thread_id="thread-exact",
+            routing_metadata={"thread_id": "thread-exact", "scope": "team-a"},
+            reply_to=987654321,
+        )
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 1
+
+        assert adapter.send.call_args.kwargs == {
+            "chat_id": "C-exact",
+            "content": "the final answer",
+            "reply_to": 987654321,
+            "metadata": {"thread_id": "thread-exact", "scope": "team-a"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_legacy_row_without_reply_field_recovers_with_none(self):
+        with dl._connect() as conn:
+            conn.execute(
+                """INSERT INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, thread_id,
+                    content, state, attempts, created_at, updated_at,
+                    owner_pid, owner_started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                (
+                    "legacy-ob",
+                    "agent:main:slack:channel:C1",
+                    "slack",
+                    "C1",
+                    "legacy-thread",
+                    "legacy answer",
+                    time.time(),
+                    time.time(),
+                    999999999,
+                    1,
+                ),
+            )
+        adapter = self._adapter()
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 1
+        assert adapter.send.call_args.kwargs["reply_to"] is None
+        assert adapter.send.call_args.kwargs["metadata"] == {
+            "thread_id": "legacy-thread"
+        }
 
     @pytest.mark.asyncio
     async def test_attempting_redelivers_with_marker(self):

@@ -2347,6 +2347,36 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5": 272_000,
 }
 
+# Codex OAuth still advertises 272K for these models even though eligible
+# ChatGPT subscriptions now receive the 1M context rollout. 900K retains
+# output headroom below that total window. Apply this only to the known-stale
+# 272K value: any different catalogue value is a provider change that must be
+# trusted verbatim. GPT-5.4 is exact so GPT-5.4-mini remains excluded.
+_CODEX_OAUTH_LARGE_CONTEXT_PREFIXES: Dict[str, int] = {
+    "gpt-5.6": 900_000,
+}
+_CODEX_OAUTH_LARGE_CONTEXT_EXACT: Dict[str, int] = {
+    "gpt-5.4": 900_000,
+}
+_CODEX_OAUTH_STALE_ADVERTISED_CONTEXT = 272_000
+
+
+def _correct_stale_codex_oauth_context(model: str, context_length: int) -> int:
+    """Lift only the stale Codex OAuth 272K value for eligible model slugs."""
+    slug = (model or "").strip().lower()
+    corrected = _CODEX_OAUTH_LARGE_CONTEXT_EXACT.get(slug)
+    if corrected is None:
+        for prefix, candidate in _CODEX_OAUTH_LARGE_CONTEXT_PREFIXES.items():
+            if slug == prefix or slug.startswith(prefix + "-") or slug.startswith(prefix + "."):
+                corrected = candidate
+                break
+    if (
+        corrected is not None
+        and context_length == _CODEX_OAUTH_STALE_ADVERTISED_CONTEXT
+    ):
+        return corrected
+    return context_length
+
 
 _codex_oauth_context_cache: Dict[str, Tuple[Dict[str, int], float]] = {}
 _CODEX_OAUTH_CONTEXT_CACHE_TTL = 3600  # 1 hour
@@ -2478,12 +2508,14 @@ def _resolve_codex_oauth_context_length_with_source(
         live, fresh_probe = _fetch_codex_oauth_context_lengths_with_source(access_token)
         live_source = "live" if fresh_probe else "memory"
         if model_bare in live:
-            return live[model_bare], live_source
+            return _correct_stale_codex_oauth_context(
+                model_bare, live[model_bare]
+            ), live_source
         # Case-insensitive match in case casing drifts
         model_lower = model_bare.lower()
         for slug, ctx in live.items():
             if slug.lower() == model_lower:
-                return ctx, live_source
+                return _correct_stale_codex_oauth_context(model_bare, ctx), live_source
 
     # Fallback: longest-key-first substring match over hardcoded defaults.
     model_lower = model_bare.lower()
@@ -2491,7 +2523,7 @@ def _resolve_codex_oauth_context_length_with_source(
         _CODEX_OAUTH_CONTEXT_FALLBACK.items(), key=lambda x: len(x[0]), reverse=True
     ):
         if slug in model_lower:
-            return ctx, "fallback"
+            return _correct_stale_codex_oauth_context(model_bare, ctx), "fallback"
 
     return None, ""
 

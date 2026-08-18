@@ -401,12 +401,12 @@ class TestCodexOAuthContextLength:
         first_response = MagicMock()
         first_response.status_code = 200
         first_response.json.return_value = {
-            "models": [{"slug": "gpt-5.6-terra", "context_window": 272_000}]
+            "models": [{"slug": "gpt-5.5", "context_window": 272_000}]
         }
         second_response = MagicMock()
         second_response.status_code = 200
         second_response.json.return_value = {
-            "models": [{"slug": "gpt-5.6-terra", "context_window": 372_000}]
+            "models": [{"slug": "gpt-5.5", "context_window": 372_000}]
         }
 
         with patch(
@@ -414,19 +414,19 @@ class TestCodexOAuthContextLength:
             side_effect=[first_response, second_response],
         ) as mock_get, patch("agent.model_metadata.save_context_length") as mock_save:
             first = get_model_context_length(
-                "gpt-5.6-terra",
+                "gpt-5.5",
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="token-account-a",
                 provider="openai-codex",
             )
             first_again = get_model_context_length(
-                "gpt-5.6-terra",
+                "gpt-5.5",
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="token-account-a",
                 provider="openai-codex",
             )
             second = get_model_context_length(
-                "gpt-5.6-terra",
+                "gpt-5.5",
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="token-account-b",
                 provider="openai-codex",
@@ -478,7 +478,7 @@ class TestCodexOAuthContextLength:
         monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
 
         base_url = "https://chatgpt.com/backend-api/codex"
-        stale_key = f"gpt-5.6-terra@{base_url}"
+        stale_key = f"gpt-5.5@{base_url}"
         other_key = "other-model@https://api.openai.com/v1/"
         import yaml as _yaml
         cache_file.write_text(_yaml.dump({"context_lengths": {
@@ -489,14 +489,14 @@ class TestCodexOAuthContextLength:
         fake_response = MagicMock()
         fake_response.status_code = 200
         fake_response.json.return_value = {
-            "models": [{"slug": "gpt-5.6-terra", "context_window": live_context}]
+            "models": [{"slug": "gpt-5.5", "context_window": live_context}]
         }
         # Exercise real persistence here: this test verifies that a live value
         # replaces the stale on-disk entry. Failure-path tests below mock the
         # writer because they assert that fallback values are not persisted.
         with patch("agent.model_metadata.requests.get", return_value=fake_response) as mock_get:
             ctx = mm.get_model_context_length(
-                model="gpt-5.6-terra",
+                model="gpt-5.5",
                 base_url=base_url,
                 api_key="fake-token",
                 provider="openai-codex",
@@ -509,6 +509,128 @@ class TestCodexOAuthContextLength:
         )
         assert remaining.get(stale_key) == live_context
         assert remaining.get(other_key) == 128_000
+
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol-2026-08-16",
+            "gpt-5.6.2026-08-16",
+            "gpt-5.4",
+        ],
+    )
+    def test_stale_272k_catalogue_value_is_corrected_to_900k(self, slug):
+        from agent.model_metadata import get_model_context_length
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "models": [{"slug": slug, "context_window": 272_000}]
+        }
+        with patch("agent.model_metadata.requests.get", return_value=response), \
+             patch("agent.model_metadata.save_context_length") as mock_save:
+            resolved = get_model_context_length(
+                slug,
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
+
+        assert resolved == 900_000
+        mock_save.assert_called_once_with(
+            slug, "https://chatgpt.com/backend-api/codex", 900_000
+        )
+
+    @pytest.mark.parametrize("advertised", [200_000, 372_000, 1_050_000])
+    def test_non_272k_catalogue_value_is_trusted_verbatim(self, advertised):
+        from agent.model_metadata import get_model_context_length
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "models": [{"slug": "gpt-5.6-sol", "context_window": advertised}]
+        }
+        with patch("agent.model_metadata.requests.get", return_value=response), \
+             patch("agent.model_metadata.save_context_length"):
+            resolved = get_model_context_length(
+                "gpt-5.6-sol",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
+
+        assert resolved == advertised
+
+    @pytest.mark.parametrize("slug", ["gpt-5.5", "gpt-5.4-mini"])
+    def test_ineligible_272k_codex_models_remain_unchanged(self, slug):
+        from agent.model_metadata import get_model_context_length
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "models": [{"slug": slug, "context_window": 272_000}]
+        }
+        with patch("agent.model_metadata.requests.get", return_value=response), \
+             patch("agent.model_metadata.save_context_length"):
+            resolved = get_model_context_length(
+                slug,
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
+
+        assert resolved == 272_000
+
+    @pytest.mark.parametrize("slug", ["gpt-5.6-luna", "gpt-5.4"])
+    def test_probe_failure_corrects_eligible_fallback_without_persisting(self, slug):
+        from agent.model_metadata import get_model_context_length
+
+        response = MagicMock(status_code=401)
+        with patch("agent.model_metadata.requests.get", return_value=response), \
+             patch("agent.model_metadata.save_context_length") as mock_save:
+            resolved = get_model_context_length(
+                slug,
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="expired-token",
+                provider="openai-codex",
+            )
+
+        assert resolved == 900_000
+        mock_save.assert_not_called()
+
+    def test_memory_catalogue_keeps_source_and_does_not_persist_again(self):
+        from agent.model_metadata import get_model_context_length
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "models": [{"slug": "gpt-5.6-terra", "context_window": 272_000}]
+        }
+        kwargs = {
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "same-token",
+            "provider": "openai-codex",
+        }
+        with patch("agent.model_metadata.requests.get", return_value=response) as mock_get, \
+             patch("agent.model_metadata.save_context_length") as mock_save:
+            first = get_model_context_length("gpt-5.6-terra", **kwargs)
+            second = get_model_context_length("gpt-5.6-terra", **kwargs)
+
+        assert (first, second) == (900_000, 900_000)
+        mock_get.assert_called_once()
+        mock_save.assert_called_once()
+
+    def test_direct_openai_api_does_not_apply_codex_oauth_correction(self):
+        from agent.model_metadata import get_model_context_length
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=272_000):
+            resolved = get_model_context_length(
+                "gpt-5.6-sol",
+                base_url="https://api.openai.com/v1",
+                api_key="fake-key",
+                provider="openai",
+            )
+
+        assert resolved == 272_000
 
 
 

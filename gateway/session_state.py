@@ -157,14 +157,15 @@ class PersistentState:
     # escalate its cooldown instead of retrying on a flat interval forever.
     # Reset on a successful compression, not by turn/boundary resets.
     #
-    # PROCESS-LOCAL, deliberately: `PersistentState` means "survives turn and
-    # boundary resets", NOT "survives a restart" — this field has no disk flush
-    # (unlike `pending_command_text` above, #72680), so a gateway restart drops
-    # escalation back to rung 1 while the DB-backed deadline itself survives
-    # (#74136). Keying on `session_key` rather than `session_id` is what buys
+    # Durable across restarts: SessionDB is authoritative (the per-session
+    # ``sessions.hygiene_failure_streak`` rung advanced by
+    # ``record_hygiene_failure`` and copied onto compression children, plus
+    # the rotation-stable ``gateway_hygiene_state`` mirror keyed by
+    # ``session_key``); this field is only the hot in-process view for
+    # gateway code that already holds the conversation-keyed state object.
+    # Keying on ``session_key`` rather than ``session_id`` is what buys
     # correctness across compaction ROTATION (the sid changes, the chat does
-    # not). gateway.run mirrors this value to the DB keyed by session_key so
-    # the same semantics also survive gateway restarts.
+    # not).
     hygiene_failure_streak: int = 0
 
 

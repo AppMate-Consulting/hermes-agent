@@ -5136,7 +5136,6 @@ def _compress_session_history(
     from agent.model_metadata import estimate_request_tokens_rough
     from hermes_cli.partial_compress import (
         parse_partial_compress_args,
-        rejoin_compressed_head_and_tail,
         split_history_for_partial_compress,
     )
 
@@ -5183,56 +5182,126 @@ def _compress_session_history(
     # auto-compaction runs inside the agent loop, not here. Manual
     # compaction bypasses the summary-failure cooldown, matching the CLI
     # and gateway handlers.
+    # Claim the host generation at the last possible pre-publication boundary.
+    # compress_context calls this only after summary generation and request
+    # admission, then retains the returned release callback across the single
+    # SessionDB transaction.  Thus typed input cannot slip between the version
+    # check and durable commit, while the potentially slow provider call never
+    # owns history_lock.
+    _missing_claim = object()
+    _previous_claim = vars(agent).get(
+        "_claim_compression_host_publication", _missing_claim
+    )
+    _previous_adopt = vars(agent).get(
+        "_adopt_compression_host_publication", _missing_claim
+    )
+
+    def _claim_host_publication():
+        session["history_lock"].acquire()
+        if int(session.get("history_version", 0)) != history_version:
+            session["history_lock"].release()
+            raise RuntimeError("TUI history changed before compression publication")
+        return session["history_lock"].release
+
+    def _adopt_host_publication(candidate):
+        # Called by compress_context after SQLite succeeds and before it
+        # releases the claim above, making durable and host publication one
+        # externally indivisible transition.
+        session["history"] = candidate
+        session["history_version"] = history_version + 1
+
+    agent._claim_compression_host_publication = _claim_host_publication
+    agent._adopt_compression_host_publication = _adopt_host_publication
     try:
         compressed, _ = agent._compress_context(
-            head,
-            None,
-            approx_tokens=approx_tokens,
-            # Partial compress has no focus topic (the modes are exclusive;
-            # parse_partial_compress_args returns focus_topic=None for the
-            # boundary-aware forms).
-            focus_topic=focus_topic or None,
-            force=True,
-            defer_context_engine_notification=True,
+                history,
+                None,
+                approx_tokens=approx_tokens,
+                # Partial compress has no focus topic (the modes are exclusive;
+                # parse_partial_compress_args returns focus_topic=None for the
+                # boundary-aware forms).
+                focus_topic=focus_topic or None,
+                force=True,
+                defer_context_engine_notification=True,
+                protected_tail=tail if partial and tail else None,
+            )
+    except Exception as exc:
+        from agent.conversation_compression import (
+            CompressionCommittedPostpublicationError,
         )
-    except Exception:
-        finalize_context_engine_compression_notification(
-            agent,
-            committed=False,
-        )
+        if isinstance(exc, CompressionCommittedPostpublicationError):
+            agent.session_id = exc.session_id
+            session["committed_session_id"] = exc.session_id
+            try:
+                authoritative = exc.load_authoritative_transcript(agent)
+            except Exception as reconcile_error:
+                with session["history_lock"]:
+                    session["history"] = []
+                    session["history_version"] = max(
+                        int(session.get("history_version", 0)), history_version + 1
+                    )
+                    session["compression_reconciliation_required"] = str(
+                        reconcile_error
+                    )
+                finalize_context_engine_compression_notification(agent, committed=True)
+                setattr(agent, "_last_compression_postcommit_warning", str(exc.cause))
+                raise RuntimeError(
+                    "compression committed; durable reconciliation required"
+                ) from reconcile_error
+            with session["history_lock"]:
+                session["history"] = authoritative
+                session["history_version"] = max(
+                    int(session.get("history_version", 0)), history_version + 1
+                )
+                session.pop("compression_reconciliation_required", None)
+            finalize_context_engine_compression_notification(agent, committed=True)
+            setattr(agent, "_last_compression_postcommit_warning", str(exc.cause))
+            return len(history) - len(authoritative), _get_usage(agent)
+        finalize_context_engine_compression_notification(agent, committed=False)
         raise
+    finally:
+        if _previous_claim is _missing_claim:
+            vars(agent).pop("_claim_compression_host_publication", None)
+        else:
+            agent._claim_compression_host_publication = _previous_claim
+        if _previous_adopt is _missing_claim:
+            vars(agent).pop("_adopt_compression_host_publication", None)
+        else:
+            agent._adopt_compression_host_publication = _previous_adopt
+
     # If _compress_context returned unchanged because a concurrent
-    # compression lock is held, raise so callers can surface a clear
-    # message instead of the misleading "No changes from compression" text.
-    # Type-pinned (is True / str): real values are None/True/holder-string;
-    # bare truthiness is fooled by MagicMock auto-attrs on test doubles.
+    # compression lock is held, raise so callers can surface a clear message.
     _lock_skipped = getattr(agent, "_compression_skipped_due_to_lock", None)
     if _lock_skipped is True or isinstance(_lock_skipped, str):
         agent._compression_skipped_due_to_lock = None
-        # No boundary was committed on a lock-skip; discard any pending
-        # deferred context-engine notification (exactly-once, no-op safe).
-        finalize_context_engine_compression_notification(
-            agent,
-            committed=False,
-        )
+        finalize_context_engine_compression_notification(agent, committed=False)
         raise CompressionLockHeld(
             _lock_skipped if isinstance(_lock_skipped, str) else None
         )
 
-    if partial and tail:
-        compressed = rejoin_compressed_head_and_tail(compressed, tail)
     with session["history_lock"]:
-        if int(session.get("history_version", 0)) != history_version:
-            # External mutation during compaction — drop the compressed
-            # result so we don't clobber concurrent edits.
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=False,
-            )
-            usage = _get_usage(agent)
-            return 0, usage
-        session["history"] = compressed
-        session["history_version"] = history_version + 1
+        # A no-DB/test double never invokes the publication claim. Preserve the
+        # ordinary post-summary generation guard for that route.
+        current_version = int(session.get("history_version", 0))
+        if current_version == history_version + 1 and session.get("history") == compressed:
+            pass  # durable route adopted under the prepublication claim
+        elif current_version != history_version:
+            finalize_context_engine_compression_notification(agent, committed=False)
+            return 0, _get_usage(agent)
+        else:
+            from agent.conversation_compression import compression_outcome_committed
+
+            outcome = getattr(agent, "_last_compression_outcome", None)
+            committed = compression_outcome_committed(outcome)
+            if not isinstance(outcome, str):
+                committed = compressed != history
+            if not committed:
+                finalize_context_engine_compression_notification(
+                    agent, committed=False
+                )
+                return 0, _get_usage(agent)
+            session["history"] = compressed
+            session["history_version"] = history_version + 1
     usage = _get_usage(agent)
     return len(history) - len(compressed), usage
 
@@ -10062,9 +10131,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    is_autonomous_completion=True,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, is_autonomous_completion=True
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10140,9 +10212,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    is_autonomous_completion=True,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, is_autonomous_completion=True
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10478,12 +10553,24 @@ def _run_prompt_submit(
     *,
     display_kind: str | None = None,
     display_metadata: dict | None = None,
+    is_autonomous_completion: bool = False,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
+            return False
+        if session.get("compression_reconciliation_required"):
+            session["running"] = False
+            _emit(
+                "message.error",
+                sid,
+                error=(
+                    "Session blocked: committed compression requires durable "
+                    "reconciliation; no new turn started."
+                ),
+            )
             return False
         if (
             queued_prompt_generation is not None
@@ -10812,6 +10899,11 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if (
+                is_autonomous_completion
+                and "persist_user_is_autonomous_completion" in _run_params
+            ):
+                run_kwargs["persist_user_is_autonomous_completion"] = True
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -11406,7 +11498,23 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        display_kind=(
+                            "async_delegation_complete"
+                            if _evt.get("type") == "async_delegation"
+                            else None
+                        ),
+                        display_metadata=(
+                            _async_delegation_display_metadata(_evt)
+                            if _evt.get("type") == "async_delegation"
+                            else None
+                        ),
+                        is_autonomous_completion=True,
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
@@ -13909,6 +14017,14 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _lines = [_fb["headline"], _fb["token_line"]]
             if _fb.get("note"):
                 _lines.append(_fb["note"])
+            _postcommit_warning = vars(agent).pop(
+                "_last_compression_postcommit_warning", None
+            )
+            if _postcommit_warning:
+                _lines.append(
+                    "Compression committed; recovered after a postcommit "
+                    f"synchronization error: {_postcommit_warning}"
+                )
             finalize_context_engine_compression_notification(
                 agent,
                 committed=True,

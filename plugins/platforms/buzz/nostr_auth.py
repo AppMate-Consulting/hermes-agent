@@ -207,10 +207,40 @@ def build_auth_event(
             raise ValueError("BUZZ_AUTH_TAG must be a four-string auth tag")
         tags.append(auth_tag)
 
+    return build_signed_event(
+        private_key=private_key,
+        kind=22242,
+        tags=tags,
+        content="",
+        created_at=created_at,
+        auxiliary_randomness=auxiliary_randomness,
+    )
+
+
+def build_signed_event(
+    *,
+    private_key: str,
+    kind: int,
+    tags: list[list[str]],
+    content: str,
+    created_at: Optional[int] = None,
+    auxiliary_randomness: Optional[bytes] = None,
+) -> dict[str, Any]:
+    """Build and BIP-340-sign a canonical Nostr event."""
+    if not isinstance(kind, int) or isinstance(kind, bool) or kind < 0:
+        raise ValueError("event kind must be a non-negative integer")
+    if not isinstance(content, str):
+        raise ValueError("event content must be a string")
+    if not isinstance(tags, list) or any(
+        not isinstance(tag, list) or not all(isinstance(part, str) for part in tag)
+        for tag in tags
+    ):
+        raise ValueError("event tags must be lists of strings")
+
     pubkey = public_key_hex(private_key)
     timestamp = int(time.time()) if created_at is None else int(created_at)
     serialized = json.dumps(
-        [0, pubkey, timestamp, 22242, tags, ""],
+        [0, pubkey, timestamp, kind, tags, content],
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode()
@@ -219,9 +249,9 @@ def build_auth_event(
         "id": event_id.hex(),
         "pubkey": pubkey,
         "created_at": timestamp,
-        "kind": 22242,
+        "kind": kind,
         "tags": tags,
-        "content": "",
+        "content": content,
         "sig": schnorr_sign(
             event_id,
             private_key,

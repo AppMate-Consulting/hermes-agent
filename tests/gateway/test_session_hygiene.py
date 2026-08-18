@@ -495,6 +495,10 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     # The DB-backed cooldown check calls this before compressing; a bare
     # MagicMock return would be truthy and skip compression entirely.
     fake_db.get_compression_failure_cooldown.return_value = None
+    fake_db.record_hygiene_failure.return_value = {
+        "streak": 1,
+        "cooldown_until": time.time() + 120,
+    }
 
     class SlowCompressAgent:
         last_instance = None
@@ -614,10 +618,10 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert runner._run_agent.await_count == 1
     # Cooldown must be persisted to the state DB (survives restart, #74136),
     # not stashed in an in-memory dict.
-    assert fake_db.record_compression_failure_cooldown.called
-    _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
-    assert _cd_args[0] == "sess-timeout"
-    assert _cd_args[1] > time.time()
+    fake_db.record_hygiene_failure.assert_called_once_with(
+        "sess-timeout", 120.0,
+        "session hygiene compression timed out with no output from the summary model",
+    )
     timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
     assert len(timeout_warnings) == 1
     fake_db.archive_and_compact.assert_not_called()
@@ -769,7 +773,10 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     monkeypatch.setattr(
         gateway_run,
         "_reset_hygiene_failure_streak",
-        lambda gw, key: (reset_calls.append(key), _real_reset(gw, key))[1],
+        lambda gw, key, session_id: (
+            reset_calls.append((key, session_id)),
+            _real_reset(gw, key, session_id),
+        )[1],
     )
 
     result = await runner._handle_message(event)
@@ -1079,6 +1086,87 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [
+    "rejected_would_grow",
+    "rejected_no_progress",
+    "rejected_below_minimum_reclaim",
+])
+async def test_hygiene_policy_rejections_cool_down_without_rewrite(
+    monkeypatch, tmp_path, caplog, outcome
+):
+    """Bind typed policy rejection handling through the real hygiene call site."""
+    from hermes_state import SessionDB
+    import gateway.run as gateway_run
+
+    sid = f"hygiene-{outcome}"
+    db = SessionDB(db_path=tmp_path / f"{outcome}.db")
+    db.create_session(sid, "telegram")
+
+    class RejectedAgent:
+        calls = 0
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", sid)
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self._last_compression_outcome = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_summary_error=None,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            type(self).calls += 1
+            self._last_compression_outcome = outcome
+            return messages, None
+
+    runner, _adapter, event = _make_cooldown_runner(
+        monkeypatch, tmp_path, RejectedAgent, db, sid
+    )
+    session_key = "agent:main:telegram:dm:12345"
+    runner._session_state(session_key).persistent.hygiene_failure_streak = 1
+    recorded = []
+    real_record = gateway_run._record_hygiene_failure
+
+    def record(gateway, key, session_id, seconds, reason=None):
+        recorded.append((session_id, seconds, reason))
+        return real_record(gateway, key, session_id, seconds, reason)
+
+    monkeypatch.setattr(gateway_run, "_record_hygiene_failure", record)
+    caplog.set_level("INFO", logger="gateway.run")
+    assert await runner._handle_message(event) == "ok"
+    runner.session_store.rewrite_transcript.assert_not_called()
+    assert RejectedAgent.calls == 1
+    assert recorded == [(sid, 300.0, outcome.removeprefix("rejected_"))]
+    assert runner._session_state(
+        session_key
+    ).persistent.hygiene_failure_streak == 1
+    text = caplog.text
+    assert "Session hygiene: compressed" not in text
+    assert "no session_db" not in text
+    assert f"did not commit (outcome={outcome})" in text
+
+    # A second autonomous delivery during the durable cooldown must not call
+    # the summarizer again.
+    event.text = "[ASYNC DELEGATION COMPLETE child=next]"
+    assert await runner._handle_message(event) == "ok"
+    assert RejectedAgent.calls == 1
+
+    # A fresh gateway reconstructs the cooldown from the shared SessionDB.
+    fresh, _adapter2, fresh_event = _make_cooldown_runner(
+        monkeypatch, tmp_path, RejectedAgent, db, sid
+    )
+    assert await fresh._handle_message(fresh_event) == "ok"
+    assert RejectedAgent.calls == 1
+    fresh.session_store.rewrite_transcript.assert_not_called()
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_hygiene_compression_cooldown_survives_gateway_restart(
     monkeypatch, tmp_path
 ):
@@ -1100,16 +1188,20 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
 
         main_thread = threading.get_ident()
         streak_threads = []
-        original_cooldown_for_failure = gateway_run._hygiene_cooldown_for_failure
+        # The durable rung + deadline are advanced by _record_hygiene_failure
+        # (one SessionDB transaction, per session id, copied onto compression
+        # children); the gateway must run it OFF the event loop thread
+        # (b3df9908) and exactly once per failed hygiene run.
+        original_record_failure = gateway_run._record_hygiene_failure
 
-        def tracked_cooldown_for_failure(*args, **kwargs):
+        def tracked_record_failure(*args, **kwargs):
             streak_threads.append(threading.get_ident())
-            return original_cooldown_for_failure(*args, **kwargs)
+            return original_record_failure(*args, **kwargs)
 
         monkeypatch.setattr(
             gateway_run,
-            "_hygiene_cooldown_for_failure",
-            tracked_cooldown_for_failure,
+            "_record_hygiene_failure",
+            tracked_record_failure,
         )
 
         class AbortingCompressAgent:
@@ -1194,5 +1286,348 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         escalated = db.get_compression_failure_cooldown(session_id)
         assert escalated is not None
         assert escalated["remaining_seconds"] == pytest.approx(900, abs=5)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [
+    "persistence_failure",
+    "compression_exception_RuntimeError",
+    "wrapper_exception_RuntimeError",
+])
+async def test_hygiene_terminal_failure_ladder_advances_after_expiry_and_restart(
+    monkeypatch, tmp_path, outcome
+):
+    """Every generic terminal class earns exactly one durable rung per run."""
+    from hermes_state import SessionDB
+
+    path = tmp_path / "ladder-restart.db"
+    sid = "ladder-restart"
+
+    class RejectingAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = False
+            self._last_compression_outcome = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(), _last_compress_aborted=False,
+                _last_summary_error=None, _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            if outcome == "persistence_failure":
+                self._last_compression_outcome = outcome
+                return messages, ""
+            if outcome == "compression_exception_RuntimeError":
+                self._last_compression_outcome = outcome
+            raise RuntimeError("synthetic hygiene failure")
+
+    deadlines = []
+    for expected_streak, multiplier in ((1, 1), (2, 3), (3, 9)):
+        db = SessionDB(db_path=path)
+        if expected_streak == 1:
+            db.create_session(sid, "telegram")
+        else:
+            # The preceding deadline has genuinely elapsed before this new
+            # process observes the session.
+            db._conn.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = 0 WHERE id = ?",
+                (sid,),
+            )
+            db._conn.commit()
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, RejectingAgent, db, sid
+        )
+        before = time.time()
+        assert await runner._handle_message(event) == "ok"
+        state = db.get_compression_failure_cooldown(sid)
+        assert db.get_hygiene_failure_streak(sid) == expected_streak
+        assert state["error"] == outcome
+        assert state["cooldown_until"] - before == pytest.approx(
+            min(300 * multiplier, 3600), abs=5
+        )
+        deadlines.append(state["cooldown_until"])
+        db.close()
+    assert deadlines[0] < deadlines[1] < deadlines[2]
+
+
+@pytest.mark.asyncio
+async def test_empty_transcript_rejection_has_restart_safe_three_rung_cooldown(
+    monkeypatch, tmp_path
+):
+    """Empty summaries advance once per attempt and remain truthful on restart.
+
+    The gateway deliberately passes ``rejection_cooldown_seconds=None`` to the
+    compressor, making the gateway the sole durable recorder. This binds that
+    single-recording contract as well as the real SessionDB ladder.
+    """
+    from hermes_state import SessionDB
+
+    path = tmp_path / "empty-transcript-ladder.db"
+    sid = "empty-transcript-ladder"
+
+    class EmptyTranscriptAgent:
+        attempts = 0
+        local_cooldown_args = []
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = False
+            self._last_compression_outcome = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(), _last_compress_aborted=False,
+                _last_summary_error="empty transcript", _last_aux_model_failure_model=None,
+                _record_compression_failure_cooldown=lambda *args: (
+                    type(self).local_cooldown_args.append(args)
+                ),
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **kwargs):
+            type(self).attempts += 1
+            # This is the actual terminal outcome produced by an empty
+            # compressor result; gateway ownership disables compressor-local
+            # persistence so one attempt cannot advance twice.
+            assert kwargs["rejection_cooldown_seconds"] is None
+            self._last_compression_outcome = "rejected_empty_transcript"
+            return messages, ""
+
+    deadlines = []
+    for expected_streak, multiplier in ((1, 1), (2, 3), (3, 9)):
+        db = SessionDB(db_path=path)
+        if expected_streak == 1:
+            db.create_session(sid, "telegram")
+        else:
+            db._conn.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = 0 WHERE id = ?",
+                (sid,),
+            )
+            db._conn.commit()
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, EmptyTranscriptAgent, db, sid
+        )
+        before = time.time()
+        assert await runner._handle_message(event) == "ok"
+        state = db.get_compression_failure_cooldown(sid)
+        assert db.get_hygiene_failure_streak(sid) == expected_streak
+        assert state["error"] == "empty_transcript"
+        assert state["cooldown_until"] - before == pytest.approx(
+            min(300 * multiplier, 3600), abs=5
+        )
+        deadlines.append(state["cooldown_until"])
+        assert EmptyTranscriptAgent.attempts == expected_streak
+        assert EmptyTranscriptAgent.local_cooldown_args == []
+
+        # Same runner and a newly reconstructed runner both suppress the next
+        # attempt while this rung is live.
+        assert await runner._handle_message(event) == "ok"
+        fresh, _adapter2, fresh_event = _make_cooldown_runner(
+            monkeypatch, tmp_path, EmptyTranscriptAgent, db, sid
+        )
+        assert await fresh._handle_message(fresh_event) == "ok"
+        assert EmptyTranscriptAgent.attempts == expected_streak
+        assert db.get_hygiene_failure_streak(sid) == expected_streak
+        db.close()
+    assert deadlines[0] < deadlines[1] < deadlines[2]
+
+
+@pytest.mark.asyncio
+async def test_hygiene_host_cancellation_wins_over_late_worker_outcome(
+    monkeypatch, tmp_path, caplog
+):
+    """Cancel the real gateway host task while its executor worker is detached."""
+    from agent.conversation_compression import _publish_compression_outcome
+    from hermes_state import SessionDB
+
+    sid = "cancel-race"
+    db = SessionDB(db_path=tmp_path / "cancel-race.db")
+    db.create_session(sid, "telegram")
+    started = threading.Event()
+    release = threading.Event()
+
+    class WaitingAgent:
+        instance = None
+
+        def __init__(self, **kwargs):
+            type(self).instance = self
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = False
+            self._last_compression_outcome = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(), _last_compress_aborted=False,
+                _last_summary_error=None, _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            started.set()
+            assert release.wait(10)
+            _publish_compression_outcome(self, "committed_materially_shrunk")
+            return messages[:-2], ""
+
+    runner, _adapter, event = _make_cooldown_runner(
+        monkeypatch, tmp_path, WaitingAgent, db, sid
+    )
+    archive = MagicMock(wraps=db.archive_and_compact)
+    monkeypatch.setattr(db, "archive_and_compact", archive)
+    try:
+        task = asyncio.create_task(runner._handle_message(event))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        agent = WaitingAgent.instance
+        assert agent._last_compression_outcome == "cancelled_host"
+        release.set()
+        for _ in range(100):
+            if agent.close.called:
+                break
+            await asyncio.sleep(0.01)
+        assert agent._last_compression_outcome == "cancelled_host"
+        archive.assert_not_called()
+        runner.session_store.rewrite_transcript.assert_not_called()
+        assert agent.close.called
+        assert "Session hygiene: compressed" not in caplog.text
+    finally:
+        release.set()
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_place", [False, True], ids=["rotation", "in-place"])
+@pytest.mark.parametrize("reconciliation", ["embedded", "retry", "repeated-failure"])
+async def test_gateway_hygiene_reconciles_committed_postpublication_failure(
+    monkeypatch, tmp_path, in_place, reconciliation
+):
+    """Bind committed-postpublication recovery through a normal gateway turn."""
+    from agent.conversation_compression import (
+        CompressionCommittedPostpublicationError,
+    )
+    from hermes_state import SessionDB
+
+    parent = f"hygiene-parent-{in_place}-{reconciliation}"
+    child = parent if in_place else f"{parent}-child"
+    durable = _make_history(2, content_size=20)
+    db = SessionDB(db_path=tmp_path / f"{parent}.db")
+    db.create_session(parent, "telegram")
+    publications = 0
+    if in_place:
+        db.replace_messages(parent, durable)
+    else:
+        real_publish = db.publish_compression_child
+        assert db.try_acquire_compression_lock(parent, "proof-holder")
+
+        def publish_once(**kwargs):
+            nonlocal publications
+            publications += 1
+            return real_publish(**kwargs)
+
+        db.publish_compression_child = publish_once
+        db.publish_compression_child(
+            parent_session_id=parent,
+            child_session_id=child,
+            source="telegram",
+            messages=durable,
+            compression_lock_holder="proof-holder",
+        )
+        db.release_compression_lock(parent, "proof-holder")
+    # The committed transcript is the SessionDB projection, not the candidate
+    # passed to its writer (which may contain speculative row ids/timestamps).
+    durable = db.get_messages_as_conversation(child)
+
+    class CommittedAgent:
+        instance = None
+
+        def __init__(self, **kwargs):
+            type(self).instance = self
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs["session_db"]
+            self._last_compaction_in_place = in_place
+            self._last_compression_outcome = "committed_materially_shrunk"
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_summary_error=None,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, *_args, **_kwargs):
+            self.session_id = child
+            raise CompressionCommittedPostpublicationError(
+                session_id=child,
+                transcript=durable if reconciliation == "embedded" else None,
+                candidate_transcript=[{"role": "user", "content": "speculative"}],
+                in_place=in_place,
+                cause=RuntimeError("host adoption failed"),
+            )
+
+    runner, adapter, event = _make_cooldown_runner(
+        monkeypatch, tmp_path, CommittedAgent, db, parent
+    )
+    entry = runner.session_store.get_or_create_session.return_value
+    runner._rebind_turn_lease = MagicMock()
+    runner._sync_telegram_topic_binding = MagicMock()
+    reads = 0
+    original_read = db.get_messages_as_conversation
+
+    def readback(session_id):
+        nonlocal reads
+        reads += 1
+        if reconciliation == "repeated-failure":
+            raise RuntimeError("durable reload still unavailable")
+        return original_read(session_id)
+
+    db.get_messages_as_conversation = readback
+    record_failure = MagicMock()
+    monkeypatch.setattr("gateway.run._record_hygiene_failure", record_failure)
+    try:
+        result = await runner._handle_message(event)
+        assert entry.session_id == child
+        runner.session_store.rewrite_transcript.assert_not_called()
+        record_failure.assert_not_called()
+        assert publications == (0 if in_place else 1)
+        assert original_read(child) == durable
+        assert all(row.get("content") != "speculative" for row in original_read(child))
+        if not in_place:
+            assert db._conn.execute(
+                "SELECT 1 FROM compression_locks WHERE session_id = ?", (parent,)
+            ).fetchone() is None
+        assert reads == (0 if reconciliation == "embedded" else 1)
+        assert db.get_hygiene_failure_streak(child) == 0
+        assert (
+            CommittedAgent.instance._last_compression_outcome
+            == "committed_postpublication_sync_error"
+        )
+        if in_place:
+            runner._rebind_turn_lease.assert_not_called()
+            runner.session_store._save.assert_not_called()
+            runner._sync_telegram_topic_binding.assert_not_called()
+        else:
+            runner._rebind_turn_lease.assert_called_once()
+            assert runner._rebind_turn_lease.call_args.args[2] == child
+            runner.session_store._save.assert_called_once()
+            runner._sync_telegram_topic_binding.assert_called_once()
+            assert runner._sync_telegram_topic_binding.call_args.args[1].session_id == child
+        if reconciliation == "repeated-failure":
+            assert result is None
+            runner._run_agent.assert_not_awaited()
+            assert any("reconciliation is required" in item["content"] for item in adapter.sent)
+        else:
+            assert result == "ok"
+            runner._run_agent.assert_awaited_once()
+            assert runner._run_agent.call_args.kwargs["history"] == durable
+            assert runner._run_agent.call_args.kwargs["session_id"] == child
+        parent_ended = db.get_session(parent)["ended_at"]
+        assert (parent_ended is None) if in_place else (parent_ended is not None)
     finally:
         db.close()

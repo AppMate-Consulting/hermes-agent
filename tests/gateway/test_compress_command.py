@@ -509,10 +509,150 @@ async def test_compress_command_cleanup_does_not_block_event_loop():
     stop.set()
     await hb
     runner._shutdown_executor()
-
     assert "Compressed:" in result
     assert "error" not in observed, observed.get("error")
     assert observed.get("ticks_during_block", 0) >= 5, (
         "event loop was blocked during manual /compress cleanup: only "
         f"{observed.get('ticks_during_block')} ticks while agent.close() was running"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_place", [False, True], ids=["rotation", "in-place"])
+@pytest.mark.parametrize(
+    "reconciliation",
+    ["embedded", "retry", "repeated-failure"],
+)
+async def test_compress_command_reconciles_committed_postpublication_failure(
+    tmp_path, in_place, reconciliation
+):
+    """Exercise the real slash-command entry point after SQLite committed.
+
+    A postpublication exception is not an ordinary compression failure: the
+    committed identity and durable transcript remain authoritative even when
+    the host callback or its immediate readback failed.
+    """
+    from agent.conversation_compression import (
+        CompressionCommittedPostpublicationError,
+    )
+    from hermes_state import AsyncSessionDB, SessionDB
+
+    history = _make_history()
+    durable = [
+        history[0],
+        {"role": "assistant", "content": "durable committed summary"},
+        history[-1],
+    ]
+    parent = "sess-1"
+    committed = parent if in_place else "sess-child"
+    db = SessionDB(db_path=tmp_path / f"manual-{in_place}-{reconciliation}.db")
+    db.create_session(parent, "telegram")
+    publications = 0
+    if in_place:
+        db.replace_messages(parent, durable)
+    else:
+        real_publish = db.publish_compression_child
+
+        def publish_once(**kwargs):
+            nonlocal publications
+            publications += 1
+            return real_publish(**kwargs)
+
+        db.publish_compression_child = publish_once
+        db.publish_compression_child(
+            parent_session_id=parent,
+            child_session_id=committed,
+            source="telegram",
+            messages=durable,
+            require_compression_lease=False,
+        )
+    # Drive reconciliation with the canonical durable projection. SessionDB
+    # owns timestamp normalization and never exposes candidate ``_row_id``s.
+    durable = db.get_messages_as_conversation(committed)
+
+    runner = _make_runner(history)
+    runner._session_db = AsyncSessionDB(db)
+    entry = runner.session_store.get_or_create_session.return_value
+    runner._sync_telegram_topic_binding = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    agent = MagicMock()
+    agent.shutdown_memory_provider = MagicMock()
+    agent.close = MagicMock()
+    agent._cached_system_prompt = ""
+    agent.tools = None
+    agent.context_compressor.has_content_to_compress.return_value = True
+    agent.context_compressor._last_compress_aborted = False
+    agent.context_compressor._last_aux_model_failure_model = None
+    agent.session_id = parent
+    agent._session_db = db
+    agent._compression_skipped_due_to_lock = False
+    error = CompressionCommittedPostpublicationError(
+        session_id=committed,
+        transcript=durable if reconciliation == "embedded" else None,
+        candidate_transcript=[{"role": "user", "content": "speculative"}],
+        in_place=in_place,
+        cause=RuntimeError("host adoption failed"),
+    )
+    agent._compress_context.side_effect = error
+
+    original_read = db.get_messages_as_conversation
+    reads = 0
+    ordering = []
+    runner.session_store._save.side_effect = lambda: ordering.append("route-saved")
+
+    def readback(session_id):
+        nonlocal reads
+        reads += 1
+        ordering.append("durable-read")
+        if reconciliation == "repeated-failure":
+            raise RuntimeError("durable reload still unavailable")
+        return original_read(session_id)
+
+    db.get_messages_as_conversation = readback
+    notifications = []
+    try:
+        with (
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test"}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("run_agent.AIAgent", return_value=agent),
+            patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+            patch(
+                "agent.conversation_compression.finalize_context_engine_compression_notification",
+                side_effect=lambda _agent, *, committed: notifications.append(committed),
+            ),
+        ):
+            result = await runner._handle_compress_command_inner(_make_event())
+
+        assert entry.session_id == committed
+        if in_place:
+            runner.session_store._save.assert_not_called()
+            runner._sync_telegram_topic_binding.assert_not_called()
+        else:
+            runner.session_store._save.assert_called_once()
+            runner._sync_telegram_topic_binding.assert_called_once()
+            assert runner._sync_telegram_topic_binding.call_args.args[1].session_id == committed
+            if reconciliation == "retry":
+                assert ordering[:2] == ["route-saved", "durable-read"]
+            # The normal-turn lookup shares this persisted host entry and can
+            # no longer fall back to the ended parent.
+            resumed = await runner.async_session_store.get_or_create_session(_make_source())
+            assert resumed.session_id == committed
+        runner.session_store.rewrite_transcript.assert_not_called()
+        assert publications == (0 if in_place else 1)
+        assert original_read(committed) == durable
+        assert all(
+            row.get("content") != "speculative" for row in original_read(committed)
+        )
+        assert reads == (0 if reconciliation == "embedded" else 1)
+        if reconciliation == "repeated-failure":
+            assert "committed" in result.lower()
+            assert "reconciliation is required" in result.lower()
+            assert "compress failed" not in result.lower()
+            assert "speculative" not in result
+            assert True in notifications
+        else:
+            assert "Compression committed" in result
+            assert "host adoption failed" in result
+            assert True in notifications
+    finally:
+        db.close()

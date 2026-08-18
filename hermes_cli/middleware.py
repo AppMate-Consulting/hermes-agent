@@ -34,6 +34,67 @@ VALID_MIDDLEWARE: set[str] = {
 }
 
 
+class ImmutableRequestMiddlewareError(RuntimeError):
+    """Execution middleware violated an admitted-request ownership contract."""
+
+
+class NonTransactionalRequestMiddlewareError(RuntimeError):
+    """Request middleware cannot participate in speculative admission."""
+
+
+@dataclass(frozen=True)
+class RequestMiddlewarePreviewState:
+    """Opaque snapshots for one speculative llm-request middleware pass."""
+
+    entries: tuple[tuple[Callable, Any], ...]
+
+
+def snapshot_llm_request_middleware_preview_state() -> RequestMiddlewarePreviewState:
+    """Snapshot every stateful request callback, rejecting unknown state.
+
+    A callback is eligible for compression admission when it either exposes
+    ``snapshot_preview_state`` and ``restore_preview_state`` methods, or opts
+    into the side-effect-free contract with ``preview_safe = True``.  Normal
+    provider dispatch remains compatible with callbacks declaring neither.
+    """
+    entries: list[tuple[Callable, Any]] = []
+    for callback in _get_middleware_callbacks(LLM_REQUEST_MIDDLEWARE):
+        snapshotter = getattr(callback, "snapshot_preview_state", None)
+        restorer = getattr(callback, "restore_preview_state", None)
+        if callable(snapshotter) and callable(restorer):
+            entries.append((callback, snapshotter()))
+            continue
+        if bool(getattr(callback, "preview_safe", False)):
+            entries.append((callback, None))
+            continue
+        raise NonTransactionalRequestMiddlewareError(
+            "llm_request middleware callback "
+            f"{getattr(callback, '__name__', repr(callback))} must expose "
+            "snapshot_preview_state()/restore_preview_state() or explicitly "
+            "declare preview_safe=True before automatic compression"
+        )
+    return RequestMiddlewarePreviewState(tuple(entries))
+
+
+def restore_llm_request_middleware_preview_state(
+    snapshot: RequestMiddlewarePreviewState,
+) -> None:
+    """Restore a preview snapshot in reverse middleware order."""
+    current = _get_middleware_callbacks(LLM_REQUEST_MIDDLEWARE)
+    expected = [callback for callback, _token in snapshot.entries]
+    if len(current) != len(expected) or any(
+        callback is not registered
+        for callback, registered in zip(current, expected)
+    ):
+        raise NonTransactionalRequestMiddlewareError(
+            "llm_request middleware registrations changed during admission"
+        )
+    for callback, token in reversed(snapshot.entries):
+        restorer = getattr(callback, "restore_preview_state", None)
+        if callable(restorer):
+            restorer(token)
+
+
 @dataclass
 class RequestMiddlewareResult:
     """Result of applying request middleware to a mutable payload."""
@@ -189,7 +250,14 @@ def run_llm_execution_middleware(
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
-    """Run provider execution through registered LLM execution middleware."""
+    """Run provider execution through registered LLM execution middleware.
+
+    ``immutable_request=True`` is reserved for a request already admitted by
+    the compression transaction.  Wrappers still run on every attempt, but
+    they may only continue with ``next_call()``; the terminal call always
+    receives the originally admitted object.
+    """
+    immutable_request = bool(context.pop("immutable_request", False))
     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(request)
@@ -199,6 +267,7 @@ def run_llm_execution_middleware(
         next_call,
         request=request,
         original_request=context.pop("original_request", request),
+        immutable_payload=immutable_request,
         **context,
     )
 
@@ -258,6 +327,104 @@ def _run_execution_chain(
     **kwargs: Any,
 ) -> Any:
     payload_key = "request" if "request" in kwargs else "args"
+    immutable_payload = bool(kwargs.pop("immutable_payload", False))
+    admitted_payload = kwargs[payload_key]
+    admitted_snapshot = deepcopy(admitted_payload) if immutable_payload else None
+    admitted_graph: List[tuple[Any, Any]] = []
+    if immutable_payload:
+        seen: set[int] = set()
+
+        def snapshot_mutable_graph(value: Any) -> None:
+            """Record mutable containers and their original graph edges."""
+            value_id = id(value)
+            if value_id in seen:
+                return
+            seen.add(value_id)
+            if isinstance(value, dict):
+                items = list(value.items())
+                admitted_graph.append((value, items))
+                for key, child in items:
+                    snapshot_mutable_graph(key)
+                    snapshot_mutable_graph(child)
+            elif isinstance(value, list):
+                items = list(value)
+                admitted_graph.append((value, items))
+                for child in items:
+                    snapshot_mutable_graph(child)
+            elif isinstance(value, set):
+                items = set(value)
+                admitted_graph.append((value, items))
+                for child in items:
+                    snapshot_mutable_graph(child)
+            elif isinstance(value, (tuple, frozenset)):
+                for child in value:
+                    snapshot_mutable_graph(child)
+
+        snapshot_mutable_graph(admitted_payload)
+
+    def restore_admitted_graph() -> None:
+        """Restore contents and aliases without replacing admitted objects."""
+        for container, contents in admitted_graph:
+            if isinstance(container, dict):
+                container.clear()
+                container.update(contents)
+            elif isinstance(container, list):
+                container[:] = contents
+            else:
+                container.clear()
+                container.update(contents)
+
+    def admitted_graph_unchanged() -> bool:
+        """Compare values and mutable-container edges to the admitted graph."""
+        mutable_types = (dict, list, set)
+
+        def same_edge(current: Any, original: Any) -> bool:
+            if isinstance(original, mutable_types):
+                return current is original
+            try:
+                return current == original
+            except Exception:
+                return False
+
+        for container, contents in admitted_graph:
+            if isinstance(container, dict):
+                current_items = list(container.items())
+                if len(current_items) != len(contents):
+                    return False
+                if any(
+                    not same_edge(current_key, original_key)
+                    or not same_edge(current_value, original_value)
+                    for (current_key, current_value), (original_key, original_value)
+                    in zip(current_items, contents)
+                ):
+                    return False
+            elif isinstance(container, list):
+                if len(container) != len(contents) or any(
+                    not same_edge(current, original)
+                    for current, original in zip(container, contents)
+                ):
+                    return False
+            elif container != contents:
+                return False
+        return True
+
+    def assert_admitted_unchanged(callback: Callable) -> None:
+        if not immutable_payload:
+            return
+        try:
+            unchanged = (
+                admitted_payload == admitted_snapshot
+                and admitted_graph_unchanged()
+            )
+        except Exception:
+            unchanged = False
+        if not unchanged:
+            restore_admitted_graph()
+            raise ImmutableRequestMiddlewareError(
+                f"Middleware '{kind}' callback "
+                f"{getattr(callback, '__name__', repr(callback))} mutated the "
+                "immutable admitted request; provider dispatch was refused"
+            )
 
     class _DownstreamExecutionError(Exception):
         def __init__(self, original: BaseException) -> None:
@@ -285,9 +452,27 @@ def _run_execution_chain(
                     f"{getattr(callback, '__name__', repr(callback))} called "
                     "next_call() more than once; downstream execution is single-use"
                 )
+            assert_admitted_unchanged(callback)
+            if (
+                immutable_payload
+                and next_payload is not None
+                and next_payload is not admitted_payload
+            ):
+                restore_admitted_graph()
+                raise ImmutableRequestMiddlewareError(
+                    f"Middleware '{kind}' callback "
+                    f"{getattr(callback, '__name__', repr(callback))} tried "
+                    "to replace the immutable admitted request; provider "
+                    "dispatch was refused"
+                )
             next_called = True
             try:
-                next_result = call_at(index + 1, payload if next_payload is None else next_payload)
+                next_result = call_at(
+                    index + 1,
+                    admitted_payload
+                    if immutable_payload
+                    else payload if next_payload is None else next_payload,
+                )
                 next_succeeded = True
                 return next_result
             except Exception as exc:
@@ -297,8 +482,17 @@ def _run_execution_chain(
         call_kwargs[payload_key] = payload
         call_kwargs["next_call"] = next_call
         try:
-            return callback(**call_kwargs)
+            result = callback(**call_kwargs)
+            assert_admitted_unchanged(callback)
+            return result
+        except ImmutableRequestMiddlewareError:
+            restore_admitted_graph()
+            raise
         except _DownstreamExecutionError as exc:
+            # A wrapper may mutate after a successful downstream dispatch and
+            # then raise.  Restore the admitted graph and report the immutable
+            # contract violation, but never issue a second provider call.
+            assert_admitted_unchanged(callback)
             raise exc.original
         except Exception as exc:
             logger.warning(
@@ -307,6 +501,9 @@ def _run_execution_chain(
                 getattr(callback, "__name__", repr(callback)),
                 exc,
             )
+            # Validate before generic fail-open continuation on *every* exit.
+            # This closes mutate-then-raise both before and after next_call().
+            assert_admitted_unchanged(callback)
             if next_succeeded:
                 return next_result
             if next_called:

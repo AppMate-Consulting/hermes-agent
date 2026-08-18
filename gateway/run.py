@@ -211,24 +211,40 @@ def _hygiene_cooldown_for_failure(
     return min(base_cooldown_seconds * multiplier, _HYGIENE_COOLDOWN_MAX_SECONDS)
 
 
-def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
+def _reset_hygiene_failure_streak(
+    gateway, session_key: str, session_id: Optional[str] = None
+) -> None:
     """Clear the hygiene failure streak after a compression that reduced context.
 
     Peeks rather than get-or-creates: writing a 0 that is already 0 must not
     materialise a ``_sessions`` entry (those are never evicted).
     """
+    session_db = getattr(gateway, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    resetter = getattr(session_db, "reset_hygiene_failure_streak", None)
+    if session_id and callable(resetter):
+        try:
+            resetter(session_id)
+        except Exception as exc:
+            logger.warning(
+                "durable hygiene failure streak reset failed for %s; "
+                "retaining local safety state: %s", session_id, exc,
+            )
+            return
     try:
         state = gateway._peek_session_state(session_key)
         if state is not None:
             state.persistent.hygiene_failure_streak = 0
     except Exception as exc:
-        logger.debug("hygiene failure streak reset failed: %s", exc)
-    session_db = getattr(gateway, "_session_db", None)
-    session_db = getattr(session_db, "_db", session_db)
-    reset = getattr(session_db, "reset_hygiene_failure_streak", None)
-    if callable(reset):
+        logger.warning("process hygiene failure streak reset failed: %s", exc)
+    # Rotation-stable durable view (#79624 follow-up): the streak mirrored by
+    # ``session_key`` in ``gateway_hygiene_state`` must clear too, or a
+    # restarted gateway that falls back to ``_hygiene_cooldown_for_failure``
+    # would resume on a stale rung. ``reset_hygiene_failure_streak`` accepts
+    # either identity; a session_key never collides with a session id.
+    if session_key and callable(resetter):
         try:
-            reset(session_key)
+            resetter(session_key)
         except Exception as exc:
             logger.debug("hygiene failure streak persistent reset failed: %s", exc)
 
@@ -308,6 +324,54 @@ def _record_hygiene_cooldown(
         recorder(session_id, _time.time() + cooldown_seconds, error)
     except Exception as exc:
         logger.debug("session hygiene cooldown persist failed: %s", exc)
+
+
+def _record_hygiene_failure(
+    gateway, session_key: str, session_id: str,
+    base_cooldown_seconds: float, error: Optional[str] = None,
+) -> None:
+    """Advance the durable rung and deadline in one SessionDB transaction."""
+    session_db = getattr(gateway, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    recorder = getattr(session_db, "record_hygiene_failure", None)
+    if callable(recorder):
+        try:
+            result = recorder(session_id, base_cooldown_seconds, error)
+        except Exception as exc:
+            logger.warning(
+                "durable hygiene failure recording failed; advancing "
+                "process-only safety state: %s", exc,
+            )
+        else:
+            # The transaction above is authoritative once it returns.  Hot
+            # state is only a same-process optimization: failure to mirror the
+            # committed streak must never enter the compatibility path and
+            # issue a second, potentially lower-rung durable cooldown write.
+            try:
+                gateway._session_state(
+                    session_key
+                ).persistent.hygiene_failure_streak = int(result["streak"])
+            except Exception as exc:
+                logger.warning(
+                    "durable hygiene failure recorded (streak=%s, "
+                    "cooldown_until=%s), but hot-cache synchronization "
+                    "failed: %s",
+                    result.get("streak") if isinstance(result, dict) else "?",
+                    (
+                        result.get("cooldown_until")
+                        if isinstance(result, dict)
+                        else "?"
+                    ),
+                    exc,
+                )
+            return
+    _record_hygiene_cooldown(
+        gateway, session_id,
+        _hygiene_cooldown_for_failure(
+            gateway, session_key, base_cooldown_seconds
+        ),
+        error,
+    )
 
 
 def _status_template_to_regex(template: str) -> str:
@@ -901,7 +965,7 @@ def _resolve_progress_thread_id(
         return str(source_thread_id) if source_thread_id else None
     if source_thread_id:
         return str(source_thread_id)
-    if platform_key in {"slack", "mattermost"} and event_message_id:
+    if platform_key in {"slack", "mattermost", "buzz"} and event_message_id:
         return str(event_message_id)
     return None
 
@@ -2528,6 +2592,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    pending_events_share_provenance,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -6240,6 +6305,8 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_display_kind"] = (
                     ctx.persist_user_display_kind
                 )
+            if ctx.persist_user_is_autonomous_completion:
+                _conversation_kwargs["persist_user_is_autonomous_completion"] = True
             if ctx.moa_config is not None:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
@@ -6517,6 +6584,17 @@ class TurnRunner:
 # DB-backed commands and is how many suites construct a bare runner).  A plain
 # ``None`` cannot express both.  Mirrors ``gateway.session._DB_UNPINNED``.
 _SESSION_DB_UNPINNED = object()
+
+
+def _event_is_autonomous_completion(event: Any) -> bool:
+    """Return only the explicit durable-provenance bit from a gateway event."""
+    return bool(getattr(event, "autonomous_completion", False))
+
+
+def _event_conversation_forwarding_metadata(event: Any) -> tuple[Optional[str], bool]:
+    """Compose the persistence metadata forwarded for one inbound event."""
+    display_kind = "internal_notification" if getattr(event, "internal", False) else None
+    return display_kind, _event_is_autonomous_completion(event)
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -9838,24 +9916,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        security_metadata_keys = (
-            "hermes_plugin_id",
-            "hermes_plugin_injection",
-            "gateway_session_key",
-            "gateway_session_id",
-            "gateway_session_strict",
+        same_provenance = existing is not None and pending_events_share_provenance(
+            existing, event
         )
-        same_security_context = existing is not None and (
-            getattr(existing, "internal", False) == getattr(event, "internal", False)
-            and getattr(existing, "allow_gateway_control", True)
-            == getattr(event, "allow_gateway_control", True)
-            and all(
-                (getattr(existing, "metadata", None) or {}).get(key)
-                == (getattr(event, "metadata", None) or {}).get(key)
-                for key in security_metadata_keys
-            )
-        )
-        if same_security_context and (
+        if same_provenance and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
@@ -9879,6 +9943,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         self._enqueue_fifo(session_key, event, adapter)
+
+    def _merge_pending_or_fifo(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        adapter: Any,
+        *,
+        merge_text: bool = False,
+    ) -> None:
+        """Coalesce compatible input, retaining provenance conflicts in FIFO."""
+        if not merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            event,
+            merge_text=merge_text,
+        ):
+            self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -11835,13 +11916,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
+            # New rows carry the exact metadata used by the final send.  NULL
+            # (legacy) rows retain the historical generic-thread recovery.
+            persisted_metadata = row.get("routing_metadata")
             metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+                dict(persisted_metadata)
+                if isinstance(persisted_metadata, dict)
+                else ({"thread_id": row["thread_id"]} if row.get("thread_id") else None)
             )
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],
                     content=content,
+                    reply_to=row.get("reply_to"),
                     metadata=metadata,
                 )
             except Exception as send_err:
@@ -16806,7 +16893,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    self._merge_pending_or_fifo(_quick_key, event, adapter)
                 return None
 
             effective_busy_input_mode = self._effective_busy_input_mode(source)
@@ -16832,10 +16919,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if effective_busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
+                        self._merge_pending_or_fifo(
                             _quick_key,
                             event,
+                            adapter,
                             merge_text=True,
                         )
                 return None
@@ -16853,10 +16940,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
+                    self._merge_pending_or_fifo(
                         _quick_key,
                         event,
+                        adapter,
                         merge_text=True,
                     )
                 return None
@@ -18741,8 +18828,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # content are untouched — display_kind is a DB-only sidecar stripped
         # from every provider-bound payload (see conversation_loop's
         # api_msg.pop("display_kind")).
-        persist_user_display_kind = (
-            "internal_notification" if getattr(event, "internal", False) else None
+        (
+            persist_user_display_kind,
+            persist_user_is_autonomous_completion,
+        ) = _event_conversation_forwarding_metadata(
+            event
         )
         try:
             _pcfg = _load_gateway_config()
@@ -19274,6 +19364,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # would end the live gateway session row.
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
+                                    _hyg_original_sid = session_entry.session_id
+                                    _hyg_postcommit_routing_reconciled = False
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
@@ -19283,8 +19375,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                             commit_fence=_hyg_commit_fence,
+                                            rejection_cooldown_seconds=None,
                                         ),
                                     )
+                                    _hyg_failure_recorded = False
                                     try:
                                         # Progress-aware wait: the timeout is an
                                         # INACTIVITY budget, not a total one. The
@@ -19375,19 +19469,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _hyg_cleanup_deferred = True
                                             if _hyg_failure_cooldown_seconds >= 0:
-                                                _hyg_cooldown = await asyncio.to_thread(
-                                                    _hygiene_cooldown_for_failure,
-                                                    self,
-                                                    session_key,
+                                                await asyncio.to_thread(
+                                                    _record_hygiene_failure,
+                                                    self, session_key,
+                                                    session_entry.session_id,
                                                     _hyg_failure_cooldown_seconds,
-                                                )
-                                                _record_hygiene_cooldown(
-                                                    self, session_entry.session_id,
-                                                    _hyg_cooldown,
                                                     "session hygiene compression "
                                                     "timed out with no output from "
                                                     "the summary model",
                                                 )
+                                                _hyg_failure_recorded = True
                                             from agent.session_activity import (
                                                 ActivityProvenance,
                                             )
@@ -19397,6 +19488,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
                                                 "hygiene compression timeout "
                                                 "activity stamp failed",
+                                            )
+                                            from agent.conversation_compression import (
+                                                _publish_compression_outcome,
+                                            )
+                                            _publish_compression_outcome(
+                                                _hyg_agent,
+                                                "timed_out_hygiene_commit_fence",
+                                                outer_terminal=True,
                                             )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
@@ -19432,7 +19531,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _werr,
                                                 )
                                             raise
-                                    except BaseException:
+                                    except BaseException as _hyg_wrapper_exc:
                                         # #76354 F2: non-timeout unwind while the
                                         # detached hygiene worker may still run —
                                         # KeyboardInterrupt, task cancellation, or
@@ -19441,42 +19540,155 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # durable lease via the holder-qualified
                                         # hook) BEFORE the host unwinds so the
                                         # worker can never commit later.
-                                        _hyg_commit_fence.revoke_commit_admission()
-                                        if not _hyg_cleanup_deferred:
+                                        from agent.conversation_compression import (
+                                            CompressionCommittedPostpublicationError,
+                                            _publish_compression_outcome,
+                                        )
+                                        if isinstance(
+                                            _hyg_wrapper_exc,
+                                            CompressionCommittedPostpublicationError,
+                                        ):
+                                            _hyg_agent.session_id = _hyg_wrapper_exc.session_id
+                                            if (
+                                                _hyg_wrapper_exc.session_id
+                                                != session_entry.session_id
+                                            ):
+                                                session_entry.session_id = (
+                                                    _hyg_wrapper_exc.session_id
+                                                )
+                                                self._rebind_turn_lease(
+                                                    _quick_key,
+                                                    run_generation,
+                                                    _hyg_wrapper_exc.session_id,
+                                                )
+                                                await self.async_session_store._save()
+                                                await asyncio.to_thread(
+                                                    self._sync_telegram_topic_binding,
+                                                    source,
+                                                    session_entry,
+                                                    reason=(
+                                                        "hygiene-compression-postcommit"
+                                                    ),
+                                                )
+                                                _hyg_postcommit_routing_reconciled = True
+                                            logger.warning(
+                                                "Session hygiene compression committed but "
+                                                "required postcommit reconciliation: %s",
+                                                _hyg_wrapper_exc.cause,
+                                            )
+                                            _publish_compression_outcome(
+                                                _hyg_agent,
+                                                "committed_postpublication_sync_error",
+                                            )
+                                            try:
+                                                _compressed = _hyg_wrapper_exc.load_authoritative_transcript(
+                                                    _hyg_agent
+                                                )
+                                            except Exception as _reconcile_exc:
+                                                _warn_msg = (
+                                                    "⚠️ Context compression committed, but "
+                                                    "durable reconciliation is required before "
+                                                    "another turn. The committed session was "
+                                                    "preserved and this turn was stopped."
+                                                )
+                                                try:
+                                                    _adapter = self._adapter_for_source(source)
+                                                    if _adapter and source.chat_id:
+                                                        await _adapter.send(
+                                                            source.chat_id,
+                                                            _warn_msg,
+                                                            metadata=_hyg_meta,
+                                                        )
+                                                except Exception:
+                                                    logger.debug(
+                                                        "Failed to deliver reconciliation warning",
+                                                        exc_info=True,
+                                                    )
+                                                logger.error(
+                                                    "Committed hygiene compression could not be "
+                                                    "reloaded for %s: %s",
+                                                    _hyg_wrapper_exc.session_id,
+                                                    _reconcile_exc,
+                                                )
+                                                return
+                                            _hyg_wrapper_exc = None
+                                        if _hyg_wrapper_exc is None:
+                                            pass
+                                        elif isinstance(
+                                            _hyg_wrapper_exc,
+                                            (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                                        ):
+                                            _outer_outcome = "cancelled_host"
+                                        else:
+                                            _worker_outcome = getattr(
+                                                _hyg_agent,
+                                                "_last_compression_outcome",
+                                                None,
+                                            )
+                                            _outer_outcome = (
+                                                _worker_outcome
+                                                if isinstance(_worker_outcome, str)
+                                                and _worker_outcome.startswith(
+                                                    "compression_exception_"
+                                                )
+                                                else "wrapper_exception_"
+                                                f"{type(_hyg_wrapper_exc).__name__}"
+                                            )
+                                        if _hyg_wrapper_exc is not None:
+                                            _publish_compression_outcome(
+                                            _hyg_agent,
+                                            _outer_outcome,
+                                            outer_terminal=(
+                                                _outer_outcome == "cancelled_host"
+                                                or _outer_outcome.startswith(
+                                                    "wrapper_exception_"
+                                                )
+                                            ),
+                                        )
+                                        if _hyg_wrapper_exc is not None and (
+                                            _outer_outcome.startswith(
+                                                ("wrapper_exception_", "compression_exception_")
+                                            )
+                                            and not _hyg_failure_recorded
+                                            and _hyg_failure_cooldown_seconds >= 0
+                                        ):
+                                            await asyncio.to_thread(
+                                                _record_hygiene_failure,
+                                                self, session_key,
+                                                session_entry.session_id,
+                                                _hyg_failure_cooldown_seconds,
+                                                _outer_outcome,
+                                            )
+                                            _hyg_failure_recorded = True
+                                        if _hyg_wrapper_exc is not None:
+                                            _hyg_commit_fence.revoke_commit_admission()
+                                        if _hyg_wrapper_exc is not None and not _hyg_cleanup_deferred:
                                             self._defer_agent_cleanup_until_future_done(
                                                 _hyg_future,
                                                 _hyg_agent,
                                                 context="session hygiene unwind",
                                             )
                                             _hyg_cleanup_deferred = True
-                                        raise
+                                        if _hyg_wrapper_exc is not None:
+                                            raise _hyg_wrapper_exc
 
                                     # _compress_context ends the old session and creates
                                     # a new session_id.  Write compressed messages into
                                     # the NEW session so the old transcript stays intact
                                     # and searchable via session_search.
                                     _hyg_new_sid = _hyg_agent.session_id
-                                    _hyg_rotated = _hyg_new_sid != session_entry.session_id
+                                    _hyg_rotated = _hyg_new_sid != _hyg_original_sid
                                     _hyg_in_place = bool(
                                         getattr(_hyg_agent, "_last_compaction_in_place", False)
                                     )
-                                    # Anti-growth guard: refuse a compression
-                                    # that did not shrink the transcript
-                                    # (observed: 427K -> 598K). Compare
-                                    # like-for-like rough estimates.
-                                    _hyg_in_toks = estimate_messages_tokens_rough(history)
-                                    _hyg_out_toks = estimate_messages_tokens_rough(_compressed)
-                                    if _hyg_rotated and _hyg_out_toks > _hyg_in_toks:
-                                        logger.warning(
-                                            "Gateway hygiene compression for session %s "
-                                            "would grow transcript (~%s -> ~%s tokens); "
-                                            "keeping the original transcript unchanged",
-                                            session_entry.session_id,
-                                            f"{_hyg_in_toks:,}",
-                                            f"{_hyg_out_toks:,}",
-                                        )
-                                        _hyg_rotated = False
-                                        _compressed = history
+                                    _hyg_outcome = getattr(
+                                        _hyg_agent, "_last_compression_outcome", None
+                                    )
+                                    # Canonical complete provider-wire admission
+                                    # already ran before publication. Once the
+                                    # child commits, its durable transcript is
+                                    # authoritative even when a message-only
+                                    # estimate happens to be larger.
                                     # Only rewrite the transcript when rotation produced
                                     # a NEW session id.  In-place compaction does NOT
                                     # need a rewrite: archive_and_compact() has already
@@ -19505,37 +19717,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # empty session while the turn continues — the
                                     # conversation silently vanishes. Persist the child
                                     # transcript first; only then rebind the live entry.
-                                    if _hyg_rotated:
-                                        if not await self.async_session_store.rewrite_transcript(
-                                            _hyg_new_sid, _compressed
-                                        ):
-                                            logger.error(
-                                                "Session hygiene: failed to persist "
-                                                "compressed transcript for rotated "
-                                                "session %s → %s; keeping the live "
-                                                "entry on the original session so the "
-                                                "conversation is not dropped",
-                                                session_entry.session_id,
-                                                _hyg_new_sid,
-                                            )
-                                            # Fail closed: treat like no rotation.
-                                            _hyg_rotated = False
-                                            _hyg_in_place = False
-                                        else:
-                                            session_entry.session_id = _hyg_new_sid
-                                            # The held turn lease follows the
-                                            # rotation so an alias key resolving
-                                            # the fresh child still serializes
-                                            # against this turn (#64934).
-                                            self._rebind_turn_lease(
-                                                _quick_key, run_generation, _hyg_new_sid
-                                            )
-                                            await self.async_session_store._save()
-                                            await asyncio.to_thread(
-                                                self._sync_telegram_topic_binding,
-                                                source, session_entry,
-                                                reason="hygiene-compression",
-                                            )
+                                    if (
+                                        _hyg_rotated
+                                        and not _hyg_postcommit_routing_reconciled
+                                    ):
+                                        # _compress_context already published the
+                                        # authoritative child transcript atomically.
+                                        # Reconcile routing only; never publish it twice.
+                                        session_entry.session_id = _hyg_new_sid
+                                        self._rebind_turn_lease(
+                                            _quick_key, run_generation, _hyg_new_sid
+                                        )
+                                        await self.async_session_store._save()
+                                        await asyncio.to_thread(
+                                            self._sync_telegram_topic_binding,
+                                            source, session_entry,
+                                            reason="hygiene-compression",
+                                        )
 
                                     if _hyg_rotated:
                                         # Reset stored token count — transcript rewritten
@@ -19563,19 +19761,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _new_tokens = _approx_tokens
                                         logger.warning(
                                             "Gateway hygiene compression for session %s "
-                                            "did not rotate or compact in place "
-                                            "(no session_db on the hygiene agent) — "
-                                            "preserving the original transcript instead "
-                                            "of overwriting it with the summary (#21301).",
+                                            "did not commit (outcome=%s) — preserving "
+                                            "the original transcript instead of "
+                                            "overwriting it with the summary (#21301).",
                                             session_entry.session_id,
+                                            _hyg_outcome or "persistence_failure",
                                         )
 
-                                    logger.info(
-                                        "Session hygiene: compressed %s → %s msgs, "
-                                        "~%s → ~%s tokens",
-                                        _msg_count, _new_count,
-                                        f"{_approx_tokens:,}", f"{_new_tokens:,}",
-                                    )
+                                    if _hyg_outcome == "committed_materially_shrunk":
+                                        logger.info(
+                                            "Session hygiene: compressed %s → %s msgs, "
+                                            "~%s → ~%s tokens",
+                                            _msg_count, _new_count,
+                                            f"{_approx_tokens:,}", f"{_new_tokens:,}",
+                                        )
 
                                     if _new_tokens >= _warn_token_threshold:
                                         logger.warning(
@@ -19597,6 +19796,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_aborted = _comp is not None and getattr(
                                         _comp, "_last_compress_aborted", False
                                     )
+                                    _hyg_rejected = _hyg_outcome in {
+                                        "rejected_no_progress",
+                                        "rejected_would_grow",
+                                        "rejected_below_minimum_reclaim",
+                                        "rejected_empty_transcript",
+                                    }
+                                    _hyg_terminal_failure = bool(
+                                        _hyg_outcome == "persistence_failure"
+                                        or (
+                                            isinstance(_hyg_outcome, str)
+                                            and _hyg_outcome.startswith(
+                                                ("compression_exception_", "wrapper_exception_")
+                                            )
+                                        )
+                                    )
+                                    if (
+                                        (_hyg_rejected or _hyg_terminal_failure)
+                                        and not _hyg_failure_recorded
+                                        and _hyg_failure_cooldown_seconds >= 0
+                                    ):
+                                        await asyncio.to_thread(
+                                            _record_hygiene_failure,
+                                            self, session_key,
+                                            session_entry.session_id,
+                                            _hyg_failure_cooldown_seconds,
+                                            (
+                                                _hyg_outcome.removeprefix("rejected_")
+                                                if _hyg_rejected
+                                                else _hyg_outcome
+                                            ),
+                                        )
+                                        _hyg_failure_recorded = True
                                     if not _hyg_aborted:
                                         # Recovery decision lives in the
                                         # extracted, unit-tested predicate — the
@@ -19617,24 +19848,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         ):
                                             await asyncio.to_thread(
                                                 _reset_hygiene_failure_streak,
-                                                self,
-                                                session_key,
+                                                self, session_key,
+                                                _hyg_new_sid,
                                             )
                                     if _hyg_aborted:
-                                        if _hyg_failure_cooldown_seconds >= 0:
-                                            _hyg_cooldown = await asyncio.to_thread(
-                                                _hygiene_cooldown_for_failure,
-                                                self,
-                                                session_key,
+                                        if (
+                                            not _hyg_failure_recorded
+                                            and _hyg_failure_cooldown_seconds >= 0
+                                        ):
+                                            await asyncio.to_thread(
+                                                _record_hygiene_failure,
+                                                self, session_key,
+                                                session_entry.session_id,
                                                 _hyg_failure_cooldown_seconds,
-                                            )
-                                            _record_hygiene_cooldown(
-                                                self, session_entry.session_id,
-                                                _hyg_cooldown,
                                                 getattr(
                                                     _comp, "_last_summary_error", None
                                                 ),
                                             )
+                                            _hyg_failure_recorded = True
                                         from agent.session_activity import (
                                             ActivityProvenance,
                                         )
@@ -19922,6 +20153,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_is_autonomous_completion=(
+                    persist_user_is_autonomous_completion
+                ),
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -23321,6 +23555,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
+        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        source_platform = getattr(source, "platform", None)
+        if getattr(source_platform, "value", source_platform) == "buzz" and anchor is not None:
+            metadata = dict(metadata or {})
+            metadata["buzz_reply_to_message_id"] = str(anchor)
+        if (
+            getattr(source_platform, "value", source_platform) == "buzz"
+            and getattr(source, "chat_type", None) != "dm"
+            and getattr(source, "user_id", None)
+        ):
+            metadata = dict(metadata or {})
+            metadata["user_id"] = str(source.user_id)
         if getattr(source, "platform", None) == Platform.SLACK:
             team_id = getattr(source, "scope_id", None)
             if team_id:
@@ -24796,6 +25042,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                autonomous_completion=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata=metadata,
             )
@@ -27529,6 +27776,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_is_autonomous_completion: bool = False,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -27549,6 +27797,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_is_autonomous_completion=(
+                    persist_user_is_autonomous_completion
+                ),
                 message_type=message_type,
             )
 
@@ -27562,6 +27813,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_is_autonomous_completion=(
+                    persist_user_is_autonomous_completion
+                ),
                 message_type=message_type,
             )
 
@@ -27705,6 +27959,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_is_autonomous_completion: bool = False,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -28015,6 +28270,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            persist_user_is_autonomous_completion=(
+                persist_user_is_autonomous_completion
+            ),
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -28031,6 +28289,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #
         # Threading metadata is platform-specific:
         # - Slack DM threading needs event_message_id fallback (reply thread)
+        # - Buzz progress/status replies use the inbound event/source message id
         # - Telegram forum topics use message_thread_id; Hermes-created private
         #   DM topic lanes require both thread metadata and a reply anchor
         # - Feishu only honors reply_in_thread when sending a reply, so topic
@@ -28065,8 +28324,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception:
                     _progress_reply_in_thread = True
+        _progress_event_message_id = event_message_id
+        if _gateway_platform_value(source.platform) == "buzz" and not _progress_event_message_id:
+            _progress_event_message_id = getattr(source, "message_id", None)
         _progress_thread_id = _resolve_progress_thread_id(
-            source.platform, source.thread_id, event_message_id,
+            source.platform, source.thread_id, _progress_event_message_id,
             reply_in_thread=_progress_reply_in_thread,
         )
         # Relay Discord auto-thread lane: a channel-initiating message has no
@@ -28087,16 +28349,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else None
         )
         _progress_metadata = (
-            self._thread_metadata_for_source(source, event_message_id)
+            self._thread_metadata_for_source(source, _progress_event_message_id)
             if _progress_thread_id == source.thread_id
             else self._thread_metadata_for_target(
                 source.platform,
                 source.chat_id,
                 _progress_thread_id,
                 chat_type=getattr(source, "chat_type", None),
-                reply_to_message_id=event_message_id,
+                reply_to_message_id=_progress_event_message_id,
             )
         ) if _progress_thread_id else None
+        if _gateway_platform_value(source.platform) == "buzz" and _progress_thread_id:
+            # Buzz routes by reply anchor rather than a distinct thread id,
+            # and the source-aware builder also carries the sender identity
+            # that the adapter independently re-authorizes before mentioning.
+            _progress_metadata = self._thread_metadata_for_source(
+                source, _progress_event_message_id
+            )
         if _progress_metadata is None and _relay_prospective_thread_id:
             # No real thread yet, but the connector will auto-thread on the
             # reply anchor; carry it so progress joins that thread.
@@ -28229,16 +28498,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         else:
             _status_thread_metadata = (
-                self._thread_metadata_for_source(source, event_message_id)
+                self._thread_metadata_for_source(source, _progress_event_message_id)
                 if _progress_thread_id == source.thread_id
                 else self._thread_metadata_for_target(
                     source.platform,
                     source.chat_id,
                     _progress_thread_id,
                     chat_type=getattr(source, "chat_type", None),
-                    reply_to_message_id=event_message_id,
+                    reply_to_message_id=_progress_event_message_id,
                 )
             ) if _progress_thread_id else None
+            if _gateway_platform_value(source.platform) == "buzz" and _progress_thread_id:
+                _status_thread_metadata = self._thread_metadata_for_source(
+                    source, _progress_event_message_id
+                )
             if _status_thread_metadata is None and _relay_prospective_thread_id:
                 # Relay Discord auto-thread lane (see _progress_metadata above):
                 # carry the reply anchor so status/interim bubbles route into
@@ -29046,7 +29319,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._merge_pending_or_fifo(
+                            session_key, pending_event, adapter
+                        )
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}

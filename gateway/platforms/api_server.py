@@ -1381,6 +1381,9 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        # Per-process capability used only by gateway.wake's loopback self-post.
+        # It is never configured, logged, or accepted from a request body.
+        self._internal_wake_token: str = uuid.uuid4().hex
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -4164,6 +4167,10 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        _trusted_internal_completion = hmac.compare_digest(
+            request.headers.get("X-Hermes-Internal-Wake", ""),
+            self._internal_wake_token,
+        )
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -4393,6 +4400,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                trusted_autonomous_completion=_trusted_internal_completion,
                 **agent_overrides,
                 route=route,
             ))
@@ -4416,6 +4424,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                trusted_autonomous_completion=_trusted_internal_completion,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -6330,6 +6339,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        trusted_autonomous_completion: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6414,6 +6424,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         user_message=user_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
+                        persist_user_is_autonomous_completion=(
+                            trusted_autonomous_completion
+                        ),
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,

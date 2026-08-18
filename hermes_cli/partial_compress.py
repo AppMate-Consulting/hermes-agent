@@ -254,6 +254,20 @@ def split_history_for_partial_compress(
 
     boundary = user_starts[-1]  # earliest of the kept user starts
 
+    # A trusted autonomous completion is one durable provenance unit:
+    # bridge-user, bridge-assistant, completion-user.  Counting its two user
+    # rows as independent exchanges can otherwise put the completion alone in
+    # the protected suffix, where restart/replay can no longer distinguish it
+    # from genuine human text.  Pull the cut back to the sequence start.
+    from agent.context_compressor import ContextCompressor
+
+    for completion_index in range(boundary, min(n, boundary + 2)):
+        if ContextCompressor._completion_has_durable_provenance(
+            history, completion_index
+        ):
+            boundary = completion_index - 2
+            break
+
     head = history[:boundary]
     tail = history[boundary:]
 

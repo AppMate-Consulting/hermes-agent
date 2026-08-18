@@ -517,6 +517,7 @@ class TestCodexOAuthContextLength:
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-5.6-sol-2026-07-09",  # dated snapshot via gpt-5.6 family prefix
+            "gpt-5.6.2026-08-16",  # dotted snapshot via gpt-5.6 family prefix
             "gpt-5.4",
         ],
     )
@@ -608,6 +609,71 @@ class TestCodexOAuthContextLength:
                 provider="openai-codex",
             )
         assert ctx == 900_000
+
+    # AppMate coverage retained across the v0.20.4 integration: persistence
+    # and provider-scope invariants of the verified-above-advertised bump.
+    @pytest.mark.parametrize("slug", ["gpt-5.6-luna", "gpt-5.4"])
+    def test_probe_failure_corrects_eligible_fallback_without_persisting(self, slug):
+        """A failed authenticated probe resolves the eligible fallback to 900K
+        but must not persist that fallback as if it were a live observation."""
+        from agent.model_metadata import get_model_context_length
+
+        response = MagicMock(status_code=401)
+        response.json.return_value = {}
+        with patch("agent.model_metadata.requests.get", return_value=response), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length") as mock_save:
+            resolved = get_model_context_length(
+                slug,
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="expired-token",
+                provider="openai-codex",
+            )
+
+        assert resolved == 900_000
+        mock_save.assert_not_called()
+
+    def test_memory_catalogue_keeps_source_and_does_not_persist_again(self):
+        """The bumped value rides the in-memory catalogue: one probe, one
+        persistent write, and repeated resolution stays at 900K."""
+        from agent.model_metadata import get_model_context_length
+        import agent.model_metadata as mm
+
+        mm._codex_oauth_context_cache = {}
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "models": [{"slug": "gpt-5.6-terra", "context_window": 272_000}]
+        }
+        kwargs = {
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "same-token",
+            "provider": "openai-codex",
+        }
+        with patch("agent.model_metadata.requests.get", return_value=response) as mock_get, \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length") as mock_save:
+            first = get_model_context_length("gpt-5.6-terra", **kwargs)
+            second = get_model_context_length("gpt-5.6-terra", **kwargs)
+
+        assert (first, second) == (900_000, 900_000)
+        mock_get.assert_called_once()
+        mock_save.assert_called_once()
+
+    def test_direct_openai_api_does_not_apply_codex_oauth_correction(self):
+        """The bump is Codex-OAuth specific; direct OpenAI API resolution of a
+        272K value stays untouched."""
+        from agent.model_metadata import get_model_context_length
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=272_000):
+            resolved = get_model_context_length(
+                "gpt-5.6-sol",
+                base_url="https://api.openai.com/v1",
+                api_key="fake-key",
+                provider="openai",
+            )
+
+        assert resolved == 272_000
 
 
 

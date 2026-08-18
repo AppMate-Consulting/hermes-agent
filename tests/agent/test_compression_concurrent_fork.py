@@ -112,6 +112,19 @@ def _count_children(db: SessionDB, parent_sid: str) -> int:
     return len(rows)
 
 
+def _material_text(label: str, *, words: int = 512) -> str:
+    """Build input large enough to exercise post-summary commit admission."""
+    return f"{label} " + ("payload " * words)
+
+
+def _material_messages(count: int = 20) -> list[dict[str, str]]:
+    """Return a transcript whose compacted form clears minimum-reclaim policy."""
+    return [
+        {"role": "user", "content": _material_text(f"m{i}")}
+        for i in range(count)
+    ]
+
+
 def _live_child_id(db: SessionDB, parent_sid: str) -> str | None:
     """The single child id of ``parent_sid``, or None when there is none.
 
@@ -201,7 +214,7 @@ def test_compression_activity_heartbeat_ignores_touch_errors(tmp_path: Path) -> 
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
     agent._touch_activity = lambda _desc, **_kw: (_ for _ in ()).throw(RuntimeError("touch boom"))
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
 
@@ -226,7 +239,7 @@ def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
     agent._compression_activity_heartbeat_interval = "not-a-number"
     touch_calls: list[str] = []
     agent._touch_activity = lambda desc, **_kw: touch_calls.append(desc)
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
 
     strict_calls: list[int | None] = []
 
@@ -241,7 +254,10 @@ def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    assert compressed[0]["content"] == "[CONTEXT COMPACTION] strict summary"
+    assert any(
+        message.get("content") == "[CONTEXT COMPACTION] strict summary"
+        for message in compressed
+    )
     assert touch_calls[0] == "context compression started"
     assert touch_calls[-1] == "context compression completed"
     assert db.get_compression_lock_holder(session_id) is None
@@ -589,12 +605,14 @@ def test_durable_message_committed_before_lease_is_adopted(
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "PRE_LEASE_DURABLE_RACE"
     db.create_session(parent_sid, source="webui")
-    db.append_message(parent_sid, "user", "old durable")
+    old_durable = _material_text("old durable", words=5_000)
+    late_durable = _material_text("late committed before lease", words=5_000)
+    db.append_message(parent_sid, "user", old_durable)
 
     # Frontend takes its snapshot, then another producer commits before this
     # compressor acquires the lease.
-    stale_snapshot = [{"role": "user", "content": "old durable"}]
-    db.append_message(parent_sid, "assistant", "late committed before lease")
+    stale_snapshot = [{"role": "user", "content": old_durable}]
+    db.append_message(parent_sid, "assistant", late_durable)
     agent = _build_agent_with_db(db, parent_sid)
 
     returned, _system_prompt = agent._compress_context(
@@ -604,8 +622,8 @@ def test_durable_message_committed_before_lease_is_adopted(
     agent.context_compressor.compress.assert_called_once()
     compressed_arg = agent.context_compressor.compress.call_args.args[0]
     assert [m["content"] for m in compressed_arg] == [
-        "old durable",
-        "late committed before lease",
+        old_durable.rstrip(),
+        late_durable.rstrip(),
     ]
     # Must not echo the stale snapshot — compression proceeded on the
     # adopted durable transcript (rotation publishes a child session).
@@ -653,7 +671,7 @@ def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) ->
 
     agent.context_compressor.compress.side_effect = _slow_summary
     agent.context_compressor._proactive_prune_rearm_tokens = 120_000
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     fence = CompressionCommitFence()
     result = {}
 
@@ -829,7 +847,7 @@ def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:
     db.create_session(parent_sid, source="cli")
 
     agent = _build_agent_with_db(db, parent_sid)
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
     child_sid = agent.session_id
@@ -899,7 +917,7 @@ def test_full_in_place_compression_atomically_clears_durable_prune_runway(
         source="cli",
         model_config={"keep": "value", "_proactive_prune_rearm_tokens": 120_000},
     )
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     db.append_messages_batch(session_id, messages)
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
@@ -924,7 +942,7 @@ def test_rotation_child_starts_without_durable_prune_runway(tmp_path: Path) -> N
         source="cli",
         model_config={"keep": "parent", "_proactive_prune_rearm_tokens": 120_000},
     )
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     db.append_messages_batch(parent_sid, messages)
     agent = _build_agent_with_db(db, parent_sid)
 
@@ -1370,7 +1388,7 @@ def test_late_hard_interrupt_restores_full_compressor_attempt_state_and_retry(
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
     agent._cached_system_prompt = "sys"
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     provider_returned = threading.Event()
     allow_compress_return = threading.Event()
     shared_telemetry = {"shared": [1, 2, 3]}
@@ -1651,7 +1669,7 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
     agent._cached_system_prompt = "sys"
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     commit_started = threading.Event()
     allow_commit = threading.Event()
     stop_returned = threading.Event()
@@ -1698,6 +1716,104 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
     )
     assert agent._hard_interrupt_requested.is_set()
     assert db.get_compression_lock_holder(session_id) is None
+
+
+@pytest.mark.parametrize("completion_order", ["older_first", "newer_first"])
+def test_hard_stop_fences_all_overlapping_compression_attempts(
+    tmp_path: Path, monkeypatch, completion_order: str
+) -> None:
+    """A latest registration cannot hide an older admitted commit from stop."""
+    from agent import conversation_compression as compression_module
+    from agent.conversation_compression import CompressionCommitFence
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = f"OVERLAPPING_FENCES_{completion_order}"
+    db.create_session(session_id, source="tui")
+    agent = _build_agent_with_db(db, session_id)
+    messages = [{"role": "user", "content": "unchanged"}]
+    older_fence = CompressionCommitFence()
+    newer_fence = CompressionCommitFence()
+    older_committing = threading.Event()
+    newer_entered = threading.Event()
+    release_older = threading.Event()
+    release_newer = threading.Event()
+    newer_admitted: list[bool] = []
+
+    def _controlled_compress(_agent, current, _system, *, commit_fence, **_kwargs):
+        if commit_fence is older_fence:
+            assert commit_fence.begin_commit(agent._hard_interrupt_requested)
+            older_committing.set()
+            assert release_older.wait(timeout=5)
+            commit_fence.finish_commit()
+        else:
+            newer_entered.set()
+            assert release_newer.wait(timeout=5)
+            admitted = commit_fence.begin_commit(agent._hard_interrupt_requested)
+            newer_admitted.append(admitted)
+            if admitted:
+                commit_fence.finish_commit()
+        return current, "sys"
+
+    monkeypatch.setattr(compression_module, "compress_context", _controlled_compress)
+    results: dict[str, tuple] = {}
+    older = threading.Thread(
+        target=lambda: results.setdefault(
+            "older",
+            agent._compress_context(messages, "sys", commit_fence=older_fence),
+        ),
+        daemon=True,
+    )
+    newer = threading.Thread(
+        target=lambda: results.setdefault(
+            "newer",
+            agent._compress_context(messages, "sys", commit_fence=newer_fence),
+        ),
+        daemon=True,
+    )
+    older.start()
+    assert older_committing.wait(timeout=2)
+    newer.start()
+    assert newer_entered.wait(timeout=2)
+    assert set(agent._active_compression_commit_fences.values()) == {
+        older_fence,
+        newer_fence,
+    }
+
+    stop_returned = threading.Event()
+    stop = threading.Thread(
+        target=lambda: (
+            agent.hard_interrupt("stop every overlapping compression"),
+            stop_returned.set(),
+        ),
+        daemon=True,
+    )
+    stop.start()
+    assert not stop_returned.wait(timeout=0.1)
+
+    if completion_order == "newer_first":
+        release_newer.set()
+        newer.join(timeout=2)
+        assert not newer.is_alive()
+        assert not stop_returned.is_set()
+        release_older.set()
+    else:
+        release_older.set()
+        older.join(timeout=2)
+        assert not older.is_alive()
+        stop.join(timeout=2)
+        assert stop_returned.is_set()
+        release_newer.set()
+
+    older.join(timeout=5)
+    newer.join(timeout=5)
+    stop.join(timeout=5)
+    assert not older.is_alive()
+    assert not newer.is_alive()
+    assert not stop.is_alive()
+    assert stop_returned.is_set()
+    assert newer_admitted == [False]
+    assert results == {"older": (messages, "sys"), "newer": (messages, "sys")}
+    assert "_active_compression_commit_fences" not in vars(agent)
 
 
 @pytest.mark.parametrize("deadline_offset", [-10.0, 0.05, None])

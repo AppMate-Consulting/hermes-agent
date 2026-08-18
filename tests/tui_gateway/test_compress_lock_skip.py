@@ -30,6 +30,14 @@ def _make_lock_skip_agent(signal):
     agent.session_id = "sess-lock"
     # Deferred-notify contract: no pending notification exists.
     agent._pending_context_engine_compression_notification = None
+    agent.session_input_tokens = 0
+    agent.session_output_tokens = 0
+    agent.session_reasoning_tokens = 0
+    agent.session_prompt_tokens = 0
+    agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+    agent.session_api_calls = 0
+    agent.context_compressor.last_prompt_tokens = 0
 
     def _fake_compress(msgs=None, *_args, **_kwargs):
         agent._compression_skipped_due_to_lock = signal
@@ -72,6 +80,38 @@ def test_compress_session_history_raises_on_lock_skip():
     # The history must be untouched by the lock-skip.
     assert session["history"] == history
     assert session["history_version"] == 1
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "summary_failure",
+        "rejected_no_progress",
+        "rejected_would_grow",
+        "rejected_below_minimum_reclaim",
+    ],
+)
+def test_rejected_compression_preserves_tui_history_identity_and_version(outcome):
+    from tui_gateway.server import _compress_session_history
+
+    history = _make_history()
+    agent = _make_lock_skip_agent(None)
+    agent._last_compression_outcome = outcome
+    session = _make_session(agent, history)
+
+    with (
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        patch(
+            "agent.conversation_compression.finalize_context_engine_compression_notification"
+        ) as finalize,
+    ):
+        removed, _ = _compress_session_history(session)
+
+    assert removed == 0
+    assert session["history"] is history
+    assert session["history"] == _make_history()
+    assert session["history_version"] == 1
+    finalize.assert_called_once_with(agent, committed=False)
 
 
 # ── Consumer 1: session.compress RPC ───────────────────────────────────
@@ -170,3 +210,56 @@ def test_mirror_slash_side_effects_reports_lock_skip():
     assert "live session sync failed" not in output
 
 
+def test_committed_postpublication_error_adopts_tui_history():
+    from agent.conversation_compression import (
+        CompressionCommittedPostpublicationError,
+    )
+    from tui_gateway.server import _compress_session_history
+
+    history = _make_history()
+    authoritative = [{"role": "user", "content": "committed summary"}]
+    agent = _make_lock_skip_agent(None)
+    agent.session_id = "child"
+    agent._compress_context.side_effect = CompressionCommittedPostpublicationError(
+        session_id="child",
+        transcript=authoritative,
+        in_place=False,
+        cause=RuntimeError("host adoption failed"),
+    )
+    session = _make_session(agent, history)
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        removed, _usage = _compress_session_history(session)
+
+    assert removed == len(history) - len(authoritative)
+    assert session["history"] == authoritative
+    assert session["history_version"] == 2
+    assert agent._last_compression_postcommit_warning == "host adoption failed"
+
+
+def test_committed_reload_failure_rebinds_and_blocks_tui_history():
+    from agent.conversation_compression import CompressionCommittedPostpublicationError
+    from tui_gateway.server import _compress_session_history
+
+    history = _make_history()
+    agent = _make_lock_skip_agent(None)
+    agent.session_id = "parent"
+    agent._session_db = MagicMock()
+    agent._session_db.get_messages_as_conversation.side_effect = RuntimeError("db down")
+    agent._compress_context.side_effect = CompressionCommittedPostpublicationError(
+        session_id="child",
+        transcript=None,
+        candidate_transcript=[{"role": "user", "content": "speculative"}],
+        in_place=False,
+        cause=RuntimeError("first read failed"),
+    )
+    session = _make_session(agent, history)
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100), \
+         pytest.raises(RuntimeError, match="reconciliation required"):
+        _compress_session_history(session)
+
+    assert agent.session_id == session["committed_session_id"] == "child"
+    assert session["session_key"] == "sess-lock"
+    assert session["history"] == []
+    assert "compression_reconciliation_required" in session

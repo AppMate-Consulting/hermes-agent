@@ -2297,6 +2297,15 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    # Runtime-only trusted producer bit. SessionDB persists it
+                    # in a dedicated column; presentation metadata remains
+                    # independent and cannot confer trust on replay.
+                    "_autonomous_completion_bridge": (
+                        msg.get("_autonomous_completion_bridge") is True
+                    ),
+                    "_active_task_contract_trusted": (
+                        msg.get("_active_task_contract_trusted") is True
+                    ),
                 })
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8
@@ -3208,23 +3217,34 @@ class AIAgent:
             event = getattr(self, "_hard_interrupt_requested", None)
             if event is None:
                 return
-            fence = vars(self).get("_active_compression_commit_fence")
-            cancel_before_commit = getattr(
-                type(fence), "cancel_before_commit", None
+            registration_lock = vars(self).setdefault(
+                "_compression_commit_fence_lock", threading.RLock()
             )
-            if callable(cancel_before_commit):
+            with registration_lock:
+                fences = tuple(
+                    vars(self).get("_active_compression_commit_fences", {}).values()
+                )
+                # Close admission before releasing the registry lock. A
+                # compression attempt registered after this snapshot will see
+                # the event in begin_commit(), while every attempt registered
+                # before it is cancelled or joined below.
+                event.set()
+            for fence in fences:
+                cancel_before_commit = getattr(
+                    type(fence), "cancel_before_commit", None
+                )
+                if not callable(cancel_before_commit):
+                    continue
                 try:
-                    # This sets the Event while holding the same lock used by
-                    # begin_commit(). If commit already won, it waits for that
-                    # tracked mutation to finish before publishing the stop.
+                    # If commit already won, this waits for that attempt's
+                    # mutation to finish. Pending attempts are cancelled.
                     cancel_before_commit(fence, event)
-                    return
                 except Exception:
                     logger.debug(
                         "Compression hard-cancel fence admission failed",
                         exc_info=True,
                     )
-            event.set()
+            return
 
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
@@ -4306,7 +4326,9 @@ class AIAgent:
             except Exception:
                 pass
 
-    def commit_memory_session(self, messages: list = None) -> None:
+    def commit_memory_session(
+        self, messages: list = None, *, old_session_id: str = None
+    ) -> None:
         """Trigger end-of-session extraction without tearing providers down.
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
@@ -4325,7 +4347,7 @@ class AIAgent:
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
                 self.context_compressor.on_session_end(
-                    self.session_id or "",
+                    old_session_id if old_session_id is not None else self.session_id or "",
                     messages or [],
                 )
             except Exception:
@@ -7894,7 +7916,10 @@ class AIAgent:
         focus_topic: str = None,
         force: bool = False,
         defer_context_engine_notification: bool = False,
+        protected_tail: list | None = None,
         commit_fence=None,
+        rejection_cooldown_seconds: float | None = 60.0,
+        live_request_context: dict | None = None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
@@ -7905,6 +7930,7 @@ class AIAgent:
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
+            _publish_compression_outcome,
             compress_context,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
@@ -7914,6 +7940,9 @@ class AIAgent:
             reset_conversation_context,
             set_conversation_context,
         )
+        # Public attempt boundary: outer pool/timeout exits may occur before
+        # compress_context() runs, so inner initialization is insufficient.
+        self._last_compression_outcome = "pending"
         # Out-of-turn compaction entry points — ``/compact`` (cli.py), the
         # gateway ``/compress`` command and its hygiene sweep (both of which
         # build a throwaway agent), and partial head compression — call this
@@ -7938,17 +7967,17 @@ class AIAgent:
         # cancel admission against begin_commit().
         active_fence = commit_fence or CompressionCommitFence()
         # A single agent can receive overlapping automatic/manual entrypoints.
-        # Serialize fence publication so a waiter cannot replace the fence of
-        # the attempt currently generating/committing a summary.
+        # Register every attempt by identity so a hard stop can join all
+        # already-admitted commits and cancel every pending one.
         fence_registration_lock = vars(self).setdefault(
             "_compression_commit_fence_lock", threading.RLock()
         )
+        fence_registration_token = object()
         with fence_registration_lock:
-            missing_fence = object()
-            previous_fence = vars(self).get(
-                "_active_compression_commit_fence", missing_fence
+            active_fences = vars(self).setdefault(
+                "_active_compression_commit_fences", {}
             )
-            self._active_compression_commit_fence = active_fence
+            active_fences[fence_registration_token] = active_fence
         try:
             def _run(fence=None, target_messages=None):
                 return compress_context(
@@ -7961,7 +7990,10 @@ class AIAgent:
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
+                    protected_tail=protected_tail,
                     commit_fence=fence,
+                    rejection_cooldown_seconds=rejection_cooldown_seconds,
+                    live_request_context=live_request_context,
                 )
 
             # Callers that already own a progress-aware wait (gateway session
@@ -8078,17 +8110,34 @@ class AIAgent:
                         "check SessionDB health (disk / lock contention)."
                     )
 
-            result = run_compress_context_with_progress_timeout(
-                worker=_snapshot_worker,
-                messages=messages,
-                system_prompt_fallback=_fallback_prompt,
-                idle_timeout_seconds=idle_timeout,
-                total_ceiling_seconds=total_ceiling,
-                on_timeout=_on_timeout,
-                on_commit_overrun=_on_commit_overrun,
-                fence=active_fence,
-                telemetry_agent=self,
-            )
+            try:
+                result = run_compress_context_with_progress_timeout(
+                    worker=_snapshot_worker,
+                    messages=messages,
+                    system_prompt_fallback=_fallback_prompt,
+                    idle_timeout_seconds=idle_timeout,
+                    total_ceiling_seconds=total_ceiling,
+                    on_timeout=_on_timeout,
+                    on_commit_overrun=_on_commit_overrun,
+                    fence=active_fence,
+                    telemetry_agent=self,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                _publish_compression_outcome(
+                    self, "cancelled_host", outer_terminal=True
+                )
+                raise
+            except BaseException as exc:
+                from agent.conversation_compression import (
+                    CompressionCommittedPostpublicationError,
+                )
+                if not isinstance(exc, CompressionCommittedPostpublicationError):
+                    _publish_compression_outcome(
+                        self,
+                        f"wrapper_exception_{type(exc).__name__}",
+                        outer_terminal=True,
+                    )
+                raise
             # compress_context ran on a daemon pool worker thread; the session
             # id rotation updated hermes_logging._session_context (a
             # threading.local) on the WORKER thread, not this one. Propagate
@@ -8118,10 +8167,12 @@ class AIAgent:
             return result
         finally:
             with fence_registration_lock:
-                if previous_fence is missing_fence:
-                    vars(self).pop("_active_compression_commit_fence", None)
-                else:
-                    self._active_compression_commit_fence = previous_fence
+                active_fences = vars(self).get(
+                    "_active_compression_commit_fences", {}
+                )
+                active_fences.pop(fence_registration_token, None)
+                if not active_fences:
+                    vars(self).pop("_active_compression_commit_fences", None)
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.
             if token is not None:
@@ -8344,6 +8395,7 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_is_autonomous_completion: bool = False,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -8709,6 +8761,9 @@ class AIAgent:
                         persist_user_message,
                         persist_user_timestamp=persist_user_timestamp,
                         persist_user_display_kind=persist_user_display_kind,
+                        persist_user_is_autonomous_completion=(
+                            persist_user_is_autonomous_completion
+                        ),
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
                     )

@@ -37,6 +37,7 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
     recover_rotated_compression_session,
+    append_autonomous_completion_provenance,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
@@ -426,6 +427,11 @@ class TurnContext:
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
+    # Automatic preflight was deliberately deferred to the complete live
+    # request boundary.  The loop consumes this semantic marker after the
+    # first provider response; it must not infer preflight ownership from an
+    # incidental API-call count.
+    deferred_preflight_pending: bool = False
 
 
 def build_turn_context(
@@ -439,6 +445,7 @@ def build_turn_context(
     persist_user_timestamp: Optional[float] = None,
     *,
     persist_user_display_kind: Optional[str] = None,
+    persist_user_is_autonomous_completion: bool = False,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -448,12 +455,16 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    defer_automatic_preflight: bool = False,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
     The callables/helpers the original prologue referenced from the
     ``conversation_loop`` module are passed in explicitly to keep this module
-    free of an import cycle with ``agent.conversation_loop``.
+    free of an import cycle with ``agent.conversation_loop``.  Standalone
+    callers retain turn-start automatic preflight by default.  Provider-loop
+    owners pass ``defer_automatic_preflight=True`` so publication occurs at
+    exact live-request admission instead.
     """
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
@@ -678,6 +689,15 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    # Never accept trusted provenance from a staged/external message mapping;
+    # normalize it solely from the explicit runtime-only turn parameter.
+    user_msg.pop("_autonomous_completion_bridge", None)
+    if persist_user_is_autonomous_completion:
+        append_autonomous_completion_provenance(messages)
+        # This normalized internal marker cannot be supplied through the
+        # external user-message input.  Together with the two bridge markers
+        # it distinguishes a live runtime completion from an exact lookalike.
+        user_msg["_autonomous_completion_bridge"] = True
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -857,11 +877,15 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+    if (
+        not defer_automatic_preflight
+        and agent.compression_enabled
+        and _should_run_preflight_estimate(
+            messages,
+            agent.context_compressor.protect_first_n,
+            agent.context_compressor.protect_last_n,
+            agent.context_compressor.threshold_tokens,
+        )
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
@@ -1405,4 +1429,5 @@ def build_turn_context(
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
+        deferred_preflight_pending=defer_automatic_preflight,
     )

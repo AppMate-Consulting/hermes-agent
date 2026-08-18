@@ -39,6 +39,48 @@ logger = logging.getLogger("hermes_state")
 _READ_PROBE_STATEMENTS: Optional[tuple] = None
 
 
+_TRANSCRIPT_GENERATION_TRIGGER_DDL = (
+    "DROP TRIGGER IF EXISTS messages_transcript_generation_insert",
+    "DROP TRIGGER IF EXISTS messages_transcript_generation_delete",
+    "DROP TRIGGER IF EXISTS messages_transcript_generation_update",
+    "DROP TRIGGER IF EXISTS messages_transcript_generation_move",
+    """CREATE TRIGGER messages_transcript_generation_insert
+        AFTER INSERT ON messages BEGIN
+            UPDATE sessions SET transcript_generation =
+                COALESCE(transcript_generation, 0) + 1
+            WHERE id = NEW.session_id;
+        END""",
+    """CREATE TRIGGER messages_transcript_generation_delete
+        AFTER DELETE ON messages BEGIN
+            UPDATE sessions SET transcript_generation =
+                COALESCE(transcript_generation, 0) + 1
+            WHERE id = OLD.session_id;
+        END""",
+    """CREATE TRIGGER messages_transcript_generation_update
+        AFTER UPDATE OF role, content, tool_call_id, tool_calls, tool_name,
+            effect_disposition, finish_reason, reasoning, reasoning_content,
+            reasoning_details, codex_reasoning_items, codex_message_items,
+            observed, active, compacted, api_content,
+            autonomous_completion_provenance,
+            active_task_contract_provenance ON messages
+        WHEN OLD.session_id = NEW.session_id BEGIN
+            UPDATE sessions SET transcript_generation =
+                COALESCE(transcript_generation, 0) + 1
+            WHERE id = NEW.session_id;
+        END""",
+    """CREATE TRIGGER messages_transcript_generation_move
+        AFTER UPDATE OF session_id ON messages
+        WHEN OLD.session_id != NEW.session_id BEGIN
+            -- Moving a row changes both model transcripts. Fence both the
+            -- source snapshot (row disappeared) and destination snapshot
+            -- (row appeared), even for a non-cooperating legacy writer.
+            UPDATE sessions SET transcript_generation =
+                COALESCE(transcript_generation, 0) + 1
+            WHERE id IN (OLD.session_id, NEW.session_id);
+        END""",
+)
+
+
 def schema_read_probe_statements() -> tuple:
     """SELECT statements that fail iff a live store is behind SCHEMA_SQL.
 
@@ -84,6 +126,25 @@ def schema_read_probe_statements() -> tuple:
 
 class SessionSchemaMixin:
     """See module docstring — mixin for SessionDB (Schema cluster)."""
+
+    def _reconcile_transcript_generation_triggers(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Atomically replace the durable transcript CAS-fence triggers."""
+        try:
+            # executescript() commits any pending transaction before running,
+            # so each statement must be executed separately to keep the whole
+            # DROP/CREATE replacement under one cross-connection write lock.
+            cursor.execute("BEGIN IMMEDIATE")
+            for statement in _TRANSCRIPT_GENERATION_TRIGGER_DDL:
+                cursor.execute(statement)
+            self._conn.commit()
+        except BaseException:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
 
     def _dedupe_legacy_system_prompts(self, cursor: sqlite3.Cursor) -> None:
         """Move inline prompt snapshots into the shared content-addressed table.
@@ -833,6 +894,17 @@ class SessionSchemaMixin:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # Durable CAS fence for model-visible transcript state. Keep these
+        # triggers after reconciliation so legacy stores first receive the
+        # generation column. Presentation-only fields are intentionally
+        # excluded; every listed field can affect provider replay or task
+        # semantics.
+        # DROP/CREATE is deliberate: CREATE IF NOT EXISTS would leave an older
+        # trigger definition installed forever when the model-visible column
+        # set grows. Rebuilding these idempotently on every open also heals
+        # partially migrated databases without rewriting any transcript row.
+        self._reconcile_transcript_generation_triggers(cursor)
 
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is

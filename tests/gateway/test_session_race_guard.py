@@ -151,6 +151,57 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.media_types == ["image/png"]
 
 
+@pytest.mark.parametrize("completion_first", [False, True])
+@pytest.mark.parametrize("with_media", [False, True])
+def test_merge_pending_event_refuses_human_completion_provenance_crossing(
+    completion_first, with_media,
+):
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="human-id",
+        user_name="Human",
+    )
+    human = MessageEvent(
+        text="human bytes \x00 stay human",
+        source=source,
+        user_id="human-id",
+        user_name="Human",
+        metadata={"gateway_session_strict": True},
+        media_urls=["/tmp/human.png"] if with_media else [],
+        media_types=["image/png"] if with_media else [],
+        message_type=MessageType.PHOTO if with_media else MessageType.TEXT,
+    )
+    completion = MessageEvent(
+        text="completion bytes \N{SNOWMAN}",
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+        autonomous_completion=True,
+        metadata={"gateway_session_strict": True},
+        media_urls=["/tmp/completion.png"] if with_media else [],
+        media_types=["image/png"] if with_media else [],
+        message_type=MessageType.PHOTO if with_media else MessageType.TEXT,
+    )
+    first, second = (completion, human) if completion_first else (human, completion)
+    pending = {"session": first}
+
+    assert merge_pending_message_event(
+        pending, "session", second, merge_text=True
+    ) is False
+    assert pending["session"] is first
+    assert first.text in {
+        "human bytes \x00 stay human",
+        "completion bytes \N{SNOWMAN}",
+    }
+    expected_media = (
+        [f"/tmp/{'completion' if completion_first else 'human'}.png"]
+        if with_media else []
+    )
+    assert first.media_urls == expected_media
+
+
 @pytest.mark.asyncio
 async def test_recent_telegram_followups_append_in_pending_queue():
     runner = _make_runner()

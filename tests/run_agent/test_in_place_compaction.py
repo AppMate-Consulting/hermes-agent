@@ -10,9 +10,14 @@ exactly as before.
 """
 
 import os
+import copy
+import json
 import tempfile
+import threading
+import types
+from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -54,11 +59,496 @@ def _seed(db, sid, title, n=8):
         db.append_message(
             session_id=sid,
             role="user" if i % 2 == 0 else "assistant",
-            content=f"msg {i}",
+            content=f"m{i} " + ("payload " * 2_999) + "payload",
         )
 
 
 class TestInPlaceCompaction:
+    @pytest.mark.parametrize("in_place", [True, False], ids=["in-place", "rotation"])
+    def test_api_content_mutation_after_generation_rejects_stale_publication(
+        self, tmp_path, in_place
+    ):
+        """An in-place prompt-cache sidecar update trips the generation CAS."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / f"api-race-{in_place}.db")
+        sid = f"api-race-{in_place}"
+        _seed(db, sid, "api race", n=4)
+        agent = _make_agent(db, sid, in_place=in_place)
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = "memory"
+        agent.commit_memory_session = MagicMock()
+        agent.event_callback = MagicMock()
+        before = db.get_messages(sid, include_inactive=True)
+        messages = db.get_messages_as_conversation(sid)
+        calls = 0
+
+        def estimate(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                assert db.set_latest_user_api_content(
+                    sid, messages[2]["content"], "new provider bytes"
+                ) == 1
+            return 100_000 if calls == 1 else 1_000
+
+        with patch(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            side_effect=estimate,
+        ):
+            returned, _ = agent._compress_context(
+                messages, "sys", approx_tokens=100_000
+            )
+
+        assert returned is messages
+        assert agent.session_id == sid
+        active = db.get_messages_as_conversation(sid)
+        assert active[2]["api_content"] == "new provider bytes"
+        assert [r["id"] for r in db.get_messages(sid, include_inactive=True)] == [
+            r["id"] for r in before
+        ]
+        assert all(r["active"] for r in db.get_messages(sid, include_inactive=True))
+        assert db._conn.execute(
+            "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+        ).fetchall() == []
+        agent._memory_manager.on_pre_compress.assert_not_called()
+        agent._memory_manager.on_session_switch.assert_not_called()
+        agent.commit_memory_session.assert_not_called()
+        agent.event_callback.assert_not_called()
+
+    def test_sessiondb_rejects_append_after_candidate_for_both_publications(self, tmp_path):
+        """A newer durable row can never be archived into a stale candidate."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "fence.db")
+        _seed(db, "in-place", "in-place", n=4)
+        identity = db.get_active_transcript_identity("in-place")
+        db.append_message("in-place", "user", "late durable truth")
+        with pytest.raises(RuntimeError, match="transcript changed"):
+            db.archive_and_compact(
+                "in-place", [{"role": "user", "content": "stale summary"}],
+                expected_active_identity=identity,
+            )
+        assert db.get_messages_as_conversation("in-place")[-1]["content"] == "late durable truth"
+
+        _seed(db, "rotation", "rotation", n=4)
+        identity = db.get_active_transcript_identity("rotation")
+        db.append_message("rotation", "assistant", "late durable truth")
+        with pytest.raises(RuntimeError, match="transcript changed"):
+            db.publish_compression_child(
+                parent_session_id="rotation", child_session_id="stale-child",
+                source="cli", messages=[{"role": "user", "content": "stale"}],
+                require_compression_lease=False,
+                expected_active_identity=identity,
+            )
+        assert db.get_session("stale-child") is None
+        assert db.get_messages_as_conversation("rotation")[-1]["content"] == "late durable truth"
+
+    def test_existing_store_auto_initializes_generation_and_api_content_advances_it(
+        self, tmp_path
+    ):
+        """Declarative reconciliation upgrades old SessionDB files in place."""
+        import sqlite3
+        from hermes_state import SessionDB
+
+        path = tmp_path / "legacy.db"
+        db = SessionDB(db_path=path)
+        db.create_session("legacy", "cli")
+        db.append_message("legacy", "user", "hello")
+        db.close()
+        raw = sqlite3.connect(path)
+        raw.execute("DROP TRIGGER messages_transcript_generation_insert")
+        raw.execute("DROP TRIGGER messages_transcript_generation_delete")
+        raw.execute("DROP TRIGGER messages_transcript_generation_update")
+        raw.execute("DROP TRIGGER IF EXISTS messages_transcript_generation_move")
+        raw.execute("ALTER TABLE sessions DROP COLUMN transcript_generation")
+        raw.commit()
+        raw.close()
+
+        reopened = SessionDB(db_path=path)
+        before = reopened.get_active_transcript_identity("legacy")
+        assert reopened.set_latest_user_api_content("legacy", "hello", "hello+ctx") == 1
+        assert reopened.get_active_transcript_identity("legacy") > before
+
+        # Opening an already-reconciled store is idempotent and retains the
+        # complete trigger set rather than preserving an obsolete definition.
+        reopened.close()
+        again = SessionDB(db_path=path)
+        triggers = {
+            row[0] for row in again._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_transcript_generation_%'"
+            )
+        }
+        assert triggers == {
+            "messages_transcript_generation_insert",
+            "messages_transcript_generation_delete",
+            "messages_transcript_generation_update",
+            "messages_transcript_generation_move",
+        }
+
+    def test_trigger_reconciliation_holds_write_lock_across_drop_create(self, tmp_path):
+        """No writer can mutate a transcript while its CAS triggers are replaced."""
+        import sqlite3
+        import threading
+
+        from hermes_state import SessionDB
+
+        path = tmp_path / "atomic-trigger-reconcile.db"
+        seed = SessionDB(db_path=path)
+        seed.create_session("session", "cli")
+        seed.append_message("session", "user", "before")
+        row_id = seed.get_messages("session")[0]["id"]
+        generation_before = seed.get_active_transcript_identity("session")
+        seed.close()
+
+        reconcile_conn = sqlite3.connect(
+            str(path), isolation_level=None, check_same_thread=False
+        )
+        writer = sqlite3.connect(str(path), isolation_level=None, timeout=0)
+        reached_boundary = threading.Event()
+        release_reconcile = threading.Event()
+        errors = []
+
+        class PausingCursor:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                result = self._real.execute(sql, *args, **kwargs)
+                if sql.startswith(
+                    "DROP TRIGGER IF EXISTS messages_transcript_generation_move"
+                ):
+                    reached_boundary.set()
+                    if not release_reconcile.wait(timeout=5):
+                        raise AssertionError("test did not release trigger reconciliation")
+                return result
+
+        owner = SessionDB.__new__(SessionDB)
+        owner._conn = reconcile_conn
+
+        def reconcile():
+            try:
+                owner._reconcile_transcript_generation_triggers(
+                    PausingCursor(reconcile_conn.cursor())
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=reconcile)
+        thread.start()
+        try:
+            assert reached_boundary.wait(timeout=5), "reconciliation never reached DROP boundary"
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                writer.execute(
+                    "UPDATE messages SET content = ? WHERE id = ?",
+                    ("unfenced", row_id),
+                )
+
+            release_reconcile.set()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "trigger reconciliation did not finish"
+            assert errors == []
+            assert writer.execute(
+                "SELECT content FROM messages WHERE id = ?", (row_id,)
+            ).fetchone()[0] == "before"
+
+            writer.execute(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                ("after reconciliation", row_id),
+            )
+            assert writer.execute(
+                "SELECT transcript_generation FROM sessions WHERE id = ?",
+                ("session",),
+            ).fetchone()[0] > generation_before
+        finally:
+            release_reconcile.set()
+            thread.join(timeout=5)
+            writer.close()
+            reconcile_conn.close()
+
+    def test_trigger_reconciliation_ddl_failure_rolls_back_whole_set(self, tmp_path):
+        """A failed CREATE restores every prior trigger and closes the transaction."""
+        import sqlite3
+
+        from hermes_state import SessionDB
+
+        path = tmp_path / "trigger-reconcile-rollback.db"
+        seed = SessionDB(db_path=path)
+        seed.close()
+        conn = sqlite3.connect(str(path), isolation_level=None)
+        owner = SessionDB.__new__(SessionDB)
+        owner._conn = conn
+        before = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_transcript_generation_%' ORDER BY name"
+        ).fetchall()
+
+        class FailingCursor:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                if sql.startswith("CREATE TRIGGER"):
+                    raise sqlite3.OperationalError("injected DDL failure")
+                return self._real.execute(sql, *args, **kwargs)
+
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="injected DDL failure"):
+                owner._reconcile_transcript_generation_triggers(
+                    FailingCursor(conn.cursor())
+                )
+            assert conn.in_transaction is False
+            assert conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_transcript_generation_%' ORDER BY name"
+            ).fetchall() == before
+        finally:
+            conn.close()
+
+    def test_generation_covers_every_model_field_and_excludes_presentation_only(self, tmp_path):
+        """Schema fence matches the conversation projection's semantic boundary.
+
+        Direct SQL deliberately simulates a legacy/non-cooperating writer; all
+        normal writers use SessionDB methods. Each mutation is isolated so a
+        missing trigger column cannot hide behind another advancing mutation.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "generation-fields.db")
+        db.create_session("source", "cli")
+        db.create_session("destination", "cli")
+        db.append_message("source", "assistant", "content")
+        row_id = db.get_messages("source")[0]["id"]
+        relevant = {
+            "role": "user",
+            "content": "changed content",
+            "tool_call_id": "call-1",
+            "tool_calls": '[{"id":"call-1"}]',
+            "tool_name": "terminal",
+            "effect_disposition": "committed",
+            "finish_reason": "stop",
+            "reasoning": "reasoning",
+            "reasoning_content": "reasoning content",
+            "reasoning_details": '[{"type":"text"}]',
+            "codex_reasoning_items": '[{"type":"reasoning"}]',
+            "codex_message_items": '[{"type":"message"}]',
+            "observed": 1,
+            "active": 0,
+            "compacted": 1,
+            "api_content": "provider-exact content",
+            "autonomous_completion_provenance": 1,
+        }
+        for column, value in relevant.items():
+            before = db.get_active_transcript_identity("source")
+            db._conn.execute(
+                f"UPDATE messages SET {column} = ? WHERE id = ?", (value, row_id)
+            )
+            db._conn.commit()
+            assert db.get_active_transcript_identity("source") > before, column
+
+        # These projection fields are display/routing metadata only and never
+        # reach provider input or decide the active human task.
+        for column, value in {
+            "platform_message_id": "platform-1",
+            "timestamp": 1234.5,
+            "display_kind": "hidden",
+            "display_metadata": '{"label":"presentation"}',
+        }.items():
+            before = db.get_active_transcript_identity("source")
+            db._conn.execute(
+                f"UPDATE messages SET {column} = ? WHERE id = ?", (value, row_id)
+            )
+            db._conn.commit()
+            assert db.get_active_transcript_identity("source") == before, column
+
+        source_before = db.get_active_transcript_identity("source")
+        destination_before = db.get_active_transcript_identity("destination")
+        db._conn.execute(
+            "UPDATE messages SET session_id = ? WHERE id = ?",
+            ("destination", row_id),
+        )
+        db._conn.commit()
+        assert db.get_active_transcript_identity("source") > source_before
+        assert db.get_active_transcript_identity("destination") > destination_before
+
+    def test_rotation_publication_failure_restores_parent_and_all_ephemeral_state(self):
+        """A materially admitted child that cannot publish leaves no boundary trace."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import CompressionCommitFence, compress_context
+        from agent import relay_runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "rotation-publication-failure"
+            _seed(db, sid, "authoritative-parent", n=4)
+            db.patch_session_model_config(sid, {"authority": "parent"})
+            db.update_system_prompt(sid, "durable-parent-prompt")
+            agent = _make_agent(db, sid, in_place=False)
+            messages = db.get_messages_as_conversation(sid)
+            original = copy.deepcopy(messages)
+            agent._cached_system_prompt = "cached-parent\x00"
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._last_flushed_db_idx = 3
+            agent._flushed_db_message_ids = {101, 202}
+            agent._flushed_db_message_session_id = sid
+            agent._flush_messages_to_session_db = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = (
+                "deterministic external memory prompt"
+            )
+            agent.commit_memory_session = MagicMock()
+            agent.event_callback = MagicMock()
+            agent.context_compressor.on_session_start = MagicMock()
+            boundary_observer = MagicMock()
+            fence = CompressionCommitFence()
+            before_rows = db.get_messages(sid, include_inactive=True)
+            before_parent = db.get_session(sid)
+
+            with patch.object(
+                relay_runtime.SESSION_COORDINATOR,
+                "notify_session_compacted",
+                boundary_observer,
+            ), patch.object(
+                db,
+                "publish_compression_child",
+                side_effect=RuntimeError("atomic publication denied"),
+            ):
+                returned, prompt = compress_context(
+                    agent,
+                    messages,
+                    "sys",
+                    approx_tokens=100_000,
+                    commit_fence=fence,
+                )
+
+            assert returned is messages
+            assert messages == original
+            assert prompt == "cached-parent\x00"
+            assert agent._cached_system_prompt == "cached-parent\x00"
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent.session_id == sid
+            assert agent._last_compression_outcome == "persistence_failure"
+            assert agent._last_flushed_db_idx == 3
+            assert agent._flushed_db_message_ids == {101, 202}
+            assert agent._flushed_db_message_session_id == sid
+            assert agent._last_compression_attempt_in_place is None
+            assert agent._last_compaction_in_place is False
+            assert db.get_messages(sid, include_inactive=True) == before_rows
+            assert fence.commit_in_flight is False
+            assert db.get_compression_lock_holder(sid) is None
+            after_parent = db.get_session(sid)
+            for field in ("parent_session_id", "message_count", "model_config", "system_prompt", "end_reason"):
+                assert after_parent[field] == before_parent[field]
+            assert db._conn.execute(
+                "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+            ).fetchall() == []
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.context_compressor.on_session_start.assert_not_called()
+            boundary_observer.assert_not_called()
+            agent.event_callback.assert_not_called()
+
+    def test_archive_and_compact_atomically_updates_transcript_config_and_prompt(self):
+        """The SessionDB API publishes every boundary field in one transaction."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "atomic_boundary"
+            _seed(db, sid, "atomic", n=2)
+
+            db.archive_and_compact(
+                sid,
+                [{"role": "user", "content": "durable summary"}],
+                model_config_patch={"compression_count": 7, "marker": "kept"},
+                system_prompt="prompt-after",
+            )
+
+            assert [m["content"] for m in db.get_messages_as_conversation(sid)] == [
+                "durable summary"
+            ]
+            all_rows = db.get_messages(sid, include_inactive=True)
+            assert [m["content"] for m in all_rows if not m["active"]] == [
+                "m0 " + ("payload " * 2_999) + "payload",
+                "m1 " + ("payload " * 2_999) + "payload",
+            ]
+            row = db.get_session(sid)
+            model_config = json.loads(row["model_config"])
+            assert model_config["compression_count"] == 7
+            assert model_config["marker"] == "kept"
+            assert row["system_prompt"] == "prompt-after"
+
+    def test_archive_and_compact_replaces_hashed_prompt_across_restart(self):
+        """Compaction atomically replaces modern prompt storage and its hash."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=path)
+            sid = "hashed_prompt_boundary"
+            _seed(db, sid, "hashed", n=2)
+            db.update_system_prompt(sid, "prompt-before")
+            old_hash = db._conn.execute(
+                "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()[0]
+
+            db.archive_and_compact(
+                sid,
+                [{"role": "user", "content": "durable summary"}],
+                system_prompt="prompt-after",
+            )
+            db.close()
+
+            reopened = SessionDB(db_path=path)
+            row = reopened.get_session(sid)
+            stored = reopened._conn.execute(
+                "SELECT system_prompt_hash, system_prompt FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+            assert row["system_prompt"] == "prompt-after"
+            assert stored[0] != old_hash
+            assert stored[1] is None
+            assert reopened._conn.execute(
+                "SELECT 1 FROM system_prompts WHERE hash = ?", (old_hash,)
+            ).fetchone() is None
+            reopened.close()
+
+    def test_archive_and_compact_failure_rolls_back_every_boundary_field(self):
+        """A failure after archiving starts leaves no partially published state."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=path)
+            sid = "atomic_rollback"
+            _seed(db, sid, "atomic", n=2)
+            db.patch_session_model_config(sid, {"compression_count": 3})
+            db.update_system_prompt(sid, "prompt-before")
+            before_messages = db.get_messages(sid, include_inactive=True)
+            before_session = db.get_session(sid)
+
+            with patch.object(
+                db,
+                "_insert_message_rows",
+                side_effect=RuntimeError("injected after archive"),
+            ):
+                with pytest.raises(RuntimeError, match="injected after archive"):
+                    db.archive_and_compact(
+                        sid,
+                        [{"role": "user", "content": "must-not-land"}],
+                        model_config_patch={"compression_count": 4},
+                        system_prompt="prompt-after",
+                    )
+            db.close()
+
+            reopened = SessionDB(db_path=path)
+            assert reopened.get_messages(sid, include_inactive=True) == before_messages
+            after_session = reopened.get_session(sid)
+            for field in ("message_count", "tool_call_count", "model_config", "system_prompt"):
+                assert after_session[field] == before_session[field]
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB
@@ -71,7 +561,7 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = db.get_messages_as_conversation(sid)
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -94,23 +584,24 @@ class TestInPlaceCompaction:
             # compacted set so compaction actually shrinks the live session and
             # doesn't immediately re-compact (#38763).
             reloaded = db.get_messages_as_conversation(sid)
-            assert len(reloaded) == 2
+            assert len(reloaded) == 3
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                messages[-2]["content"],
             ]
-            assert row["message_count"] == 2  # live (active) count
+            assert row["message_count"] == 3  # live (active) count
             # NON-DESTRUCTIVE: the 8 seeded originals survive at active=0
-            # alongside the 2 compacted rows — nothing was DELETEd.
+            # alongside the 3 compacted rows — nothing was DELETEd.
             all_rows = db.get_messages(sid, include_inactive=True)
-            assert len(all_rows) == 10
+            assert len(all_rows) == 11
             archived = [m for m in all_rows if not m.get("active", 1)]
             assert len(archived) == 8
             # The originals remain FTS-searchable (active=0 is a content-
             # preserving UPDATE; the fts triggers don't key on active).
             hit = db._conn.execute(
                 "SELECT 1 FROM messages_fts f JOIN messages m ON m.id = f.rowid "
-                "WHERE m.session_id = ? AND messages_fts MATCH 'msg' AND m.active = 0 "
+                "WHERE m.session_id = ? AND messages_fts MATCH 'payload' AND m.active = 0 "
                 "LIMIT 1",
                 (sid,),
             ).fetchone()
@@ -122,7 +613,7 @@ class TestInPlaceCompaction:
             # Rotation-independent in-place signal set for the gateway.
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
-            assert len(compressed) == 2
+            assert len(compressed) == 3
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
@@ -134,7 +625,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = db.get_messages_as_conversation(sid)
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -142,9 +633,8 @@ class TestInPlaceCompaction:
             assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
 
 
-    def test_rotation_still_preflushes(self):
-        """Rotation MUST pre-flush so current-turn messages survive in the
-        preserved old (parent) session before it is ended (#47202)."""
+    def test_rotation_does_not_preflush_after_candidate_generation(self):
+        """Rotation keeps publication fencing valid by not mutating its parent."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
@@ -157,10 +647,10 @@ class TestInPlaceCompaction:
                 "n", calls["n"] + 1
             )
             compress_context(
-                agent, [{"role": "user", "content": "x"}] * 8,
+                agent, db.get_messages_as_conversation("rot_flush"),
                 approx_tokens=100_000, system_message="sys",
             )
-            assert calls["n"] == 1
+            assert calls["n"] == 0
 
 
 class TestRotationFallbackWhenFlagOff:
@@ -178,7 +668,7 @@ class TestRotationFallbackWhenFlagOff:
             agent = _make_agent(db, sid, in_place=False)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = db.get_messages_as_conversation(sid)
             compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -197,11 +687,12 @@ class TestRotationFallbackWhenFlagOff:
             assert child[0]["title"] == "my-research"
             # The compacted child is persisted atomically at the rotation
             # boundary, so a headless process killed before finalization can
-            # still resume it without duplicating the two handoff messages.
-            assert agent._last_flushed_db_idx == 2
+            # still resume it without duplicating the three handoff messages.
+            assert agent._last_flushed_db_idx == 3
             assert [m.get("content") for m in db.get_messages_as_conversation(agent.session_id)] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                messages[-2]["content"],
             ]
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
@@ -221,7 +712,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, [{"role": "user", "content": "x"}] * 8,
+                a_ip, db.get_messages_as_conversation("s_ip"),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True
@@ -230,7 +721,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_rot", "rot")
             a_rot = _make_agent(db, "s_rot", in_place=False)
             compress_context(
-                a_rot, [{"role": "user", "content": "x"}] * 8,
+                a_rot, db.get_messages_as_conversation("s_rot"),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_rot._last_compaction_in_place is False
@@ -243,6 +734,338 @@ class TestInPlaceConfigDefault:
         from hermes_cli.config import DEFAULT_CONFIG
 
         assert DEFAULT_CONFIG["compression"].get("in_place") is True
+
+
+class TestCompressionAttemptStateContract:
+    def _agent(self, tmp_path, suffix="attempt-state"):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / f"{suffix}.db")
+        sid = suffix
+        _seed(db, sid, suffix)
+        return db, _make_agent(db, sid, in_place=True)
+
+    def test_graph_snapshot_restores_nested_resources_aliases_and_cycles(
+        self, tmp_path
+    ):
+        _db, agent = self._agent(tmp_path, "resource-graph")
+
+        class OpaqueResource:
+            def __init__(self, label):
+                self.label = label
+                self.copy_calls = 0
+                self.close_calls = 0
+
+            def __copy__(self):
+                self.copy_calls += 1
+                raise AssertionError(f"copied {self.label}")
+
+            def __deepcopy__(self, _memo):
+                self.copy_calls += 1
+                raise AssertionError(f"deep-copied {self.label}")
+
+            def close(self):
+                self.close_calls += 1
+
+        client = OpaqueResource("client")
+        database = OpaqueResource("database")
+        lock = threading.Lock()
+        shared = ["original"]
+        self_cycle = []
+        self_cycle.append(self_cycle)
+        mutual_list = []
+        mutual_dict = {"back": mutual_list}
+        mutual_list.append(mutual_dict)
+        structural_tuple = (shared, client, lock, database)
+        state = {
+            "client": client,
+            "database": database,
+            "lock": lock,
+            "left": shared,
+            "right": shared,
+            "tuple": structural_tuple,
+            "self_cycle": self_cycle,
+            "mutual": mutual_dict,
+            "removed": {"value": 7},
+        }
+        agent.context_compressor.selector_state = state
+        agent.context_compressor.selector_state_alias = state
+
+        snapshot = agent.context_compressor.snapshot_compression_attempt_state()
+        removed = state.pop("removed")
+        removed["value"] = 99
+        shared[:] = ["mutated"]
+        shared.append(client)
+        state["added"] = [database]
+        self_cycle[:] = ["broken"]
+        mutual_dict.clear()
+        mutual_list[:] = ["broken"]
+        agent.context_compressor.selector_state = {"replacement": database}
+        agent.context_compressor.attempt_owned = [client]
+
+        agent.context_compressor.restore_compression_attempt_state(snapshot)
+
+        assert agent.context_compressor.selector_state is state
+        assert agent.context_compressor.selector_state_alias is state
+        assert state["client"] is client
+        assert state["database"] is database
+        assert state["lock"] is lock
+        assert state["left"] is shared is state["right"]
+        assert shared == ["original"]
+        assert state["tuple"] is structural_tuple
+        assert structural_tuple == (shared, client, lock, database)
+        assert self_cycle[0] is self_cycle
+        assert mutual_dict["back"] is mutual_list
+        assert mutual_list[0] is mutual_dict
+        assert state["removed"] is removed
+        assert removed == {"value": 7}
+        assert "added" not in state
+        assert not hasattr(agent.context_compressor, "attempt_owned")
+        assert client.copy_calls == database.copy_calls == 0
+        assert client.close_calls == database.close_calls == 0
+
+    @pytest.mark.parametrize("exit_kind", ["rejected", "cancelled", "exception"])
+    def test_rollback_paths_preserve_nested_opaque_resources(
+        self, tmp_path, exit_kind
+    ):
+        from agent.auxiliary_client import AuxiliaryExplicitCancellation
+        from agent.conversation_compression import compress_context
+
+        class DatabaseHandle:
+            def __init__(self):
+                self.copy_calls = 0
+                self.close_calls = 0
+
+            def __copy__(self):
+                self.copy_calls += 1
+                raise AssertionError("database handle copied")
+
+            def __deepcopy__(self, _memo):
+                self.copy_calls += 1
+                raise AssertionError("database handle deep-copied")
+
+            def close(self):
+                self.close_calls += 1
+
+        _db, agent = self._agent(tmp_path, f"resource-{exit_kind}")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        handle = DatabaseHandle()
+        lock = threading.Lock()
+        items = [handle, lock, "control"]
+        state = {"items": items, "alias": items, "tuple": (handle, items)}
+        agent.context_compressor.selector_state = state
+
+        def terminate(candidate, **_kwargs):
+            items[:] = ["speculative"]
+            state.pop("tuple")
+            state["new"] = handle
+            if exit_kind == "cancelled":
+                raise AuxiliaryExplicitCancellation()
+            if exit_kind == "exception":
+                raise RuntimeError("selector failed")
+            return candidate
+
+        agent.context_compressor.compress = terminate
+        if exit_kind == "exception":
+            with pytest.raises(RuntimeError, match="selector failed"):
+                compress_context(
+                    agent, messages, "sys", approx_tokens=100_000, force=True
+                )
+        else:
+            returned, _ = compress_context(
+                agent, messages, "sys", approx_tokens=100_000, force=True
+            )
+            assert returned is messages
+
+        assert agent.context_compressor.selector_state is state
+        assert state["items"] is items is state["alias"]
+        assert items[0] is handle
+        assert items[1] is lock
+        assert items[2] == "control"
+        assert state["tuple"][0] is handle
+        assert state["tuple"][1] is items
+        assert "new" not in state
+        assert handle.copy_calls == handle.close_calls == 0
+
+    def test_rejection_restores_aliased_containers_in_place(self, tmp_path):
+        from agent.conversation_compression import compress_context
+
+        _db, agent = self._agent(tmp_path, "aliased-rejection")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        shared_list = ["control"]
+        shared_dict = {"cursor": 0, "items": shared_list}
+        dict_alias = shared_dict
+        list_alias = shared_list
+        agent.context_compressor.selector_state = shared_dict
+        agent.context_compressor.selector_items = shared_list
+        opaque = object()
+        agent.context_compressor.selector_client = opaque
+
+        def reject(candidate, **_kwargs):
+            agent.context_compressor.selector_state["cursor"] = 9
+            agent.context_compressor.selector_items.append("speculative")
+            agent.context_compressor.speculative_owned_field = ["remove me"]
+            return candidate
+
+        agent.context_compressor.compress = reject
+        returned, _ = compress_context(
+            agent, messages, "sys", approx_tokens=100_000, force=True
+        )
+
+        assert returned is messages
+        assert agent.context_compressor.selector_state is dict_alias
+        assert agent.context_compressor.selector_items is list_alias
+        assert dict_alias == {"cursor": 0, "items": ["control"]}
+        assert list_alias == ["control"]
+        assert dict_alias["items"] is list_alias
+        assert not hasattr(agent.context_compressor, "speculative_owned_field")
+        assert agent.context_compressor.selector_client is opaque
+        assert (dict_alias["cursor"], list(list_alias)) == (0, ["control"])
+
+    def test_custom_dataclass_hook_restores_identity_and_selection(self, tmp_path):
+        from agent.conversation_compression import compress_context
+
+        @dataclass
+        class RouterState:
+            cursor: int
+            topics: list[str]
+
+        _db, agent = self._agent(tmp_path, "custom-state-rejection")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        state = RouterState(0, ["control"])
+        external_alias = state
+        agent.context_compressor.router_state = state
+
+        def snapshot(engine):
+            return (engine.router_state, copy.deepcopy(engine.router_state))
+
+        def restore(engine, token):
+            original, saved = token
+            original.cursor = saved.cursor
+            original.topics[:] = saved.topics
+            engine.router_state = original
+            vars(engine).pop("attempt_route", None)
+
+        agent.context_compressor.snapshot_compression_attempt_state = types.MethodType(
+            snapshot, agent.context_compressor
+        )
+        agent.context_compressor.restore_compression_attempt_state = types.MethodType(
+            restore, agent.context_compressor
+        )
+
+        def reject(candidate, **_kwargs):
+            state.cursor = 4
+            state.topics.append("speculative")
+            agent.context_compressor.attempt_route = "owned"
+            return candidate
+
+        agent.context_compressor.compress = reject
+        control_selection = (state.cursor, tuple(state.topics))
+        compress_context(agent, messages, "sys", approx_tokens=100_000, force=True)
+
+        assert agent.context_compressor.router_state is external_alias
+        assert (state.cursor, tuple(state.topics)) == control_selection
+        assert not hasattr(agent.context_compressor, "attempt_route")
+
+    @pytest.mark.parametrize("exit_kind", ["cancel", "exception"])
+    def test_cancellation_and_exception_restore_hook_once(self, tmp_path, exit_kind):
+        from agent.auxiliary_client import AuxiliaryExplicitCancellation
+        from agent.conversation_compression import compress_context
+
+        _db, agent = self._agent(tmp_path, f"restore-once-{exit_kind}")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        original_restore = agent.context_compressor.restore_compression_attempt_state
+        restore = MagicMock(side_effect=original_restore)
+        agent.context_compressor.restore_compression_attempt_state = restore
+
+        error = (
+            AuxiliaryExplicitCancellation()
+            if exit_kind == "cancel"
+            else RuntimeError("selector failed")
+        )
+
+        def fail(_candidate, **_kwargs):
+            raise error
+
+        agent.context_compressor.compress = fail
+        if exit_kind == "cancel":
+            compress_context(agent, messages, "sys", approx_tokens=100_000, force=True)
+        else:
+            with pytest.raises(RuntimeError, match="selector failed"):
+                compress_context(
+                    agent, messages, "sys", approx_tokens=100_000, force=True
+                )
+        assert restore.call_count == 1
+
+    def test_successful_publication_does_not_restore_committed_state(self, tmp_path):
+        from agent.conversation_compression import compress_context
+
+        _db, agent = self._agent(tmp_path, "successful-state-publication")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        original_restore = agent.context_compressor.restore_compression_attempt_state
+        restore = MagicMock(side_effect=original_restore)
+        agent.context_compressor.restore_compression_attempt_state = restore
+        state = {"cursor": 0}
+        agent.context_compressor.selector_state = state
+
+        def commit(_candidate, **_kwargs):
+            state["cursor"] = 1
+            return [
+                {"role": "user", "content": "summary"},
+                {"role": "assistant", "content": "tail"},
+            ]
+
+        agent.context_compressor.compress = commit
+        compressed, _ = compress_context(
+            agent, messages, "sys", approx_tokens=100_000, force=True
+        )
+
+        assert compressed is not messages
+        assert state == {"cursor": 1}
+        # Candidate selection first rewinds the selector from the
+        # pre-old projection snapshot.  A successful publication must keep
+        # the candidate mutation and must not perform the separate abort
+        # rollback to the attempt snapshot.
+        restore.assert_called_once()
+        assert restore.call_args.args[0] is not None
+
+    def test_successful_publication_keeps_nested_resource_identity(self, tmp_path):
+        from agent.conversation_compression import compress_context
+
+        class Client:
+            def __init__(self):
+                self.copy_calls = 0
+                self.close_calls = 0
+
+            def __deepcopy__(self, _memo):
+                self.copy_calls += 1
+                raise AssertionError("client deep-copied")
+
+            def close(self):
+                self.close_calls += 1
+
+        _db, agent = self._agent(tmp_path, "resource-success")
+        messages = agent._session_db.get_messages_as_conversation(agent.session_id)
+        client = Client()
+        state = {"client": client, "published": False}
+        agent.context_compressor.selector_state = state
+
+        def commit(_candidate, **_kwargs):
+            state["published"] = True
+            return [
+                {"role": "user", "content": "summary"},
+                {"role": "assistant", "content": "tail"},
+            ]
+
+        agent.context_compressor.compress = commit
+        compressed, _ = compress_context(
+            agent, messages, "sys", approx_tokens=100_000, force=True
+        )
+
+        assert compressed is not messages
+        assert state == {"client": client, "published": True}
+        assert state["client"] is client
+        assert client.copy_calls == client.close_calls == 0
 
 
 class TestInPlaceAntiGrowthGuard:
@@ -273,7 +1096,7 @@ class TestInPlaceAntiGrowthGuard:
                 ]
 
             agent.context_compressor.compress = _growing_compress
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = db.get_messages_as_conversation(sid)
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -285,13 +1108,547 @@ class TestInPlaceAntiGrowthGuard:
             # Durable state is byte-for-byte the pre-compression live set:
             # nothing archived, nothing inserted.
             reloaded = db.get_messages_as_conversation(sid)
-            assert [m["content"] for m in reloaded] == [f"msg {i}" for i in range(8)]
+            assert [m["content"] for m in reloaded] == [
+                f"m{i} " + ("payload " * 2_999) + "payload" for i in range(8)
+            ]
             all_rows = db.get_messages(sid, include_inactive=True)
             assert len(all_rows) == 8
             assert not any(not m.get("active", 1) for m in all_rows)
             # Session identity untouched.
             assert agent.session_id == sid
             assert db.get_session(sid)["end_reason"] is None
+
+    def test_request_overhead_can_make_message_shrink_marginal(self):
+        """Admission uses comparable full requests, never message-only size."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_request_estimator"
+            _seed(db, sid, "request")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            before_rows = db.get_messages(sid, include_inactive=True)
+
+            estimates = []
+
+            def _request_estimate(candidate, *, system_prompt="", tools=None):
+                # Message-only sizing shrinks dramatically, but the exact
+                # request overhead leaves only 3K reclaim (< the 9.6K floor).
+                estimates.append(copy.deepcopy(candidate))
+                return (100_000, 97_000)[len(estimates) - 1]
+
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=_request_estimate,
+            ):
+                returned, _ = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            assert returned is messages
+            assert agent._last_compression_outcome == "rejected_below_minimum_reclaim"
+            cooldown = db.get_compression_failure_cooldown(sid)
+            assert cooldown is not None
+            assert cooldown["error"] == "below_minimum_reclaim"
+            assert len(cooldown["error"]) < 256
+            fresh = _make_agent(db, sid, in_place=True)
+            fresh.context_compressor.bind_session_state(db, sid)
+            assert fresh.context_compressor.get_active_compression_failure_cooldown()
+            after_rows = db.get_messages(sid, include_inactive=True)
+            assert [(r["id"], r["active"]) for r in after_rows] == [
+                (r["id"], r["active"]) for r in before_rows
+            ]
+
+    @pytest.mark.parametrize(
+        ("request_out", "outcome"),
+        [
+            (101_000, "rejected_would_grow"),
+            (100_000, "rejected_no_progress"),
+            (97_000, "rejected_below_minimum_reclaim"),
+        ],
+    )
+    def test_policy_rejection_precedes_every_persistence_side_effect(
+        self, request_out, outcome
+    ):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = f"policy_{outcome}"
+            _seed(db, sid, "policy")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            before = [(r["id"], r["active"]) for r in db.get_messages(
+                sid, include_inactive=True
+            )]
+            agent.commit_memory_session = MagicMock()
+            side_effects = [
+                "archive_and_compact", "publish_compression_child",
+                "end_session", "create_session",
+            ]
+            spies = {
+                name: patch.object(db, name, wraps=getattr(db, name))
+                for name in side_effects if hasattr(db, name)
+            }
+            started = {name: spy.start() for name, spy in spies.items()}
+            agent._flush_messages_to_session_db = MagicMock()
+            try:
+                estimates = iter((100_000, request_out))
+                with patch(
+                    "agent.conversation_compression.estimate_request_tokens_rough",
+                    side_effect=lambda candidate, **kwargs: next(estimates),
+                ):
+                    returned, _ = compress_context(
+                        agent, messages, approx_tokens=100_000,
+                        system_message="sys",
+                    )
+            finally:
+                for spy in spies.values():
+                    spy.stop()
+            assert returned is messages
+            assert agent._last_compression_outcome == outcome
+            agent.commit_memory_session.assert_not_called()
+            agent._flush_messages_to_session_db.assert_not_called()
+            assert all(mock.call_count == 0 for mock in started.values())
+            after = [(r["id"], r["active"]) for r in db.get_messages(
+                sid, include_inactive=True
+            )]
+            assert after == before
+
+    @pytest.mark.parametrize("rejection_cooldown_seconds", [60.0, None])
+    def test_compressor_no_progress_has_no_persistence_side_effects(
+        self, rejection_cooldown_seconds
+    ):
+        """Equivalent compressor output is rejected before request admission."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = f"compressor_no_progress_{rejection_cooldown_seconds}"
+            _seed(db, sid, "no-progress")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            agent.context_compressor.compress = lambda current, **kwargs: current
+            before = [(r["id"], r["active"]) for r in db.get_messages(
+                sid, include_inactive=True
+            )]
+            agent.commit_memory_session = MagicMock()
+            agent._flush_messages_to_session_db = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = ""
+            agent.event_callback = MagicMock()
+            with patch.object(db, "archive_and_compact", wraps=db.archive_and_compact) as archive, \
+                 patch.object(db, "publish_compression_child", wraps=db.publish_compression_child) as publish, \
+                 patch.object(db, "record_compression_failure_cooldown", wraps=db.record_compression_failure_cooldown) as cooldown:
+                returned, _ = compress_context(
+                    agent, messages, "sys", approx_tokens=100_000,
+                    rejection_cooldown_seconds=rejection_cooldown_seconds,
+                )
+            assert returned is messages
+            assert agent._last_compression_outcome == "rejected_no_progress"
+            agent.commit_memory_session.assert_not_called()
+            agent._flush_messages_to_session_db.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.event_callback.assert_not_called()
+            archive.assert_not_called()
+            publish.assert_not_called()
+            assert [(r["id"], r["active"]) for r in db.get_messages(
+                sid, include_inactive=True
+            )] == before
+            if rejection_cooldown_seconds is None:
+                cooldown.assert_not_called()
+            else:
+                cooldown.assert_called_once()
+                assert db.get_compression_failure_cooldown(sid)["error"] == "no_progress"
+
+    def test_uncached_admission_uses_built_input_prompt(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        from agent.conversation_loop import _project_provider_request
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "uncached_prompt"
+            _seed(db, sid, "prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            agent._cached_system_prompt = None
+            agent._cached_system_prompt_static = None
+            agent._build_system_prompt = MagicMock(return_value="EXACT BUILT PROMPT")
+            seen = []
+            messages_before = copy.deepcopy(messages)
+            tools_before = copy.deepcopy(agent.tools)
+            estimates = iter((100_000, 80_000))
+
+            def estimate(candidate, *, tools=None):
+                seen.append((copy.deepcopy(candidate), copy.deepcopy(tools)))
+                return next(estimates)
+
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=estimate,
+            ):
+                compress_context(agent, messages, "sys", approx_tokens=100_000)
+            assert len(seen) == 2
+            request_in, tools_in = seen[0]
+            request_out, tools_out = seen[1]
+            expected_in = _project_provider_request(
+                agent,
+                messages_before,
+                system_prompt="EXACT BUILT PROMPT",
+                tools=tools_before,
+                apply_context_selection=False,
+            )
+            assert request_in == expected_in["messages"]
+            assert request_out[0] == request_in[0]
+            assert request_out != request_in
+            assert sum(
+                row.get("content") == "EXACT BUILT PROMPT" for row in request_in
+            ) == 1
+            assert sum(
+                row.get("content") == "EXACT BUILT PROMPT" for row in request_out
+            ) == 1
+            assert tools_in == tools_out == tools_before
+            assert messages == messages_before
+            assert agent.tools == tools_before
+
+    @pytest.mark.parametrize(
+        ("request_out", "outcome"),
+        [(100_000, "rejected_no_progress"), (101_000, "rejected_would_grow"),
+         (97_000, "rejected_below_minimum_reclaim")],
+    )
+    def test_in_place_mutating_engine_rolls_back_against_immutable_input(
+        self, request_out, outcome, request
+    ):
+        """A plugin may mutate and return its exact input list (#remediation-7)."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        from agent.conversation_loop import _project_provider_request
+        from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            request.addfinalizer(db.close)
+            sid = f"mutating-{outcome}"
+            _seed(db, sid, "mutating")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            original = copy.deepcopy(messages)
+            cached, static = "old prompt\x00", "old static\U0001f680"
+            agent._cached_system_prompt = cached
+            agent._cached_system_prompt_static = static
+            agent.commit_memory_session = MagicMock()
+            agent._flush_messages_to_session_db = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = (
+                "deterministic external memory prompt"
+            )
+            agent.event_callback = MagicMock()
+
+            def mutate(candidate, **_kwargs):
+                candidate[:] = (
+                    copy.deepcopy(original) if outcome == "rejected_no_progress"
+                    else [
+                        {"role": "user", "content": "mutated candidate"},
+                        {"role": "assistant", "content": "mutated answer"},
+                    ]
+                )
+                return candidate
+
+            agent.context_compressor.compress = mutate
+            estimates = []
+            tools_before = copy.deepcopy(agent.tools)
+
+            def estimate(payload):
+                estimates.append(
+                    (
+                        copy.deepcopy(payload["messages"]),
+                        copy.deepcopy(payload.get("tools")),
+                    )
+                )
+                return 100_000 if len(estimates) == 1 else request_out
+
+            with patch(
+                "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+                side_effect=estimate,
+            ), patch.object(db, "archive_and_compact") as archive, patch.object(
+                db, "publish_compression_child"
+            ) as publish, patch.object(db, "end_session") as end, patch.object(
+                db, "create_session"
+            ) as create:
+                returned, prompt = compress_context(
+                    agent, messages, "sys", approx_tokens=100_000
+                )
+
+            if outcome == "rejected_no_progress":
+                assert len(estimates) == 0
+            else:
+                assert len(estimates) == 2
+                request_in, tools_in = estimates[0]
+                request_out_rows, tools_out = estimates[1]
+                expected_in = _project_provider_request(
+                    agent,
+                    original,
+                    system_prompt=cached,
+                    tools=tools_before,
+                    apply_context_selection=False,
+                    static_system_prefix=static,
+                )
+                assert request_in == expected_in["messages"]
+                assert request_out_rows[0]["role"] == "system"
+                built_output_prompt = request_out_rows[0]["content"]
+                for required_fragment in (
+                    DEFAULT_AGENT_IDENTITY,
+                    "deterministic external memory prompt",
+                    "Conversation started:",
+                    "Model: test/model",
+                ):
+                    assert built_output_prompt.count(required_fragment) == 1
+                assert built_output_prompt.split("\n\n").count("sys") == 1
+                assert sum(
+                    row.get("role") == "system" for row in request_out_rows
+                ) == 1
+                assert request_out_rows != request_in
+                admitted_content = "\n".join(
+                    str(message.get("content", "")) for message in request_out_rows
+                )
+                assert "mutated candidate" in admitted_content
+                assert original[-2]["content"] in admitted_content
+                assert sum(row.get("content") == cached for row in request_in) == 1
+                assert tools_in == tools_out == tools_before
+            assert returned is messages
+            assert messages == original
+            assert prompt == cached
+            assert agent._cached_system_prompt == cached
+            assert agent._cached_system_prompt_static == static
+            assert agent.tools == tools_before
+            assert agent._last_compression_outcome == outcome
+            agent.commit_memory_session.assert_not_called()
+            agent._flush_messages_to_session_db.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.event_callback.assert_not_called()
+            for side_effect in (archive, publish, end, create):
+                side_effect.assert_not_called()
+
+    def test_uncached_exact_noop_removes_prompt_cache_attributes(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "uncached-noop"
+            _seed(db, sid, "uncached")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._build_system_prompt = MagicMock(return_value="logical built prompt")
+            agent.context_compressor.compress = lambda current, **_kwargs: current
+            agent.commit_memory_session = MagicMock()
+            agent._flush_messages_to_session_db = MagicMock()
+            agent.event_callback = MagicMock()
+
+            with patch.object(db, "archive_and_compact") as archive, patch.object(
+                db, "publish_compression_child"
+            ) as publish:
+                returned, prompt = compress_context(
+                    agent, messages, "base prompt", approx_tokens=100_000
+                )
+
+            assert returned is messages
+            assert prompt == "logical built prompt"
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent._last_compression_outcome == "rejected_no_progress"
+            agent.commit_memory_session.assert_not_called()
+            agent._flush_messages_to_session_db.assert_not_called()
+            agent.event_callback.assert_not_called()
+            archive.assert_not_called()
+            publish.assert_not_called()
+
+    def test_candidate_preparation_exception_restores_complete_precommit_state(self):
+        """A post-engine helper failure unwinds mutable input, caches and callbacks."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import CompressionCommitFence, compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "candidate-preparation-rollback"
+            _seed(db, sid, "candidate")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            original = copy.deepcopy(messages)
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            from agent.conversation_compression import (
+                _snapshot_compressor_attempt_state,
+            )
+            attempt_before = _snapshot_compressor_attempt_state(
+                agent.context_compressor
+            )
+            agent.commit_memory_session = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = (
+                "deterministic external memory prompt"
+            )
+            agent.event_callback = MagicMock()
+            fence = CompressionCommitFence()
+
+            def mutate(candidate, **_kwargs):
+                candidate[:] = [
+                    {"role": "user", "content": "candidate"},
+                    {"role": "assistant", "content": "candidate answer"},
+                ]
+                return candidate
+
+            agent.context_compressor.compress = mutate
+            with patch.object(
+                agent,
+                "_invalidate_system_prompt",
+                side_effect=RuntimeError("post-engine helper failed"),
+            ), pytest.raises(RuntimeError, match="post-engine helper failed"):
+                compress_context(
+                    agent,
+                    messages,
+                    "sys",
+                    approx_tokens=100_000,
+                    commit_fence=fence,
+                )
+
+            assert messages == original
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert _snapshot_compressor_attempt_state(
+                agent.context_compressor
+            ) == attempt_before
+            assert agent.session_id == sid
+            assert agent._last_compression_attempt_in_place is None
+            assert agent._last_compaction_in_place is False
+            assert db.get_compression_lock_holder(sid) is None
+            assert fence.commit_in_flight is False
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.event_callback.assert_not_called()
+
+    def test_in_place_publication_failure_has_no_boundary_side_effects(self):
+        """A failed durable publication returns the exact pre-attempt boundary."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import CompressionCommitFence, compress_context
+        from agent import relay_runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "in-place-publication-failure"
+            _seed(db, sid, "failure")
+            messages = db.get_messages_as_conversation(sid)
+            original = copy.deepcopy(messages)
+            agent = _make_agent(db, sid, in_place=True)
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._last_flushed_db_idx = 5
+            agent._flushed_db_message_ids = {17}
+            agent._memory_manager = MagicMock()
+            agent._memory_manager.build_system_prompt.return_value = (
+                "deterministic external memory prompt"
+            )
+            agent.commit_memory_session = MagicMock()
+            agent.event_callback = MagicMock()
+            agent.context_compressor.on_session_start = MagicMock()
+            boundary_observer = MagicMock()
+            fence = CompressionCommitFence()
+            before_rows = db.get_messages(sid, include_inactive=True)
+            before_session = db.get_session(sid)
+
+            with patch.object(
+                relay_runtime.SESSION_COORDINATOR,
+                "notify_session_compacted",
+                boundary_observer,
+            ), patch.object(
+                db, "archive_and_compact", side_effect=RuntimeError("disk full")
+            ):
+                returned, _prompt = compress_context(
+                    agent,
+                    messages,
+                    "sys",
+                    approx_tokens=100_000,
+                    commit_fence=fence,
+                )
+
+            assert returned is messages
+            assert messages == original
+            assert agent._last_compression_outcome == "persistence_failure"
+            assert agent.session_id == sid
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent._last_flushed_db_idx == 5
+            assert agent._flushed_db_message_ids == {17}
+            assert agent._last_compression_attempt_in_place is None
+            assert agent._last_compaction_in_place is False
+            assert db.get_messages(sid, include_inactive=True) == before_rows
+            assert fence.commit_in_flight is False
+            assert db.get_compression_lock_holder(sid) is None
+            after_session = db.get_session(sid)
+            for field in ("message_count", "model_config", "system_prompt", "end_reason"):
+                assert after_session[field] == before_session[field]
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.context_compressor.on_session_start.assert_not_called()
+            boundary_observer.assert_not_called()
+            agent.event_callback.assert_not_called()
+
+    def test_rejection_restores_both_prompt_cache_tiers_byte_for_byte(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "cached_prompt_restore"
+            _seed(db, sid, "prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            cached = "cached\x00prompt\U0001f642"
+            static = "static\x00prefix\U0001f680"
+            agent._cached_system_prompt = cached
+            agent._cached_system_prompt_static = static
+            estimates = iter((100_000, 100_000))
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=lambda candidate, **kwargs: next(estimates),
+            ):
+                returned, prompt = compress_context(
+                    agent, messages, "sys", approx_tokens=100_000
+                )
+            assert returned is messages
+            assert prompt == cached
+            assert agent._cached_system_prompt == cached
+            assert agent._cached_system_prompt_static == static
+
+    def test_manual_rejection_does_not_write_automatic_cooldown(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_manual_reject"
+            _seed(db, sid, "manual")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            estimates = iter((100_000, 97_000))
+            with patch(
+                "agent.conversation_compression.estimate_request_tokens_rough",
+                side_effect=lambda candidate, **kwargs: next(estimates),
+            ):
+                compress_context(
+                    agent, messages, "sys", force=True, approx_tokens=100_000
+                )
+            assert agent._last_compression_outcome == "rejected_below_minimum_reclaim"
+            assert db.get_compression_failure_cooldown(sid) is None
 
     def test_in_place_still_commits_shrinking_compression(self):
         """The guard must not block legitimate compressions — a result SMALLER
@@ -306,7 +1663,7 @@ class TestInPlaceAntiGrowthGuard:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = db.get_messages_as_conversation(sid)
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -317,6 +1674,7 @@ class TestInPlaceAntiGrowthGuard:
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                messages[-2]["content"],
             ]
 
 

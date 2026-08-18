@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -32,13 +33,16 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    estimate_finalized_payload_tokens_rough,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -66,7 +70,6 @@ from agent.message_sanitization import (
 _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
-    _estimate_tools_tokens_rough,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
@@ -105,6 +108,7 @@ logger = logging.getLogger(__name__)
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+_PROVIDER_REQUEST_UNSET = object()
 
 
 def _restore_user_after_reference_handoff(
@@ -1275,6 +1279,324 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
         am["tool_calls"] = new_tcs
 
 
+def _project_provider_history_message(agent, msg, *, model=None):
+    """Project one durable row into its provider-history representation."""
+    api_msg = _clone_message_for_send(msg)
+    api_content = api_msg.pop("api_content", None)
+    api_msg.pop("display_kind", None)
+    api_msg.pop("display_metadata", None)
+    api_msg.pop("_row_id", None)
+    for field in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+        api_msg.pop(field, None)
+    if (
+        isinstance(api_content, str)
+        and api_content
+        and msg.get("role") in ("user", "assistant")
+    ):
+        api_msg["content"] = api_content
+    agent._copy_reasoning_content_for_api(msg, api_msg)
+    api_msg.pop("reasoning", None)
+    api_msg.pop("finish_reason", None)
+    api_msg.pop("_length_continuation_fragment", None)
+    api_msg.pop("_length_continuation_nudge", None)
+    if agent._should_sanitize_tool_calls():
+        agent._sanitize_tool_calls_for_strict_api(
+            api_msg, model=model if model is not None else agent.model
+        )
+    return api_msg
+
+
+def _project_provider_request(
+    agent,
+    messages,
+    *,
+    system_prompt: str = "",
+    tools=None,
+    current_turn_user_idx: Optional[int] = None,
+    external_prefetch: Any = None,
+    plugin_user_context: Any = None,
+    prefill_messages: Optional[List[Dict[str, Any]]] = None,
+    apply_context_selection: bool = True,
+    incoming_message: Optional[Dict[str, Any]] = None,
+    sanitize_model: Optional[str] = None,
+    current_turn_suffix: Optional[str] = None,
+    static_system_prefix: Any = _PROVIDER_REQUEST_UNSET,
+):
+    """Return the canonical, non-mutating provider-visible request projection.
+
+    This is the common projection owner for compression admission and live
+    dispatch.  All deterministic request shaping belongs here; callers must
+    consume the returned objects rather than repeating transforms afterward.
+    The returned messages and tools are private structural copies, so neither
+    the transcript, prefill rows, nor registry schemas can be mutated.
+    """
+    api_messages = []
+    indexed_source_messages = [
+        (source_idx, msg)
+        for source_idx, msg in enumerate(messages or [])
+        if not (
+            msg.get("display_kind") == "hidden"
+            and msg.get("role") == "assistant"
+            and any(
+                isinstance(msg.get(field), str)
+                and msg[field].strip() == _INTERRUPT_SCAFFOLD_MARKER
+                for field in ("content", "api_content")
+            )
+        )
+    ]
+    source_messages = [msg for _, msg in indexed_source_messages]
+    for source_idx, msg in indexed_source_messages:
+        api_msg = _project_provider_history_message(
+            agent, msg, model=sanitize_model
+        )
+        if source_idx == current_turn_user_idx and msg.get("role") == "user":
+            api_content = msg.get("api_content")
+            if isinstance(api_content, str) and api_content:
+                api_msg["content"] = api_content
+            else:
+                composed = compose_user_api_content(
+                    api_msg.get("content", ""),
+                    external_prefetch,
+                    plugin_user_context,
+                )
+                if composed is not None:
+                    api_msg["content"] = composed
+            if current_turn_suffix:
+                content = api_msg.get("content", "")
+                if isinstance(content, str):
+                    api_msg["content"] = content + "\n\n" + current_turn_suffix
+                elif isinstance(content, list):
+                    api_msg["content"] = [
+                        *content,
+                        {"type": "text", "text": "\n\n" + current_turn_suffix},
+                    ]
+        api_messages.append(api_msg)
+
+    effective_system = system_prompt or ""
+    ephemeral_system = getattr(agent, "ephemeral_system_prompt", None)
+    if ephemeral_system:
+        effective_system = (effective_system + "\n\n" + ephemeral_system).strip()
+    if effective_system:
+        api_messages.insert(0, {"role": "system", "content": effective_system})
+    prefills = prefill_messages if prefill_messages is not None else getattr(
+        agent, "prefill_messages", None
+    )
+    if prefills:
+        system_offset = int(
+            bool(api_messages and api_messages[0].get("role") == "system")
+        )
+        for idx, prefill in enumerate(prefills):
+            api_messages.insert(
+                system_offset + idx, _clone_message_for_send(prefill)
+            )
+    # Sequence repair operates only on the private projection. The live
+    # transcript may also be repaired for durable hygiene, but request
+    # correctness and compression admission never depend on that mutation.
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    repair_message_sequence(agent, api_messages)
+    if apply_context_selection:
+        api_messages = _apply_context_engine_selection(
+            agent,
+            api_messages,
+            source_messages,
+            incoming_message,
+            logger=getattr(agent, "logger", None) or logger,
+        )
+    api_messages = agent._sanitize_api_messages(api_messages)
+    api_messages = agent._drop_thinking_only_and_merge_users(
+        api_messages,
+        drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+    )
+    for api_msg in api_messages:
+        if isinstance(api_msg.get("content"), str):
+            api_msg["content"] = api_msg["content"].strip()
+    _canonicalize_api_tool_calls(api_messages)
+    _sanitize_messages_surrogates(api_messages)
+    # Transport adapters consume any provider-specific private state before
+    # emitting wire messages; arbitrary row provenance never reaches a
+    # provider. Admission has no transport call, so finish that projection
+    # explicitly here. Codex replay fields are intentionally non-underscored.
+    for api_msg in api_messages:
+        for key in tuple(api_msg):
+            if isinstance(key, str) and key.startswith("_"):
+                api_msg.pop(key, None)
+
+    projected_tools = _clone_message_for_send(tools or [])
+    if agent._use_prompt_caching and agent.provider != "moa":
+        plan = build_prompt_cache_plan(
+            api_messages,
+            projected_tools,
+            cache_ttl=effective_cache_ttl(
+                agent._cache_ttl, provider=agent.provider, model=agent.model
+            ),
+            native_anthropic=agent._use_native_cache_layout,
+            static_system_prefix=(
+                static_system_prefix
+                if static_system_prefix is not _PROVIDER_REQUEST_UNSET
+                else (
+                    agent._cached_system_prompt_static
+                    if isinstance(
+                        getattr(agent, "_cached_system_prompt_static", None), str
+                    )
+                    else None
+                )
+            ),
+            direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
+        )
+        api_messages = plan.messages
+        projected_tools = plan.tools
+    return {"messages": api_messages, "tools": projected_tools}
+
+
+def finalize_provider_request(
+    agent,
+    messages,
+    *,
+    system_message: str = "",
+    tools=None,
+    current_turn_user_idx: Optional[int] = None,
+    external_prefetch: Any = None,
+    plugin_user_context: Any = None,
+    prefill_messages: Optional[List[Dict[str, Any]]] = None,
+    incoming_message: Optional[Dict[str, Any]] = None,
+    sanitize_model: Optional[str] = None,
+    current_turn_suffix: Optional[str] = None,
+    static_system_prefix: Any = _PROVIDER_REQUEST_UNSET,
+    _frozen_projection: Optional[Dict[str, Any]] = None,
+    moa_prepared_request: Any = None,
+    middleware_context: Optional[Dict[str, Any]] = None,
+    consume_user_initiator: bool = False,
+    user_initiated_turn: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Construct the sole provider-wire request consumed by dispatch/admission.
+
+    Durable/current transcript rows and frozen turn inputs are projected here;
+    callers cannot omit context selection or another model-visible stage.
+    Every deterministic,
+    model-visible send-path transformation is completed here: provider
+    reasoning echo, cache redecoration, API-mode kwargs shaping, Unicode
+    normalization, Responses transport preflight, and request middleware.
+    Callers must dispatch ``payload`` verbatim.
+    """
+    # Live dispatch may freeze the projection once before pressure checks and
+    # MoA preparation. This private handoff is not a public stage-selection
+    # switch: admission and all external callers always build from transcript.
+    projected_request = (
+        copy.deepcopy(_frozen_projection)
+        if _frozen_projection is not None
+        else _project_provider_request(
+            agent,
+            messages,
+            system_prompt=system_message,
+            tools=tools,
+            current_turn_user_idx=current_turn_user_idx,
+            external_prefetch=external_prefetch,
+            plugin_user_context=plugin_user_context,
+            prefill_messages=prefill_messages,
+            incoming_message=incoming_message,
+            sanitize_model=sanitize_model,
+            current_turn_suffix=current_turn_suffix,
+            static_system_prefix=static_system_prefix,
+        )
+    )
+    api_messages = projected_request["messages"]
+    tools_for_api = projected_request["tools"]
+    agent._reapply_reasoning_echo_for_provider(api_messages)
+    api_messages, moa_prepared_request, tools_for_api = (
+        _redecorate_prompt_cache_for_provider(
+            agent,
+            api_messages,
+            system_message=system_message,
+            moa_prepared=moa_prepared_request,
+            tools_for_api=tools_for_api,
+        )
+    )
+    if tools_for_api == agent.tools:
+        payload = agent._build_api_kwargs(api_messages)
+    else:
+        payload = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    _sanitize_structure_surrogates(payload)
+    if agent._force_ascii_payload:
+        _sanitize_structure_non_ascii(payload)
+    if agent.api_mode == "codex_responses":
+        payload = agent._get_transport().preflight_kwargs(
+            payload,
+            allow_stream=False,
+            is_github_responses=agent._is_copilot_url(),
+            sanitize_harmony_tokens=agent._is_codex_backend(),
+        )
+    _include_user_initiator = (
+        bool(
+            consume_user_initiator
+            and getattr(agent, "_is_user_initiated_turn", False)
+        )
+        if user_initiated_turn is None
+        else bool(user_initiated_turn)
+    )
+    if _include_user_initiator and agent._is_copilot_url():
+        headers = dict(payload.get("extra_headers") or {})
+        headers["x-initiator"] = "user"
+        payload["extra_headers"] = headers
+        if consume_user_initiator:
+            agent._is_user_initiated_turn = False
+    # This snapshot is the completed provider projection: selection, provider
+    # shaping and transport preflight have all happened exactly once.  Keep it
+    # private from middleware so determinism checks can replay *only* the
+    # middleware stage without re-running stateful selectors or preflight.
+    pre_middleware_payload = copy.deepcopy(payload)
+    result = {
+        "payload": payload,
+        "messages": api_messages,
+        "tools": tools_for_api,
+        "moa_prepared_request": moa_prepared_request,
+        "_pre_middleware_payload": pre_middleware_payload,
+        "original_payload": copy.deepcopy(payload),
+        "middleware_trace": [],
+        "middleware_error": None,
+    }
+    return _apply_finalized_request_middleware(
+        result, middleware_context=middleware_context
+    )
+
+
+def _apply_finalized_request_middleware(
+    finalized_request: Dict[str, Any],
+    *,
+    middleware_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply middleware to a private clone of one completed projection.
+
+    This is intentionally not a stage-skipping builder API.  Its sole caller
+    outside ``finalize_provider_request`` is compression admission's
+    determinism replay, which must use the exact same immutable pre-middleware
+    body without repeating context selection, provider shaping, or preflight.
+    """
+    result = dict(finalized_request)
+    frozen = copy.deepcopy(finalized_request["_pre_middleware_payload"])
+    payload = copy.deepcopy(frozen)
+    result.update(
+        payload=payload,
+        original_payload=copy.deepcopy(frozen),
+        middleware_trace=[],
+        middleware_error=None,
+    )
+    if middleware_context is None:
+        return result
+    try:
+        from hermes_cli.middleware import apply_llm_request_middleware
+
+        mw = apply_llm_request_middleware(payload, **middleware_context)
+        result["payload"] = mw.payload
+        result["original_payload"] = mw.original_payload
+        result["middleware_trace"] = list(mw.trace)
+    except Exception as exc:
+        # Live behavior remains best-effort. Admission inspects this field and
+        # fails closed when normal middleware shaping was unavailable.
+        result["middleware_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     """Error-result content for a tool call whose name isn't a real tool.
 
@@ -1698,6 +2020,7 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     persist_user_display_kind: Optional[str] = None,
+    persist_user_is_autonomous_completion: bool = False,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -1748,6 +2071,10 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # Admission is call-local.  Discard the obsolete process-like parking
+    # slot defensively so an agent created by older embedding code cannot
+    # replay speculative bytes into this turn or a later tool iteration.
+    vars(agent).pop("_admitted_provider_request", None)
 
     # If a background memory/skill review spawned at the end of a PRIOR turn
     # (agent/background_review.py) is still running its own run_conversation()
@@ -1800,6 +2127,7 @@ def run_conversation(
         persist_user_message,
         persist_user_timestamp,
         persist_user_display_kind=persist_user_display_kind,
+        persist_user_is_autonomous_completion=persist_user_is_autonomous_completion,
         persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
@@ -1811,6 +2139,13 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        # Normal provider turns must publish automatic compression only after
+        # the complete live request has been assembled.  Codex app-server
+        # modes retain their existing native/Hermes ownership decision in the
+        # turn prologue.
+        defer_automatic_preflight=(
+            getattr(agent, "api_mode", None) != "codex_app_server"
+        ),
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -1823,6 +2158,7 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _deferred_preflight_pending = _ctx.deferred_preflight_pending
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -2102,121 +2438,14 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
-        api_messages = []
-        for idx, msg in enumerate(messages):
-
-            # Structural clone, NOT msg.copy(): every in-place transform
-            # below (canonicalize/repair, surrogate + non-ASCII sanitizers,
-            # cache decoration) must be unable to reach the persisted
-            # history through shared nested containers. See
-            # _clone_message_for_send.
-            api_msg = _clone_message_for_send(msg)
-
-            # api_content is the persistence sidecar carrying the exact bytes
-            # sent to the API for this message when they differ from the clean
-            # stored content (see compose_user_api_content in turn_context).
-            # It is bookkeeping, never a provider field — pop it from EVERY
-            # outgoing copy.
-            _api_content = api_msg.pop("api_content", None)
-
-            # Display-only timeline metadata. Never a provider field — strip
-            # from every outgoing copy so strict OpenAI-compatible backends
-            # don't reject the request after a model switch or resumed typed
-            # event row enters the live history.
-            api_msg.pop("display_kind", None)
-            api_msg.pop("display_metadata", None)
-
-            # Durable row identity stamped by _rows_to_conversation so the
-            # desktop can address a specific persisted message (reactions).
-            # Bookkeeping, never a provider field — only the chat-completions
-            # transport strips underscore keys, so drop it centrally here.
-            api_msg.pop("_row_id", None)
-
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated beyond the api_content stamp, so nothing leaks
-            # into the clean transcript content.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
-                if isinstance(_api_content, str) and _api_content:
-                    # Stamped by the prologue from the same composition —
-                    # reuse it so the persisted sidecar and the wire cannot
-                    # drift, and so every pass this turn sends identical
-                    # bytes (composed from msg["content"], never from a
-                    # previously-injected copy).
-                    api_msg["content"] = _api_content
-                else:
-                    # Callers that bypass the prologue stamping: compose live.
-                    _composed = compose_user_api_content(
-                        api_msg.get("content", ""),
-                        _ext_prefetch_cache,
-                        _plugin_user_context,
-                    )
-                    if _composed is not None:
-                        api_msg["content"] = _composed
-            elif (
-                isinstance(_api_content, str)
-                and _api_content
-                and msg.get("role") in ("user", "assistant")
-            ):
-                # Historical message: replay the exact bytes sent when it was
-                # live, so the provider prompt-cache prefix stays byte-stable
-                # instead of diverging at the injection point and
-                # re-prefilling everything after it. User rows carry the
-                # prefetch/plugin injection sidecar; user AND assistant rows
-                # can carry a sanitize-divergence sidecar (content that
-                # ``get_messages_as_conversation``'s sanitize_context/strip
-                # would rewrite on reload — see the capture in
-                # ``_flush_messages_to_session_db``).
-                api_msg["content"] = _api_content
-
-            # For ALL assistant messages, pass reasoning back to the API
-            # This ensures multi-turn reasoning context is preserved
-            agent._copy_reasoning_content_for_api(msg, api_msg)
-
-            # Remove 'reasoning' field - it's for trajectory storage only
-            # We've copied it to 'reasoning_content' for the API above
-            if "reasoning" in api_msg:
-                api_msg.pop("reasoning")
-            # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
-            if "finish_reason" in api_msg:
-                api_msg.pop("finish_reason")
-            # _thinking_prefill survives here intentionally: the drop pass below
-            # needs it. The transport strips all underscore keys before the wire.
-            # Strip length-continuation marks; not every transport drops underscore keys.
-            api_msg.pop("_length_continuation_fragment", None)
-            api_msg.pop("_length_continuation_nudge", None)
-            # Strip Codex Responses API fields (call_id, response_item_id) for
-            # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
-            # Uses new dicts so the internal messages list retains the fields
-            # for Codex Responses compatibility.
-            if agent._should_sanitize_tool_calls():
-                # In MoA mode, agent.model is the virtual preset name
-                # (e.g. "closed"), not the actual aggregator model.  Use
-                # the resolved aggregator model so Gemini aggregators
-                # correctly preserve thought_signature (extra_content).
-                _sanitize_model = agent.model
-                if agent.provider == "moa":
-                    if moa_config:
-                        _agg = moa_config.get("aggregator") or {}
-                        if _agg.get("model"):
-                            _sanitize_model = _agg["model"]
-                    if _sanitize_model == agent.model:
-                        # Virtual-provider mode: no moa_config is threaded
-                        # through run_conversation — the facade resolves the
-                        # preset internally. Ask the facade for the resolved
-                        # aggregator slot from the previous create() instead
-                        # (set before any history replay that could carry
-                        # thought_signature).
-                        _moa_client = getattr(agent, "client", None)
-                        _agg_slot = getattr(_moa_client, "last_aggregator_slot", None)
-                        if _agg_slot and _agg_slot.get("model"):
-                            _sanitize_model = _agg_slot["model"]
-                agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
-            # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
-            # The signature field helps maintain reasoning continuity
-            api_messages.append(api_msg)
+        _sanitize_model = agent.model
+        if agent.provider == "moa":
+            if moa_config:
+                _aggregator = moa_config.get("aggregator") or {}
+                _sanitize_model = _aggregator.get("model") or _sanitize_model
+            _aggregator_slot = getattr(agent.client, "last_aggregator_slot", None)
+            if _sanitize_model == agent.model and _aggregator_slot:
+                _sanitize_model = _aggregator_slot.get("model") or _sanitize_model
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
@@ -2234,15 +2463,31 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
+        _handoff_request = None
+        _handoff_admitted = False
+        # MoA guidance is the sole live-only dynamic transform. Produce it
+        # before canonical projection, then pass the resulting text into the
+        # current-turn composition below; compression never replays advisors.
+        api_messages = []
+        _moa_context = None
 
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
+
+                api_messages = _project_provider_request(
+                    agent,
+                    messages,
+                    system_prompt=effective_system,
+                    tools=[],
+                    current_turn_user_idx=current_turn_user_idx,
+                    external_prefetch=_ext_prefetch_cache,
+                    plugin_user_context=_plugin_user_context,
+                    prefill_messages=[],
+                    apply_context_selection=False,
+                    sanitize_model=_sanitize_model,
+                )["messages"]
 
                 _moa_context = aggregate_moa_context(
                     user_prompt=(
@@ -2272,139 +2517,56 @@ def run_conversation(
                     ),
                     agent=agent,
                 )
-                if _moa_context:
-                    for _msg in reversed(api_messages):
-                        if _msg.get("role") == "user":
-                            _base = _msg.get("content", "")
-                            if isinstance(_base, str):
-                                _msg["content"] = _base + "\n\n" + _moa_context
-                            elif isinstance(_base, list):
-                                # Multimodal user turn (text + image parts):
-                                # append the MoA context as a trailing text
-                                # part instead of silently dropping it.
-                                _msg["content"] = [
-                                    *_base,
-                                    {"type": "text", "text": "\n\n" + _moa_context},
-                                ]
-                            break
             except Exception as _moa_exc:
                 logger.warning("MoA context aggregation failed: %s", _moa_exc)
 
-        # Inject ephemeral prefill messages right after the system prompt
-        # but before conversation history. Same API-call-time-only pattern.
-        if agent.prefill_messages:
-            sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
-            for idx, pfm in enumerate(agent.prefill_messages):
-                # Structural clone: the sanitizers below run over
-                # api_messages in place, and a shallow copy would let them
-                # write through into agent.prefill_messages' nested
-                # containers (same aliasing class as the history build).
-                api_messages.insert(sys_offset + idx, _clone_message_for_send(pfm))
-
-        # Per-turn context selection hook (additive, no-op by default).
-        # Lets a context engine select/replace which context enters the
-        # prompt for THIS call only — retrieval, topic routing, role/branch
-        # switching — distinct from compression and independent of
-        # should_compress(). Request-only: persisted history is untouched, so
-        # caching/sanitization below operate on whatever the engine selected.
-        # Fail-open (see _apply_context_engine_selection).
-        _sel_incoming = (
+        _incoming = (
             messages[current_turn_user_idx]
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        api_messages = _apply_context_engine_selection(
-            agent,
-            api_messages,
-            messages,
-            _sel_incoming,
-            logger=request_logger,
+        # Context selection is a real per-request state transition.  Preserve
+        # opaque tokens on both sides of this first (old-request) projection so
+        # compression can replace it transactionally with exactly one candidate
+        # transition, or retain it when the old request remains authoritative.
+        from agent.context_engine import context_selection_is_preview_safe
+
+        _selector_projection_safe = context_selection_is_preview_safe(
+            agent.context_compressor
         )
-
-        # Safety net: strip orphaned tool results / add stubs for missing
-        # results before sending to the API.  Runs unconditionally — not
-        # gated on context_compressor — so orphans from session loading or
-        # manual message manipulation are always caught.
-        api_messages = agent._sanitize_api_messages(api_messages)
-
-        # Drop thinking-only assistant turns (reasoning but no visible
-        # output and no tool_calls) and merge any adjacent user messages
-        # left behind. Prevents Anthropic 400s ("The final block in an
-        # assistant message cannot be `thinking`.") and equivalent errors
-        # from third-party Anthropic-compatible gateways that can't replay
-        # a thinking-only turn. Runs on the per-call copy only — the
-        # stored conversation history keeps the reasoning block for the
-        # UI transcript and session persistence.
-        api_messages = agent._drop_thinking_only_and_merge_users(
-            api_messages,
-            drop_codex_reasoning_items=agent.api_mode != "codex_responses",
-        )
-
-        # Normalize message whitespace and tool-call JSON for consistent
-        # prefix matching.  Ensures bit-perfect prefixes across turns,
-        # which enables KV cache reuse on local inference servers
-        # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
-        # cloud providers.  Operates on api_messages (the API copy) so
-        # the original conversation history in `messages` is untouched.
-        for am in api_messages:
-            if isinstance(am.get("content"), str):
-                am["content"] = am["content"].strip()
-        _canonicalize_api_tool_calls(api_messages)
-
-        # Proactively strip any surrogate characters before the API call.
-        # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
-        # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
-        # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
-        _sanitize_messages_surrogates(api_messages)
-
-        # NOTE (empty-content class fix): no send-time pad loop here.  The
-        # single owner for "never send a turn strict wire validation rejects
-        # as empty" is ``repair_empty_non_final_messages``, which runs inside
-        # ``_sanitize_api_messages`` above — the unconditional pre-send
-        # chokepoint shared with the summary path.  Its placeholder is
-        # non-whitespace, so it survives the whitespace-normalization pass
-        # regardless of ordering (a single-space pad here previously had to
-        # be sequenced after normalization to survive, forking the concept).
-
-        # Build the request-local cache sections only after every transcript
-        # mutation. The canonical tool registry stays undecorated.
-        #
-        # Runs LAST, after every message mutation above. Marking earlier
-        # defeats the prefix stability the mutations exist to create:
-        # ``_apply_cache_marker`` rewrites ``content`` from a plain string
-        # into a ``[{"type": "text", ...}]`` block, so the marked messages
-        # no longer match the ``isinstance(content, str)`` test in the
-        # whitespace-normalization pass and silently keep their raw
-        # leading/trailing whitespace. A tool result ending in "\n" is
-        # therefore sent unstripped while it sits in the last-3 window and
-        # stripped once it rolls out of it — the same message, different
-        # bytes on consecutive turns, which breaks the prefix match at
-        # exactly the point the breakpoints were meant to protect. Marking
-        # last also keeps breakpoints off messages that the orphan sweep or
-        # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
-        if agent._use_prompt_caching and agent.provider != "moa":
-            _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
-            _initial_cache_plan = build_prompt_cache_plan(
-                api_messages,
-                tools_for_api,
-                # Clamp per-destination: a configured 1h regresses to 5m on
-                # Qwen/Alibaba routes, whose context cache is 5m-only (#84733).
-                cache_ttl=effective_cache_ttl(
-                    agent._cache_ttl,
-                    provider=agent.provider,
-                    model=agent.model,
-                ),
-                native_anthropic=agent._use_native_cache_layout,
-                static_system_prefix=(
-                    _static_system_prefix
-                    if isinstance(_static_system_prefix, str)
-                    else None
-                ),
-                direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
+        _selector_preview_snapshotter = (
+            getattr(
+                agent.context_compressor,
+                "snapshot_compression_attempt_state",
+                None,
             )
-            api_messages = _initial_cache_plan.messages
-            tools_for_api = _initial_cache_plan.tools
+            if _selector_projection_safe
+            else None
+        )
+        _selector_preview_pre = (
+            _selector_preview_snapshotter()
+            if callable(_selector_preview_snapshotter) else None
+        )
+        _provider_request = (
+            _project_provider_request(
+                agent,
+                messages,
+                system_prompt=effective_system,
+                tools=agent.tools or [],
+                current_turn_user_idx=current_turn_user_idx,
+                external_prefetch=_ext_prefetch_cache,
+                plugin_user_context=_plugin_user_context,
+                incoming_message=_incoming,
+                sanitize_model=_sanitize_model,
+                current_turn_suffix=_moa_context,
+            )
+        )
+        _selector_preview_post = (
+            _selector_preview_snapshotter()
+            if callable(_selector_preview_snapshotter) else None
+        )
+        api_messages = _provider_request["messages"]
+        tools_for_api = _provider_request["tools"]
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -2429,14 +2591,81 @@ def run_conversation(
             if _moa_prepared_request is not None:
                 api_messages = _moa_prepared_request["messages"]
 
-        # One image-stripped message estimate feeds both figures. Was: a
-        # str(msg) char walk (re-serialized base64 every call) + a second
-        # messages walk inside estimate_request_tokens_rough. Tools added
-        # separately (compression needs them: 50+ tools = 20-30K tokens).
-        # total_chars is a rough (~) proxy — verbose log + hook metric only.
+        # Finalize the ordinary old request exactly once, before compression
+        # can become speculative.  Request middleware is a state transition in
+        # the same sense as context selection, so automatic admission receives
+        # opaque tokens from both sides of this live transition.  Unknown
+        # callbacks still get their one ordinary invocation; the refusal token
+        # merely prevents compression from invoking them again.
+        from hermes_cli.middleware import snapshot_llm_request_middleware_preview_state
+
+        _request_middleware_nontransactional = None
+        try:
+            _request_middleware_preview_pre = (
+                snapshot_llm_request_middleware_preview_state()
+            )
+        except Exception as exc:
+            _request_middleware_preview_pre = None
+            _request_middleware_nontransactional = f"{type(exc).__name__}: {exc}"
+        _live_middleware_context = {
+            "task_id": effective_task_id,
+            "turn_id": turn_id,
+            "api_request_id": f"{turn_id}:api:{api_call_count}",
+            "session_id": agent.session_id or "",
+            "platform": agent.platform or "",
+            "model": agent.model,
+            "provider": agent.provider,
+            "base_url": agent.base_url,
+            "api_mode": agent.api_mode,
+            "api_call_count": api_call_count,
+        }
+        _old_finalized_request = finalize_provider_request(
+            agent,
+            messages,
+            system_message=effective_system,
+            tools=agent.tools or [],
+            current_turn_user_idx=current_turn_user_idx,
+            external_prefetch=_ext_prefetch_cache,
+            plugin_user_context=_plugin_user_context,
+            incoming_message=_incoming,
+            sanitize_model=_sanitize_model,
+            current_turn_suffix=_moa_context,
+            _frozen_projection=_provider_request,
+            moa_prepared_request=_moa_prepared_request,
+            middleware_context=_live_middleware_context,
+            user_initiated_turn=bool(
+                getattr(agent, "_is_user_initiated_turn", False)
+            ),
+        )
+        _old_finalized_request["_consumes_user_initiator"] = bool(
+            getattr(agent, "_is_user_initiated_turn", False)
+            and agent._is_copilot_url()
+        )
+        if _request_middleware_nontransactional is None:
+            try:
+                _request_middleware_preview_post = (
+                    snapshot_llm_request_middleware_preview_state()
+                )
+            except Exception as exc:
+                _request_middleware_preview_post = None
+                _request_middleware_nontransactional = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+        else:
+            _request_middleware_preview_post = None
+        # This exact object owns the first dispatch without replaying request
+        # middleware.  It is only an ordinary finalized handoff: compression
+        # may replace it with an admitted immutable candidate below.
+        _handoff_request = _old_finalized_request
+        _handoff_admitted = False
+
+        # Keep the message-only estimate for explicitly message-only
+        # diagnostics.  Admission pressure must cover the exact finalized
+        # provider body, including middleware-added messages, tools, options,
+        # and transport fields.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
-        request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+        request_pressure_tokens = estimate_finalized_payload_tokens_rough(
+            _old_finalized_request["payload"]
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -2552,11 +2781,20 @@ def run_conversation(
                 compression_attempts,
                 max_compression_attempts,
             )
+            _automatic_compression_phase = (
+                "preflight" if _deferred_preflight_pending else "pre_api"
+            )
+            _automatic_compression_template = (
+                PREFLIGHT_COMPRESSION_STATUS_TEMPLATE
+                if _deferred_preflight_pending
+                else PRE_API_COMPRESSION_STATUS_TEMPLATE
+            )
             _pre_api_status = automatic_compaction_status_message(
                 _compressor,
-                phase="pre_api",
-                default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=request_pressure_tokens
+                phase=_automatic_compression_phase,
+                default_message=_automatic_compression_template.format(
+                    tokens=request_pressure_tokens,
+                    threshold=_preflight_threshold,
                 ),
                 approx_tokens=request_pressure_tokens,
                 threshold_tokens=int(
@@ -2573,12 +2811,56 @@ def run_conversation(
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
+            # The handoff is a transaction-local capability.  Current-turn
+            # identity stays out of band: private provenance must never be
+            # inserted into the transcript that the auxiliary compressor sees.
+            # reanchor_current_turn_user_idx deliberately chooses the last
+            # structurally equal human row, which is the active turn when old
+            # and current structured contents are equal.
+            _admission_handoff = {
+                "request": _old_finalized_request,
+                "admitted": False,
+            }
             messages, active_system_prompt = agent._compress_context(
                 messages,
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
+                live_request_context={
+                        "admission_handoff": _admission_handoff,
+                        "frozen_projection": _provider_request,
+                        "frozen_finalized_request": _old_finalized_request,
+                        "selector_preview_pre": _selector_preview_pre,
+                        "selector_preview_post": _selector_preview_post,
+                        "selector_projection_safe": _selector_projection_safe,
+                        "request_middleware_preview_pre": _request_middleware_preview_pre,
+                        "request_middleware_preview_post": _request_middleware_preview_post,
+                        "request_middleware_nontransactional": (
+                            _request_middleware_nontransactional
+                        ),
+                        "current_turn_user_idx": current_turn_user_idx,
+                        "current_turn_identity": copy.deepcopy(
+                            messages[current_turn_user_idx].get("content")
+                            if 0 <= current_turn_user_idx < len(messages) else None
+                        ),
+                        "incoming_message": copy.deepcopy(_incoming),
+                        "external_prefetch": copy.deepcopy(_ext_prefetch_cache),
+                        "plugin_user_context": copy.deepcopy(_plugin_user_context),
+                        "prefill_messages": copy.deepcopy(
+                            getattr(agent, "prefill_messages", None)
+                        ),
+                        "sanitize_model": _sanitize_model,
+                        "current_turn_suffix": _moa_context,
+                        "moa_prepared_request": _moa_prepared_request,
+                        "tools": copy.deepcopy(agent.tools or []),
+                        "user_initiated_turn": bool(
+                            getattr(agent, "_is_user_initiated_turn", False)
+                        ),
+                        "middleware_context": _live_middleware_context,
+                },
             )
+            _handoff_request = _admission_handoff.pop("request", None)
+            _handoff_admitted = bool(_admission_handoff.pop("admitted", False))
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
                 # compression lock, so this pass no-oped. That is a temporary
@@ -2614,17 +2896,24 @@ def run_conversation(
                 conversation_history = conversation_history_after_compression(
                     agent, messages, conversation_history
                 )
-                # This preflight iteration never reaches the provider whether
-                # we skip the turn (handoff guard below) or re-run the loop —
-                # refund the consumed call/budget in BOTH cases, mirroring the
-                # ollama_runtime_context_too_small early-exit above. Without
-                # the refund on the break path, every skipped turn leaked one
-                # iteration-budget unit for the agent's lifetime and
-                # finalize_turn logged an api_call_count including a call that
-                # was never made.
-                api_call_count -= 1
-                agent._api_call_count = api_call_count
-                agent.iteration_budget.refund()
+                # Compression may take long enough for a user interrupt to
+                # arrive while it is running.  The loop-level interrupt check
+                # happened before this pass, so fence the newly admitted
+                # request at its source before any provider dispatch.  The
+                # compaction itself is already committed: keep its transcript
+                # and compressor state, and refund only the provider call that
+                # never happened.
+                if agent._interrupt_requested:
+                    interrupted = True
+                    _turn_exit_reason = "interrupted_by_user"
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
+                    if not agent.quiet_mode:
+                        agent._safe_print(
+                            "\n⚡ Breaking out of tool loop due to interrupt..."
+                        )
+                    break
                 if _should_skip_model_call_for_reference_handoff(
                     messages, user_message
                 ):
@@ -2637,8 +2926,29 @@ def run_conversation(
                     if not final_response:
                         final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                     _turn_exit_reason = "compaction_handoff_not_actionable"
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
                     break
-                continue
+                if _handoff_request is None:
+                    # A no-op/failed publication has no exact request to own.
+                    # Rebuild on a fresh iteration; never dispatch the
+                    # speculative pre-compression projection below.
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
+                    continue
+                # The explicit handoff owns this SAME dispatch.  A committed
+                # candidate is admitted/immutable; an abort retains the exact
+                # ordinary old finalized object in compatibility mode.  In
+                # either case request middleware must not run again here.
+                api_messages = _handoff_request["messages"]
+                tools_for_api = _handoff_request["tools"]
+                _moa_prepared_request = _handoff_request.get(
+                    "moa_prepared_request"
+                )
+                approx_tokens = estimate_messages_tokens_rough(api_messages)
+                total_chars = approx_tokens * 4
         elif (
             agent.compression_enabled
             and len(messages) > 1
@@ -2704,6 +3014,51 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        _admitted_retry_request = None
+        _admitted_retry_semantics = None
+
+        def _live_retry_compression_context(admission_handoff):
+            """Carry this dispatched request into post-provider admission.
+
+            Provider overflow recovery happens after selection and request
+            middleware have already advanced their state for the failed
+            request.  Compression must replace that transition with exactly
+            one candidate transition and return the finalized candidate to
+            this retry loop; rebuilding it in the outer loop would replay both
+            stateful stages and could consume a one-shot output cap early.
+            """
+            return {
+                "admission_handoff": admission_handoff,
+                "frozen_projection": _provider_request,
+                "frozen_finalized_request": _finalized_request,
+                "selector_preview_pre": _selector_preview_pre,
+                "selector_preview_post": _selector_preview_post,
+                "selector_projection_safe": _selector_projection_safe,
+                "request_middleware_preview_pre": _request_middleware_preview_pre,
+                "request_middleware_preview_post": _request_middleware_preview_post,
+                "request_middleware_nontransactional": (
+                    _request_middleware_nontransactional
+                ),
+                "current_turn_user_idx": current_turn_user_idx,
+                "current_turn_identity": copy.deepcopy(
+                    messages[current_turn_user_idx].get("content")
+                    if 0 <= current_turn_user_idx < len(messages) else None
+                ),
+                "incoming_message": copy.deepcopy(_incoming),
+                "external_prefetch": copy.deepcopy(_ext_prefetch_cache),
+                "plugin_user_context": copy.deepcopy(_plugin_user_context),
+                "prefill_messages": copy.deepcopy(
+                    getattr(agent, "prefill_messages", None)
+                ),
+                "sanitize_model": _sanitize_model,
+                "current_turn_suffix": _moa_context,
+                "moa_prepared_request": _moa_prepared_request,
+                "tools": copy.deepcopy(agent.tools or []),
+                "user_initiated_turn": bool(
+                    getattr(agent, "_is_user_initiated_turn", False)
+                ),
+                "middleware_context": _live_middleware_context,
+            }
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -2766,77 +3121,83 @@ def run_conversation(
                 # echo-back pad for the *current* provider here (idempotent no-op
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
-                agent._reapply_reasoning_echo_for_provider(api_messages)
-                # Same story for prompt-cache decoration (#72626): try_activate_
-                # fallback refreshes the policy flags, but the decorated list
-                # still carries the primary's breakpoints (or none). Strip and
-                # re-render for the current provider before building kwargs.
-                api_messages, _moa_prepared_request, tools_for_api = (
-                    _redecorate_prompt_cache_for_provider(
-                        agent,
-                        api_messages,
-                        system_message=system_message,
-                        moa_prepared=_moa_prepared_request,
-                        tools_for_api=tools_for_api,
-                    )
+                _request_semantics = (
+                    agent.provider, agent.model, agent.base_url, agent.api_mode,
+                    _sanitize_model,
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
+                _using_handoff_request = _handoff_request is not None
+                _using_admitted_request = (
+                    _using_handoff_request and _handoff_admitted
+                )
+                if _using_handoff_request:
+                    _finalized_request = _handoff_request
+                    if _using_admitted_request:
+                        _admitted_retry_request = _handoff_request
+                        _admitted_retry_semantics = _request_semantics
+                elif (
+                    _admitted_retry_request is not None
+                    and _admitted_retry_semantics == _request_semantics
+                ):
+                    # A transport retry in this provider transaction must send
+                    # the exact bytes admission authorized.  This local is born
+                    # after compression and dies with this retry loop, so it
+                    # cannot cross a fallback rebuild, tool iteration, or turn.
+                    _finalized_request = _admitted_retry_request
+                elif _admitted_retry_request is not None:
+                    # Provider/request semantics changed after admission.  Do
+                    # not silently finalize and dispatch an unauthorised body
+                    # inside this transaction; restart the iteration so the
+                    # new provider projection receives its own pressure check
+                    # and, when required, a fresh compression admission.
+                    _retry.restart_with_rebuilt_messages = True
+                    break
                 else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
+                    _finalized_request = finalize_provider_request(
+                        agent,
+                        messages,
+                        system_message=effective_system,
+                        tools=agent.tools or [],
+                        current_turn_user_idx=current_turn_user_idx,
+                        external_prefetch=_ext_prefetch_cache,
+                        plugin_user_context=_plugin_user_context,
+                        incoming_message=_incoming,
+                        sanitize_model=_sanitize_model,
+                        current_turn_suffix=_moa_context,
+                        _frozen_projection=_provider_request,
+                        moa_prepared_request=_moa_prepared_request,
+                        middleware_context={
+                            "task_id": effective_task_id,
+                            "turn_id": turn_id,
+                            "api_request_id": api_request_id,
+                            "session_id": agent.session_id or "",
+                            "platform": agent.platform or "",
+                            "model": agent.model,
+                            "provider": agent.provider,
+                            "base_url": agent.base_url,
+                            "api_mode": agent.api_mode,
+                            "api_call_count": api_call_count,
+                        },
+                        consume_user_initiator=True,
                     )
-                # Outbound-request surrogate chokepoint (#50959): the messages
-                # were scrubbed above, but the rest of the request body —
-                # tool/function descriptions (session_search's ±-heavy text is
-                # the recorded repro), extra_body, system strings routed via
-                # kwargs — can still carry invalid code points that providers
-                # reject with a non-retryable HTTP 400 ("invalid unicode code
-                # point"). One in-place walk here guarantees the entire
-                # payload json.dumps()-safe regardless of which leaf produced
-                # the string. Fast no-op when the payload is clean.
-                _sanitize_structure_surrogates(api_kwargs)
-                if agent._force_ascii_payload:
-                    _sanitize_structure_non_ascii(api_kwargs)
-                if agent.api_mode == "codex_responses":
-                    api_kwargs = agent._get_transport().preflight_kwargs(
-                        api_kwargs,
-                        allow_stream=False,
-                        is_github_responses=agent._is_copilot_url(),
-                        sanitize_harmony_tokens=agent._is_codex_backend(),
-                    )
-                # Copilot x-initiator: the first API call of a user turn is
-                # marked "user" so Copilot bills a premium request; tool-loop
-                # follow-ups keep the default "agent" header (#3040).
-                if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
-                    _xh = dict(api_kwargs.get("extra_headers") or {})
-                    _xh["x-initiator"] = "user"
-                    api_kwargs["extra_headers"] = _xh
+                # Move the one-shot handoff into the retry transaction before
+                # dispatch. It remains reusable only under the semantics gate
+                # above and cannot survive this provider-attempt loop.
+                _handoff_request = None
+                _handoff_admitted = False
+                _immutable_admitted_payload = (
+                    _admitted_retry_request is not None
+                    and _finalized_request is _admitted_retry_request
+                )
+                if _using_handoff_request and _finalized_request.get(
+                    "_consumes_user_initiator"
+                ):
                     agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
-                    _original_api_kwargs = dict(api_kwargs)
-                    _llm_middleware_trace = []
-
+                api_kwargs = _finalized_request["payload"]
+                api_messages = _finalized_request["messages"]
+                tools_for_api = _finalized_request["tools"]
+                _moa_prepared_request = _finalized_request["moa_prepared_request"]
+                _original_api_kwargs = _finalized_request["original_payload"]
+                _llm_middleware_trace = _finalized_request["middleware_trace"]
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
@@ -2848,12 +3209,9 @@ def run_conversation(
                             request_messages = api_kwargs.get("input")
                         if not isinstance(request_messages, list):
                             request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
+                        # Observation hooks receive structural copies.  A hook
+                        # must never mutate the finalized object dispatched to
+                        # the provider after compression admission.
                         #
                         # The ``request_messages`` and ``conversation_history``
                         # kwargs below are pre-existing raw passthroughs
@@ -2864,7 +3222,9 @@ def run_conversation(
                         # ``api_kwargs`` is the same object passed to the
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                        _request_payload = copy.deepcopy(
+                            agent._api_request_payload_for_hook(api_kwargs)
+                        )
                         # Anthropic (``system``) and Responses/Codex
                         # (``instructions``) move the system prompt out of
                         # messages; pass it explicitly for observability
@@ -2878,8 +3238,8 @@ def run_conversation(
                             turn_id=turn_id,
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
+                            user_message=copy.deepcopy(original_user_message),
+                            conversation_history=copy.deepcopy(messages),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
@@ -2887,7 +3247,7 @@ def run_conversation(
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
                             retry_count=retry_count,
-                            request_messages=list(request_messages)
+                            request_messages=copy.deepcopy(request_messages)
                             if isinstance(request_messages, list)
                             else [],
                             system_prompt=system_prompt_for_hooks,
@@ -2984,13 +3344,6 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
-                    if agent.api_mode == "codex_responses":
-                        next_api_kwargs = agent._get_transport().preflight_kwargs(
-                            next_api_kwargs,
-                            allow_stream=False,
-                            is_github_responses=agent._is_copilot_url(),
-                            sanitize_harmony_tokens=agent._is_codex_backend(),
-                        )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -3045,6 +3398,7 @@ def run_conversation(
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
+                        immutable_request=_immutable_admitted_payload,
                     )
                 finally:
                     if _redirect_lock is not None:
@@ -3349,6 +3703,7 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                _deferred_preflight_pending = False
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -3997,6 +4352,23 @@ def run_conversation(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0
                     )
+                    if (
+                        _completed_compaction_pending
+                        and _compression_threshold > 0
+                        and 0 < prompt_tokens < _compression_threshold
+                    ):
+                        # Provider-confirmed recovery clears the insufficient-
+                        # progress preflight block on its own, independent of
+                        # the attempt counter below. Under request-admission
+                        # ownership the admitted candidate is dispatched in the
+                        # same iteration, so a failover that resets
+                        # compression_attempts to 0 before this reading would
+                        # otherwise leave the block armed for the rest of the
+                        # turn even though the provider just proved the prompt
+                        # is back below the threshold (the exact silent-growth
+                        # hazard the rearm branch describes).
+                        _preflight_compression_blocked = False
+                        _last_preflight_pressure = None
                     if _should_rearm_compression_budget(
                         compression_attempts,
                         completed_compaction_pending=_completed_compaction_pending,
@@ -4264,6 +4636,30 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                # An admitted request is an immutable transaction result.
+                # Execution middleware violations are deterministic local
+                # contract failures: retry/fallback, credential rotation, or
+                # transport recovery cannot make the same callback valid and
+                # must never expose a mutated payload to provider dispatch.
+                from hermes_cli.middleware import ImmutableRequestMiddlewareError
+
+                if isinstance(api_error, ImmutableRequestMiddlewareError):
+                    _middleware_error = agent._summarize_api_error(api_error)
+                    logger.error(
+                        "%sImmutable admitted request middleware violation: %s",
+                        agent.log_prefix,
+                        _middleware_error,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _middleware_error,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _middleware_error,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -5440,12 +5836,20 @@ def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
+                    _retry_admission_handoff = {
+                        "request": _finalized_request,
+                        "admitted": False,
+                    }
                     # Option A (LCM issue 441): overhead-aware request size so recovery arms on the
                     # true request (msgs + tools + system), not the tool-blind message count.
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        force=True,
+                        live_request_context=_live_retry_compression_context(
+                            _retry_admission_handoff
+                        ),
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -5462,6 +5866,11 @@ def run_conversation(
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
+                    if _retry_admission_handoff.get("admitted") is True:
+                        _admitted_retry_request = _retry_admission_handoff.get(
+                            "request"
+                        )
+                        _admitted_retry_semantics = _request_semantics
 
                     # Re-estimate tokens after compression.  Same-message-count
                     # compression (tool-result pruning, in-place summarization)
@@ -5476,6 +5885,11 @@ def run_conversation(
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
                         time.sleep(2)  # Brief pause between compression retries
+                        if _admitted_retry_request is not None:
+                            # The admission transaction already finalized the
+                            # replacement request.  Retry those exact bytes in
+                            # this loop without replaying selection/middleware.
+                            continue
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -5589,10 +6003,18 @@ def run_conversation(
                             original_len = len(messages)
                             original_tokens = estimate_messages_tokens_rough(messages)
                             _overflow_input = messages
+                            _retry_admission_handoff = {
+                                "request": _finalized_request,
+                                "admitted": False,
+                            }
                             messages, active_system_prompt = agent._compress_context(
                                 messages, system_message,
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
+                                force=True,
+                                live_request_context=_live_retry_compression_context(
+                                    _retry_admission_handoff
+                                ),
                             )
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                                 compression_attempts -= 1
@@ -5608,6 +6030,11 @@ def run_conversation(
                                 agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                             elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                                 agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                            if _retry_admission_handoff.get("admitted") is True:
+                                _admitted_retry_request = (
+                                    _retry_admission_handoff.get("request")
+                                )
+                                _admitted_retry_semantics = _request_semantics
                         except Exception:
                             # Compression must never turn an output-cap error
                             # fatal — fall through and retry on max_tokens alone.
@@ -5615,6 +6042,11 @@ def run_conversation(
                                 "%sOutput-cap compression hit an error; retrying on max_tokens only.",
                                 agent.log_prefix,
                             )
+                        if _admitted_retry_request is not None:
+                            # Stay inside this provider transaction: the next
+                            # attempt consumes the exact finalized candidate,
+                            # including the one-shot reduced output cap.
+                            continue
                         _retry.restart_with_compressed_messages = True
                         break
 
@@ -5739,6 +6171,10 @@ def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
+                    _retry_admission_handoff = {
+                        "request": _finalized_request,
+                        "admitted": False,
+                    }
                     # Option A (LCM issue 441): pass the OVERHEAD-AWARE request size (msgs + tool
                     # schemas + system), not the tool-blind message count, so LCM forced-overflow
                     # recovery arms on the TRUE request that overflowed. See hermes-lcm engine
@@ -5747,6 +6183,10 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        force=True,
+                        live_request_context=_live_retry_compression_context(
+                            _retry_admission_handoff
+                        ),
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -5763,6 +6203,11 @@ def run_conversation(
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
+                    if _retry_admission_handoff.get("admitted") is True:
+                        _admitted_retry_request = _retry_admission_handoff.get(
+                            "request"
+                        )
+                        _admitted_retry_semantics = _request_semantics
 
                     # Re-estimate tokens after compression.  Same-message-count
                     # compression (tool-result pruning, in-place summarization)
@@ -5776,6 +6221,11 @@ def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        if _admitted_retry_request is not None:
+                            # Admission already finalized the only request this
+                            # retry may send.  Do not rebuild it in the outer
+                            # loop or advance selector/middleware a second time.
+                            continue
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break

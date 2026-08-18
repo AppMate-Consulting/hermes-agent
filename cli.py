@@ -4841,6 +4841,21 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _SyntheticCompletionInput:
+    """Queue sentinel proving a completion originated in Hermes runtime."""
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+
+def _unwrap_completion_input(value):
+    """Unwrap the private queue sentinel without inferring from wrapper text."""
+    if isinstance(value, _SyntheticCompletionInput):
+        return value.text, True
+    return value, False
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -12342,7 +12357,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            self._pending_input.put(_SyntheticCompletionInput(synthetic_message))
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -12735,7 +12750,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from hermes_cli.partial_compress import (
             extract_compress_flags,
             parse_partial_compress_args,
-            rejoin_compressed_head_and_tail,
             split_history_for_partial_compress,
             summarize_compress_preview,
         )
@@ -12836,12 +12850,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # which already contain the agent identity — resulting in the
                 # identity block appearing twice (issue #15281).
                 compressed, _ = self.agent._compress_context(
-                    head,
+                    original_history,
                     None,
                     approx_tokens=approx_tokens,
                     focus_topic=focus_topic or None,
                     force=True,
                     defer_context_engine_notification=True,
+                    protected_tail=tail if partial and tail else None,
                 )
 
                 # If _compress_context returned unchanged because a
@@ -12876,8 +12891,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     return
 
-                if partial and tail:
-                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
+                from agent.conversation_compression import compression_outcome_committed
+
+                _compression_outcome = getattr(
+                    self.agent, "_last_compression_outcome", None
+                )
+                _host_commit = compression_outcome_committed(_compression_outcome)
+                # Keep compatibility with simple external/test engines that do
+                # not publish a typed outcome, but never infer a commit from an
+                # equal copy.
+                if not isinstance(_compression_outcome, str):
+                    _host_commit = compressed != original_history
+                if not _host_commit:
+                    finalize_context_engine_compression_notification(
+                        self.agent, committed=False
+                    )
+                    summary = summarize_manual_compression(
+                        original_history,
+                        original_history,
+                        approx_tokens,
+                        approx_tokens,
+                        compression_state=getattr(
+                            self.agent, "context_compressor", None
+                        ),
+                    )
+                    print(f"  🗜️ {summary['headline']}")
+                    print(f"     {summary['token_line']}")
+                    if summary["note"]:
+                        print(f"     {summary['note']}")
+                    return
+
                 self.conversation_history = compressed
                 # _compress_context ends the old session and creates a new child
                 # session on the agent (run_agent.py::_compress_context). Sync the
@@ -12892,10 +12935,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.session_id = self.agent.session_id
                     getattr(self, "_write_terminal_breadcrumb", lambda: None)()
                     self._pending_title = None
-                    # Manual /compress replaces conversation_history with a new
-                    # compressed handoff for the child session. Persist it from
-                    # offset 0 so resume can recover the continuation after exit.
-                    self.agent._flush_messages_to_session_db(self.conversation_history, None)
                 finalize_context_engine_compression_notification(
                     self.agent,
                     committed=True,
@@ -12924,6 +12963,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     print(f"     {summary['note']}")
 
             except Exception as e:
+                from agent.conversation_compression import (
+                    CompressionCommittedPostpublicationError,
+                )
+                if isinstance(e, CompressionCommittedPostpublicationError):
+                    self.agent.session_id = e.session_id
+                    self.session_id = e.session_id
+                    self._pending_title = None
+                    try:
+                        self.conversation_history = e.load_authoritative_transcript(
+                            self.agent
+                        )
+                        self._compression_reconciliation_required = None
+                        finalize_context_engine_compression_notification(
+                            self.agent, committed=True
+                        )
+                        print(
+                            "  ⚠️ Compression committed, but host synchronization "
+                            f"needed recovery: {e.cause}"
+                        )
+                    except Exception as reconcile_error:
+                        self.conversation_history = []
+                        self._compression_reconciliation_required = str(reconcile_error)
+                        finalize_context_engine_compression_notification(
+                            self.agent, committed=True
+                        )
+                        print(
+                            "  ⚠️ Compression committed, but durable host "
+                            f"reconciliation failed: {reconcile_error}"
+                        )
+                    return
                 finalize_context_engine_compression_notification(
                     self.agent,
                     committed=False,
@@ -15383,7 +15452,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self, message, images: list = None, voice_input: bool = False,
+        synthetic_completion: bool = False,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -15404,6 +15476,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        if getattr(self, "_compression_reconciliation_required", None):
+            print(
+                "  ⛔ Session blocked: committed compression requires durable "
+                "reconciliation; no new turn started."
+            )
+            return None
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -15744,6 +15823,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
+                        persist_user_display_kind=(
+                            "internal_notification" if synthetic_completion else None
+                        ),
+                        persist_user_is_autonomous_completion=synthetic_completion,
                         moa_config=_moa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
@@ -19128,6 +19211,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
                     if is_voice_input:
                         user_input = user_input.text
+                    user_input, is_synthetic_completion = _unwrap_completion_input(
+                        user_input
+                    )
 
                     if not user_input:
                         continue
@@ -19243,7 +19329,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input, images=submit_images or None,
+                            voice_input=is_voice_input,
+                            synthetic_completion=is_synthetic_completion,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

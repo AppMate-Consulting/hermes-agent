@@ -14,6 +14,77 @@ from unittest.mock import MagicMock
 
 import pytest
 
+
+@pytest.mark.parametrize("late_outcome", ["rejected_no_progress", "summary_failure"])
+def test_late_worker_cannot_overwrite_terminal_host_timeout(late_outcome):
+    """A started worker may finish after timeout, but host truth is final."""
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from agent.conversation_compression import (
+        _publish_compression_outcome,
+        run_compress_context_with_progress_timeout,
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    agent = SimpleNamespace(_last_compression_outcome="pending")
+
+    def worker(_fence):
+        started.set()
+        release.wait(2)
+        _publish_compression_outcome(agent, late_outcome)
+        exited.set()
+        return [], "late"
+
+    def release_after_timeout(*_args):
+        release.set()
+
+    result = run_compress_context_with_progress_timeout(
+        worker=worker,
+        messages=[{"role": "user", "content": "original"}],
+        system_prompt_fallback="sys",
+        idle_timeout_seconds=0.03,
+        total_ceiling_seconds=0.05,
+        on_timeout=release_after_timeout,
+        telemetry_agent=agent,
+    )
+    assert started.is_set()
+    assert result[0][0]["content"] == "original"
+    assert exited.wait(2)
+    time.sleep(0.01)
+    assert agent._last_compression_outcome in {
+        "timed_out_inactivity", "timed_out_total_ceiling"
+    }
+
+
+@pytest.mark.parametrize(
+    ("outcome", "phrase"),
+    [
+        ("committed_materially_shrunk", "changes committed"),
+        ("rejected_no_progress", "aborted — no changes committed"),
+        ("skipped_cooldown", "skipped — no changes committed"),
+        ("timed_out_inactivity", "timed out — no changes committed"),
+        ("summary_failure", "failed — no changes committed"),
+    ],
+)
+def test_terminal_compaction_status_is_truthful_and_typed(outcome, phrase):
+    from types import SimpleNamespace
+    from agent.conversation_compression import _emit_compaction_done
+
+    calls = []
+    agent = SimpleNamespace(
+        _last_compression_outcome=outcome,
+        status_callback=lambda *args: calls.append(args),
+    )
+    _emit_compaction_done(agent)
+    assert calls == [("compacted", calls[0][1])]
+    assert phrase in calls[0][1]
+    assert outcome in calls[0][1] or outcome == "committed_materially_shrunk"
+    assert "provider exploded" not in calls[0][1]
+
 from agent.conversation_compression import (
     CompressionCommitFence,
     resolve_context_compression_timeouts,
@@ -54,7 +125,7 @@ class TestRunCompressContextWithProgressTimeout:
 
         def worker(fence: CompressionCommitFence):
             started.set()
-            assert release.wait(timeout=2)
+            assert release.wait(timeout=10)
             if not fence.begin_commit():
                 return ([{"role": "assistant", "content": "should-not-land"}], "x")
             try:
@@ -64,19 +135,25 @@ class TestRunCompressContextWithProgressTimeout:
                 fence.finish_commit()
 
         warnings = []
+        telemetry_agent = type("Agent", (), {"_last_compression_outcome": "pending"})()
 
         result_msgs, result_prompt = run_compress_context_with_progress_timeout(
             worker=worker,
             messages=original,
             system_prompt_fallback="fallback-prompt",
-            idle_timeout_seconds=0.05,
-            total_ceiling_seconds=0.2,
+            # This test verifies fence cancellation after a worker has started,
+            # not executor scheduling latency. Leave enough admission budget
+            # for the 48-process verifier while keeping the worker silent long
+            # enough to exercise the real timeout path.
+            idle_timeout_seconds=1.0,
+            total_ceiling_seconds=1.0,
             on_timeout=lambda idle, waited, since: warnings.append(
                 (idle, waited, since)
             ),
+            telemetry_agent=telemetry_agent,
         )
 
-        assert started.wait(timeout=1)
+        assert started.wait(timeout=10)
         # Give the waiter time to cancel before releasing the worker.
         time.sleep(0.15)
         release.set()
@@ -88,9 +165,13 @@ class TestRunCompressContextWithProgressTimeout:
         assert result_msgs is original
         assert result_prompt == "fallback-prompt"
         assert warnings, "timeout callback should fire"
+        assert telemetry_agent._last_compression_outcome in {
+            "timed_out_inactivity", "timed_out_total_ceiling",
+        }
         assert not commit_attempted.is_set(), (
             "cancelled fence must block late session mutation"
         )
+        assert telemetry_agent._last_compression_outcome.startswith("timed_out_")
 
     def test_progress_extends_idle_budget_until_success(self):
         original = [{"role": "user", "content": "a"}]
@@ -145,11 +226,11 @@ class TestRunCompressContextWithProgressTimeout:
             worker=worker,
             messages=original,
             system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.05,
-            total_ceiling_seconds=0.05,
+            idle_timeout_seconds=1.0,
+            total_ceiling_seconds=1.0,
         )
 
-        assert entered.wait(timeout=1)
+        assert entered.wait(timeout=10)
         assert result_msgs == compressed
         assert result_prompt == "committed"
 

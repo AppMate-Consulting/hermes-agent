@@ -218,6 +218,54 @@ def test_user_message_preserves_platform_event_timestamp():
     assert ctx.messages[-1]["timestamp"] == 123.5
 
 
+@pytest.mark.parametrize(
+    ("defer_automatic_preflight", "expected_calls"),
+    [(False, 1), (True, 0)],
+)
+def test_standalone_preflight_default_is_preserved_but_can_be_deferred(
+    defer_automatic_preflight, expected_calls
+):
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    compressor = MagicMock()
+    compressor.protect_first_n = 0
+    compressor.protect_last_n = 0
+    compressor.threshold_tokens = 10
+    compressor.context_length = 100
+    compressor.summary_target_ratio = 0.5
+    compressor.last_prompt_tokens = 0
+    compressor.should_defer_preflight_to_real_usage.return_value = False
+    compressor.get_active_compression_failure_cooldown.return_value = None
+    compressor.should_compress.side_effect = [True, False]
+    agent.context_compressor = compressor
+    agent._compress_context = MagicMock(
+        side_effect=lambda messages, *_args, **_kwargs: (
+            [
+                {"role": "assistant", "content": "summary"},
+                messages[-1],
+            ],
+            "SYSTEM",
+        )
+    )
+
+    with (
+        patch("agent.turn_context._should_run_preflight_estimate", return_value=True),
+        patch("agent.turn_context.estimate_request_tokens_rough", return_value=50),
+        patch("agent.turn_context.automatic_compaction_status_message", return_value=""),
+    ):
+        ctx = _build(
+            agent,
+            conversation_history=[
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "answer"},
+            ],
+            defer_automatic_preflight=defer_automatic_preflight,
+        )
+
+    assert agent._compress_context.call_count == expected_calls
+    assert ctx.deferred_preflight_pending is defer_automatic_preflight
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous

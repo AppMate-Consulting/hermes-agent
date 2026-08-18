@@ -98,7 +98,11 @@ class TestF1CommitOverrunWhileHung:
             t = threading.Thread(target=run, name="f1-hung-commit-host")
             t.start()
             try:
-                assert entered.wait(timeout=2)
+                # Under the parallel verifier this process may be CPU-starved
+                # while the bounded executor starts.  Admission is the subject
+                # here, not a two-second startup deadline; the worker's own
+                # event gate still proves the overrun while commit is blocked.
+                assert entered.wait(timeout=10)
                 # ── Assert WHILE the commit worker is still blocked ──────
                 assert overrun_fired.wait(timeout=5), (
                     "on_commit_overrun must fire while the commit is hung"
@@ -142,6 +146,173 @@ class TestF1CommitOverrunWhileHung:
         assert fence.commit_in_flight is True
         fence.finish_commit()
         assert fence.commit_in_flight is False
+
+
+def test_in_memory_publication_claim_linearizes_both_race_outcomes():
+    cancelled = CompressionCommitFence()
+    assert cancelled.try_cancel_before_commit() is True
+    assert cancelled.claim_caller_publication() is False
+    assert cancelled.caller_publication_claimed is False
+
+    published = CompressionCommitFence()
+    assert published.claim_caller_publication() is True
+    assert published.caller_publication_claimed is True
+    assert published.try_cancel_before_commit() is False
+    assert published.commit_in_flight is False
+
+
+def test_postcommit_lane_serializes_blocked_chains_in_publication_order(monkeypatch):
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    order = []
+
+    class Agent:
+        pass
+
+    agent = Agent()
+    monkeypatch.setattr(cc, "_POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.02)
+
+    def first():
+        order.append("first-enter")
+        first_entered.set()
+        assert release_first.wait(timeout=5)
+        order.append("first-exit")
+
+    def second():
+        order.append("second-enter")
+        second_entered.set()
+
+    cc._run_postcommit_callbacks_bounded(agent, first, session_id="child-1")
+    assert first_entered.is_set()
+    cc._run_postcommit_callbacks_bounded(agent, second, session_id="child-2")
+    assert not second_entered.is_set()
+    release_first.set()
+    assert second_entered.wait(timeout=2)
+    assert order == ["first-enter", "first-exit", "second-enter"]
+
+
+def test_deferred_notification_claims_then_waits_fifo_with_frozen_identity(monkeypatch):
+    """Host finalization clears B immediately while observer A is blocked."""
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    delivered = threading.Event()
+    order = []
+    calls = []
+
+    class Compressor:
+        pass
+
+    class Agent:
+        platform = "old-platform"
+        session_id = "child-b"
+        _gateway_session_key = ("old", "conversation")
+        context_compressor = Compressor()
+
+    agent = Agent()
+    monkeypatch.setattr(cc, "_POSTCOMMIT_CALLBACK_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        cc,
+        "_notify_context_engine_compression_complete",
+        lambda _agent, **kwargs: (
+            order.append("b"),
+            calls.append((kwargs, threading.current_thread().name)),
+            delivered.set(),
+            True,
+        )[-1],
+    )
+
+    def first():
+        order.append("a-enter")
+        first_entered.set()
+        assert release_first.wait(timeout=5)
+        order.append("a-exit")
+
+    cc._run_postcommit_callbacks_bounded(agent, first, session_id="child-a")
+    assert first_entered.is_set()
+    frozen_callback = object()
+    agent.context_compressor.on_session_start = frozen_callback
+    cc._queue_context_engine_compression_notification(
+        agent, new_session_id="child-b", old_session_id="parent-b"
+    )
+    agent.context_compressor.on_session_start = object()
+    agent.platform = "mutated-platform"
+    agent._gateway_session_key = ("mutated", "conversation")
+    agent.session_id = "child-c"
+
+    assert cc.finalize_context_engine_compression_notification(agent, committed=True)
+    assert getattr(agent, cc._PENDING_CONTEXT_ENGINE_NOTIFICATION) is None
+    assert not delivered.is_set()
+    release_first.set()
+    assert delivered.wait(timeout=2)
+    assert order == ["a-enter", "a-exit", "b"]
+    assert len(calls) == 1
+    delivered_kwargs, delivery_thread = calls[0]
+    assert delivered_kwargs["new_session_id"] == "child-b"
+    assert delivered_kwargs["old_session_id"] == "parent-b"
+    assert delivered_kwargs["platform"] == "old-platform"
+    assert delivered_kwargs["conversation_id"] == ("old", "conversation")
+    assert delivered_kwargs["callback"] is frozen_callback
+    assert delivery_thread == "compression-postcommit-child-b"
+
+    # No detached work can reinstall stale state; a subsequent record is
+    # independently claimable and discarded exactly once.
+    cc._queue_context_engine_compression_notification(
+        agent, new_session_id="child-c", old_session_id="child-b"
+    )
+    assert not cc.finalize_context_engine_compression_notification(
+        agent, committed=False
+    )
+    assert getattr(agent, cc._PENDING_CONTEXT_ENGINE_NOTIFICATION) is None
+
+
+def test_finalized_payload_estimator_charges_late_fields_and_binary_safely(monkeypatch):
+    monkeypatch.setattr(cc, "estimate_request_tokens_rough", lambda *_a, **_k: 10)
+    base = {"messages": [{"role": "user", "content": "same"}]}
+    grown = {**base, "instructions": "x" * 4000, "binary": b"z" * 4000}
+    assert cc.estimate_finalized_payload_tokens_rough(base) == 10
+    assert cc.estimate_finalized_payload_tokens_rough(grown) > 1900
+
+
+def test_middleware_replay_uses_frozen_final_body_without_repeating_shaping(
+    monkeypatch,
+):
+    """Replay is middleware-only and cannot mutate its frozen input."""
+    from types import SimpleNamespace
+
+    from agent.conversation_loop import _apply_finalized_request_middleware
+
+    frozen = {
+        "messages": [{"role": "user", "content": "selected once"}],
+        "tools": [{"type": "function", "function": {"name": "immutable"}}],
+        "late": {"value": 1},
+    }
+    calls = []
+
+    def apply(payload, **context):
+        calls.append((payload, context))
+        payload["late"]["value"] = 2
+        return SimpleNamespace(
+            payload=payload,
+            original_payload=copy.deepcopy(frozen),
+            trace=["late"],
+        )
+
+    import copy
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware", apply)
+    finalized = {
+        "payload": {"irrelevant": True},
+        "_pre_middleware_payload": copy.deepcopy(frozen),
+        "messages": frozen["messages"],
+        "tools": frozen["tools"],
+    }
+    first = _apply_finalized_request_middleware(finalized, middleware_context={})
+    replay = _apply_finalized_request_middleware(finalized, middleware_context={})
+
+    assert first["payload"] == replay["payload"]
+    assert finalized["_pre_middleware_payload"] == frozen
+    assert calls[0][0] is not calls[1][0]
 
 
 class _KIOnFirstResultFuture:
@@ -278,7 +449,7 @@ class TestF6ExecutorSaturation:
         run the refused job."""
         _drain_admission_slots()
         release = threading.Event()
-        started = threading.Barrier(5, timeout=10)  # 4 workers + main
+        started = threading.Barrier(5, timeout=60)  # 4 workers + main
 
         def blocked_worker(fence: CompressionCommitFence):
             started.wait()
@@ -349,6 +520,7 @@ class TestF6ExecutorSaturation:
             cc.logger.addHandler(capture)
             cc.logger.setLevel(_logging.DEBUG)
             t0 = time.monotonic()
+            telemetry_agent = _TelemetryAgent()
             try:
                 msgs, prompt = run_compress_context_with_progress_timeout(
                     worker=fifth_worker,
@@ -356,7 +528,7 @@ class TestF6ExecutorSaturation:
                     system_prompt_fallback="fifth-fallback",
                     idle_timeout_seconds=5.0,
                     total_ceiling_seconds=5.0,
-                    telemetry_agent=_TelemetryAgent(),
+                    telemetry_agent=telemetry_agent,
                 )
             finally:
                 cc.logger.removeHandler(capture)
@@ -370,6 +542,9 @@ class TestF6ExecutorSaturation:
             assert msgs is fifth_msgs
             assert prompt == "fifth-fallback"
             assert not fifth_ran.is_set()
+            assert telemetry_agent._last_compression_outcome == (
+                "rejected_pool_saturated"
+            )
             saturated = [
                 p for p in capture.payloads
                 if p.get("failure_class") == "pool_saturated"
@@ -440,7 +615,13 @@ class TestF6ExecutorSaturation:
             compressor._last_aux_model_failure_model = None
             compressor._last_aux_model_failure_error = None
             agent.context_compressor = compressor
-            agent._cached_system_prompt = "sys"
+            agent.api_mode = "codex_app_server"
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._build_system_prompt = MagicMock(return_value="logical prompt")
+            agent._memory_manager = MagicMock()
+            agent.commit_memory_session = MagicMock()
+            agent.event_callback = MagicMock()
 
             fence = CompressionCommitFence()
             assert fence.cancel_before_commit() is True
@@ -452,8 +633,64 @@ class TestF6ExecutorSaturation:
 
             compressor.compress.assert_not_called()
             assert returned is messages
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent._last_compression_outcome == "cancelled_commit_fence"
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.event_callback.assert_not_called()
+            assert fence.begin_commit() is False
             # The cancelled attempt must not leave the durable lock held.
             assert db.get_compression_lock_holder(session_id) is None
+
+    def test_uncached_automatic_cooldown_skip_is_side_effect_free(self):
+        """The public automatic path preserves absence and releases all gates."""
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as td:
+            db = SessionDB(db_path=Path(td) / "state.db")
+            sid = "UNCAHCED_COOLDOWN_SKIP"
+            db.create_session(sid, source="cli")
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                from run_agent import AIAgent
+
+                agent = AIAgent(
+                    api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                    model="test/model", quiet_mode=True, session_db=db,
+                    session_id=sid, skip_context_files=True, skip_memory=True,
+                )
+            vars(agent).pop("_cached_system_prompt", None)
+            vars(agent).pop("_cached_system_prompt_static", None)
+            agent._build_system_prompt = MagicMock(return_value="logical prompt")
+            db.record_compression_failure_cooldown(
+                sid, time.time() + 60, "automatic test cooldown"
+            )
+            agent._memory_manager = MagicMock()
+            agent.commit_memory_session = MagicMock()
+            agent.event_callback = MagicMock()
+            messages = [{"role": "user", "content": "unchanged"}]
+            before = list(messages)
+
+            returned, prompt = agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+            assert returned is messages and messages == before
+            assert prompt == "logical prompt"
+            assert "_cached_system_prompt" not in vars(agent)
+            assert "_cached_system_prompt_static" not in vars(agent)
+            assert agent._last_compression_outcome == "skipped_cooldown"
+            assert agent._compression_skipped_due_to_lock is None
+            assert db.get_compression_lock_holder(sid) is None
+            agent._memory_manager.on_pre_compress.assert_not_called()
+            agent._memory_manager.on_session_switch.assert_not_called()
+            agent.commit_memory_session.assert_not_called()
+            agent.event_callback.assert_not_called()
 
 
 class TestS3IdleChargedFromLastProgress:

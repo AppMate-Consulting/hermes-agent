@@ -44,7 +44,14 @@ class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
-        self.sent.append(content)
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
         return SendResult(success=True, message_id="m1")
 
 
@@ -104,11 +111,43 @@ class TestProducerHook:
         adapter = _Adapter()
         await _run(adapter, _event())
 
-        assert adapter.sent == ["final answer"]
+        assert adapter.sent[0]["content"] == "final answer"
+        assert adapter.sent[0]["reply_to"] == "msg-42"
         rows = _rows()
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+
+    @pytest.mark.asyncio
+    async def test_live_and_recovered_send_use_identical_route_identity(self):
+        """Recovery replays the exact chat, scope, thread and reply anchor."""
+        from gateway.run import GatewayRunner
+
+        adapter = _Adapter()
+        event = _event()
+        event.source.thread_id = "thread-7"
+        await _run(adapter, event)
+        live = dict(adapter.sent[0])
+        with dl._connect() as conn:
+            conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='pending', owner_pid=999999999, owner_started_at=1"""
+            )
+
+        runner = object.__new__(GatewayRunner)
+        runner.adapters = {Platform.SLACK: adapter}
+        store = MagicMock()
+        store.clear_resume_pending = AsyncMock()
+        store._store = None
+        runner.session_store = None
+        runner._async_session_store = store
+
+        assert await runner._redeliver_pending_obligations() == 1
+        recovered = adapter.sent[1]
+        assert recovered["chat_id"] == live["chat_id"]
+        assert recovered["reply_to"] == live["reply_to"] == "msg-42"
+        assert recovered["metadata"] == live["metadata"]
+        assert recovered["metadata"]["thread_id"] == "thread-7"
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):
@@ -135,7 +174,7 @@ class TestProducerHook:
             await asyncio.gather(_run(adapter, _event()), event_loop_witness())
 
         assert blocked_event_loop == []
-        assert adapter.sent == ["final answer"]
+        assert [sent["content"] for sent in adapter.sent] == ["final answer"]
 
     @pytest.mark.asyncio
     async def test_slow_ledger_update_does_not_block_event_loop(self):
@@ -151,7 +190,7 @@ class TestProducerHook:
             await asyncio.gather(_run(adapter, _event()), event_loop_witness())
 
         assert blocked_event_loop == []
-        assert adapter.sent == ["final answer"]
+        assert [sent["content"] for sent in adapter.sent] == ["final answer"]
 
     @pytest.mark.asyncio
     async def test_crash_between_attempting_and_ack_is_recoverable(self):

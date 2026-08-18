@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Canonical acceptance gate for the AppMate hermes-agent fork.
 #
-# Bootstrap baseline for the v0.20.4 (v2026.8.18) integration branch. Every
-# file listed here exists on the clean upstream release commit and collects
-# inside the credential-free verifier image declared in .argus/verifier.json.
-# Ported AppMate behaviours must extend this list with the tests that prove
-# them; do not remove existing entries without an explicit reason.
+# v0.20.4 (v2026.8.18) integration: the release-base bootstrap list (model
+# metadata, config validation, background review, compression/compaction,
+# hermes_state and FTS, gateway session/completion/hygiene/delivery, Buzz)
+# plus every AppMate test file that proves a ported production capability
+# (transactional in-place compaction, request admission ownership, completion
+# provenance, desktop loopback auth, turn-context provenance). Every file
+# listed here exists on this branch and collects inside the credential-free
+# verifier image declared in .argus/verifier.json. Extend it with the tests
+# that prove each new behaviour; do not remove entries without an explicit
+# reason.
 #
 # Runs through the repository's hermetic per-file runner (clean env, TZ=UTC,
 # per-file subprocess isolation). Retries are controlled by
@@ -61,4 +66,10 @@ exec "$repo_root/scripts/run_tests.sh" \
   tests/gateway/test_session_reset_notify.py \
   tests/gateway/test_buzz_adapter.py \
   tests/gateway/test_buzz_websocket.py \
+  tests/agent/test_completion_chain_compaction.py \
+  tests/agent/test_request_admission_ownership.py \
+  tests/tui_gateway/test_completion_provenance.py \
+  tests/run_agent/test_partial_compression_atomicity.py \
+  tests/hermes_cli/test_desktop_loopback_auth.py \
+  tests/agent/test_turn_context.py \
   -o 'addopts=' -q

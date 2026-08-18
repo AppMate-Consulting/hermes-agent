@@ -187,13 +187,16 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
             "agent.turn_context.estimate_request_tokens_rough",
             return_value=10,
         ),
+        # Admission pressure is measured on the exact finalized provider
+        # payload (request admission ownership), so the scripted pressure
+        # readings drive that seam; the message-only estimate is diagnostic.
         patch(
-            "agent.conversation_loop.estimate_messages_tokens_rough",
+            "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
             side_effect=_next_estimate,
         ),
         patch(
-            "agent.conversation_loop._estimate_tools_tokens_rough",
-            return_value=0,
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=10,
         ),
         patch.object(agent, "_compress_context", side_effect=_fake_compress),
         patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute_tool_calls),

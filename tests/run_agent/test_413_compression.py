@@ -6,6 +6,10 @@ Verifies that:
 - Preflight compression proactively compresses oversized sessions before API calls
 """
 
+import copy
+import hashlib
+import os
+
 import pytest
 #pytestmark = pytest.mark.skip(reason="Hangs in non-interactive environments")
 
@@ -13,10 +17,19 @@ import pytest
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 
 from agent.context_compressor import SUMMARY_PREFIX
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_compression import (
+    ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+    ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+    _compaction_terminal_status,
+)
+from agent.conversation_loop import finalize_provider_request
+from agent.turn_context import reanchor_current_turn_user_idx
 from run_agent import AIAgent
 import run_agent
 
@@ -75,6 +88,51 @@ def _make_413_error(*, use_status_code=True, message="Request entity too large")
     if use_status_code:
         err.status_code = 413
     return err
+
+
+def _materially_compressible_history() -> list[dict]:
+    """History whose deterministic summary clears the 9,600-token floor."""
+    return [
+        {"role": "user", "content": "old question " + ("x" * 60_000)},
+        {"role": "assistant", "content": "old answer " + ("y" * 60_000)},
+        {"role": "user", "content": "hello"},
+    ]
+
+
+def _mock_compression_result(agent, messages, system_prompt, live, *, admitted):
+    """Return a mock compression result honoring the admission handoff."""
+    handoff = live["admission_handoff"]
+    if not admitted:
+        handoff["request"] = live["frozen_finalized_request"]
+        handoff["admitted"] = False
+        return messages, system_prompt
+
+    turn_idx = reanchor_current_turn_user_idx(
+        messages, live["current_turn_identity"]
+    )
+    incoming = messages[turn_idx] if turn_idx is not None else None
+    finalized = finalize_provider_request(
+        agent,
+        messages,
+        system_message=system_prompt,
+        tools=live["tools"],
+        current_turn_user_idx=turn_idx,
+        external_prefetch=live["external_prefetch"],
+        plugin_user_context=live["plugin_user_context"],
+        prefill_messages=live["prefill_messages"],
+        incoming_message=incoming,
+        sanitize_model=live["sanitize_model"],
+        current_turn_suffix=live["current_turn_suffix"],
+        moa_prepared_request=live["moa_prepared_request"],
+        middleware_context=live["middleware_context"],
+        user_initiated_turn=live["user_initiated_turn"],
+    )
+    finalized["_consumes_user_initiator"] = bool(
+        live["user_initiated_turn"] and agent._is_copilot_url()
+    )
+    handoff["request"] = finalized
+    handoff["admitted"] = True
+    return messages, system_prompt
 
 
 @pytest.fixture()
@@ -141,6 +199,350 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
         == "new message that must survive a crash"
     )
     assert isinstance(persisted_messages[-1]["timestamp"], float)
+
+
+@pytest.mark.parametrize(
+    "notification",
+    [
+        "[IMPORTANT: Background process p completed normally.]",
+        "[ASYNC DELEGATION COMPLETE child=one]",
+        "[ASYNC DELEGATION BATCH COMPLETE children=two]",
+    ],
+)
+def test_production_turn_builder_injects_completion_provenance(agent, notification):
+    """Bind provenance to AIAgent's public turn-building seam, not its helper."""
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
+    from agent.context_compressor import ContextCompressor
+
+    agent.compression_enabled = False
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+    history = [
+        {"role": "user", "content": "real task"},
+        {"role": "assistant", "content": "ordinary response"},
+    ]
+    result = agent.run_conversation(
+        notification,
+        conversation_history=history,
+        persist_user_display_kind="internal_notification",
+        persist_user_is_autonomous_completion=True,
+    )
+    messages = result["messages"]
+    assert [m.get("content") for m in messages[2:5]] == [
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        notification,
+    ]
+    assert [m.get("role") for m in messages[2:5]] == ["user", "assistant", "user"]
+    assert ContextCompressor._has_autonomous_completion_chain(messages[:-1])
+
+
+def test_live_completion_provenance_does_not_require_presentation_metadata(agent):
+    """Trusted runtime markers classify a live completion without display fields."""
+    from agent.context_compressor import ContextCompressor
+
+    agent.compression_enabled = False
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+    result = agent.run_conversation(
+        "[ASYNC DELEGATION COMPLETE child=live-no-display]",
+        conversation_history=[
+            {"role": "user", "content": "real task"},
+            {"role": "assistant", "content": "ordinary response"},
+        ],
+        persist_user_is_autonomous_completion=True,
+    )
+    live = result["messages"][:-1]
+    completion_index = len(live) - 1
+    assert "display_kind" not in live[completion_index]
+    assert all(
+        live[index].get("_autonomous_completion_bridge") is True
+        for index in range(completion_index - 2, completion_index + 1)
+    )
+    assert ContextCompressor._completion_has_durable_provenance(
+        live, completion_index
+    )
+    assert ContextCompressor._has_autonomous_completion_chain(live)
+
+
+def test_production_turn_builder_does_not_retype_genuine_user_wrapper(agent):
+    from agent.context_compressor import ContextCompressor
+
+    wrapper = "[ASYNC DELEGATION COMPLETE child=human-written]"
+    agent.compression_enabled = False
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+    result = agent.run_conversation(
+        wrapper,
+        conversation_history=[
+            {"role": "user", "content": "real task"},
+            {"role": "assistant", "content": "ordinary response"},
+        ],
+        persist_user_display_kind="internal_notification",
+    )
+    messages = result["messages"]
+    wrapper_row = next(m for m in messages if m.get("content") == wrapper)
+    assert wrapper_row.get("display_kind") == "internal_notification"
+    assert not ContextCompressor._has_autonomous_completion_chain(messages[:-1])
+
+
+def test_explicit_completion_provenance_survives_sessiondb_replay(
+    agent, tmp_path, request
+):
+    """A real turn builder and durable flush preserve explicit provenance only."""
+    from hermes_state import SessionDB
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
+
+    db = SessionDB(db_path=Path(tmp_path) / "state.db")
+    request.addfinalizer(db.close)
+    sid = "durable-completion-provenance"
+    db.create_session(sid, "tui", model="test/model")
+    agent._session_db = db
+    agent.session_id = sid
+    agent._session_db_created = True
+    agent.compression_enabled = False
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("completion handled"),
+        _mock_response("human wrapper handled"),
+    ]
+    history = [
+        {"role": "user", "content": "real task"},
+        {"role": "assistant", "content": "ordinary response"},
+    ]
+    db.append_message(sid, "user", "real task")
+    db.append_message(sid, "assistant", "ordinary response")
+    completion = "[ASYNC DELEGATION COMPLETE child=durable]"
+    first = agent.run_conversation(
+        completion,
+        conversation_history=history,
+        persist_user_display_kind="internal_notification",
+        persist_user_is_autonomous_completion=True,
+    )
+    replay = db.get_messages_as_conversation(sid)
+    completion_index = next(
+        index for index, row in enumerate(replay) if row.get("content") == completion
+    )
+    assert [row.get("content") for row in replay[completion_index - 2:completion_index + 1]] == [
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        completion,
+    ]
+    assert [row.get("role") for row in replay[completion_index - 2:completion_index + 1]] == [
+        "user", "assistant", "user",
+    ]
+    assert ContextCompressor._has_autonomous_completion_chain(replay[:-1])
+
+    genuine = "[ASYNC DELEGATION COMPLETE child=human-authored]"
+    agent.run_conversation(
+        genuine,
+        conversation_history=first["messages"],
+        persist_user_display_kind="internal_notification",
+        persist_user_is_autonomous_completion=False,
+    )
+    replay = db.get_messages_as_conversation(sid)
+    genuine_row = next(m for m in replay if m.get("content") == genuine)
+    assert genuine_row["display_kind"] == "internal_notification"
+    assert genuine_row["role"] == "user"
+    genuine_index = replay.index(genuine_row)
+    assert [row.get("content") for row in replay[max(0, genuine_index - 2):genuine_index]] != [
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+    ]
+    assert not ContextCompressor._completion_has_durable_provenance(
+        replay, genuine_index
+    )
+
+
+def test_exact_bridge_lookalike_remains_latest_human_task_after_replay(
+    tmp_path, request
+):
+    """Replay and compaction preserve an exact human bridge lookalike."""
+    from hermes_state import SessionDB
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        _latest_active_human_task_row,
+        compress_context,
+    )
+
+    db = SessionDB(db_path=Path(tmp_path) / "bridge-lookalike.db")
+    request.addfinalizer(db.close)
+    sid = "bridge-lookalike"
+    db.create_session(sid, "tui", model="test/model")
+    rows = [
+        ("user", "older task", None),
+        ("assistant", "older answer", None),
+        ("user", AUTONOMOUS_COMPLETION_BRIDGE_USER, None),
+        ("assistant", "ordinary assistant response", None),
+        ("user", AUTONOMOUS_COMPLETION_BRIDGE_USER, None),
+        ("assistant", AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT, None),
+        ("user", "[ASYNC DELEGATION COMPLETE child=real]", "internal_notification"),
+    ]
+    for index, (role, content, display_kind) in enumerate(rows):
+        db.append_message(
+            sid,
+            role,
+            content,
+            display_kind=display_kind,
+            autonomous_completion_provenance=index in (4, 5, 6),
+        )
+    db.append_message(
+        sid,
+        "assistant",
+        "",
+        tool_calls=[{
+            "id": "completion-proof-call",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }],
+    )
+    db.append_message(
+        sid, "tool", "completion tool result", tool_call_id="completion-proof-call"
+    )
+    db.append_message(sid, "assistant", "completion handled")
+
+    replay = db.get_messages_as_conversation(sid)
+    active = _latest_active_human_task_row(replay)
+    assert active is not None
+    assert active["content"] == AUTONOMOUS_COMPLETION_BRIDGE_USER
+    assert ContextCompressor._active_task_contract(replay)["content"] == (
+        AUTONOMOUS_COMPLETION_BRIDGE_USER
+    )
+    assert ContextCompressor._has_autonomous_completion_chain(replay)
+    assert sum(
+        row.get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER for row in replay
+    ) == 2
+
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        compacting_agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            session_db=db,
+            session_id=sid,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    compacting_agent.compression_in_place = True
+    compacting_agent.context_compressor.protect_first_n = 0
+    compacting_agent.context_compressor.protect_last_n = 3
+    compacting_agent.context_compressor._generate_summary = (
+        lambda *_args, **_kwargs: "Deterministic completion history summary."
+    )
+    compacting_agent._cached_system_prompt = "stable system prompt"
+
+    estimate_calls = []
+    replay_before = copy.deepcopy(replay)
+    tools_before = copy.deepcopy(compacting_agent.tools)
+
+    def _admitted_full_request_estimate(payload):
+        estimate_calls.append(copy.deepcopy(payload))
+        return 20_000 if len(estimate_calls) == 1 else 1_000
+
+    telemetry = []
+
+    def _record_telemetry(owner, **kwargs):
+        telemetry.append(dict(kwargs))
+
+    with (
+        patch(
+            "agent.conversation_compression.estimate_finalized_payload_tokens_rough",
+            side_effect=_admitted_full_request_estimate,
+        ),
+        patch(
+            "agent.conversation_compression._emit_compression_attempt_telemetry",
+            side_effect=_record_telemetry,
+        ),
+        patch.object(db, "archive_and_compact", wraps=db.archive_and_compact) as commit,
+        patch.object(db, "append_message", wraps=db.append_message) as append,
+    ):
+        compacted, _ = compress_context(
+            compacting_agent, replay, "sys", approx_tokens=1, force=True
+        )
+
+    durable = db.get_messages_as_conversation(sid)
+    for transcript in (compacted, durable):
+        contract = ContextCompressor._active_task_contract(transcript)
+        assert contract == {
+            "content": AUTONOMOUS_COMPLETION_BRIDGE_USER,
+            "sha256": hashlib.sha256(
+                AUTONOMOUS_COMPLETION_BRIDGE_USER.encode("utf-8")
+            ).hexdigest(),
+        }
+        assert not any(row.get("content") == "older task" for row in transcript)
+        assert ContextCompressor._has_autonomous_completion_chain(transcript)
+        roles = [row["role"] for row in transcript]
+        assert all(left != right for left, right in zip(roles, roles[1:]))
+        call_ids = {
+            call["id"]
+            for row in transcript
+            for call in row.get("tool_calls", [])
+        }
+        assert all(
+            row.get("tool_call_id") in call_ids
+            for row in transcript
+            if row.get("role") == "tool"
+        )
+        assert call_ids == {"completion-proof-call"}
+
+    bridge_contents = {
+        ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+        ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+    }
+    bridge_counts = {
+        content: sum(row.get("content") == content for row in durable)
+        for content in bridge_contents
+    }
+    assert bridge_counts[AUTONOMOUS_COMPLETION_BRIDGE_USER] <= 2
+    assert bridge_counts[AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT] <= 1
+    assert bridge_counts[ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE] <= 1
+    assert bridge_counts[ACTIVE_TASK_CONTRACT_BRIDGE_AFTER] <= 1
+    assert len(estimate_calls) == 2
+    request_in = estimate_calls[0]["messages"]
+    tools_in = estimate_calls[0].get("tools")
+    request_out = estimate_calls[1]["messages"]
+    tools_out = estimate_calls[1].get("tools")
+    assert request_in[0] == {
+        "role": "system", "content": "stable system prompt"
+    }
+    assert [row.get("role") for row in request_in[1:]] == [
+        row.get("role") for row in replay
+    ]
+    assert [row.get("content") for row in request_in[1:]] == [
+        row.get("content") for row in replay
+    ]
+    assert request_in[3]["role"] == replay[2]["role"] == "user"
+    assert request_in[3]["content"] == replay[2]["content"] == (
+        AUTONOMOUS_COMPLETION_BRIDGE_USER
+    )
+    assert not any(
+        row.get("autonomous_completion_provenance", False) for row in request_in
+    )
+    assert request_out[0]["role"] == "system"
+    assert tools_in == tools_out == tools_before
+    assert replay == replay_before
+    assert compacting_agent.tools == tools_before
+    assert commit.call_count == 1
+    append.assert_not_called()
+    persisted = db.get_messages(sid, include_inactive=True)
+    assert sum(not row.get("active", 1) for row in persisted) == len(replay)
+    assert sum(bool(row.get("active", 1)) for row in persisted) == len(durable)
+    assert compacting_agent._last_compression_outcome == (
+        "committed_materially_shrunk"
+    )
+    assert compacting_agent._compression_durable_commit_occurred is True
+    assert telemetry[-1]["commit_status"] == "committed"
+    assert telemetry[-1]["split_status"] == "in_place_committed"
 
 
 class TestHTTP413Compression:
@@ -440,6 +842,86 @@ class TestHTTP413Compression:
 class TestPreflightCompression:
     """Preflight compression should compress history before the first API call."""
 
+    def test_in_memory_commit_has_truthful_terminal_status(self):
+        assert _compaction_terminal_status("committed_in_memory") == (
+            "✓ Context compaction complete — in-memory context updated."
+        )
+
+    @pytest.mark.parametrize(
+        ("mode", "outcome"),
+        [
+            ("native", "skipped_codex_native_ownership"),
+            ("off", "skipped_codex_off_ownership"),
+        ],
+    )
+    def test_codex_public_entry_reports_automatic_ownership_skip(
+        self, agent, mode, outcome
+    ):
+        messages = [{"role": "user", "content": "unchanged"}]
+        agent.api_mode = "codex_app_server"
+        agent.codex_app_server_auto_compaction = mode
+        with patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ):
+            returned, _ = agent._compress_context(messages, "system")
+        assert returned is messages
+        assert agent._last_compression_outcome == outcome
+        assert "skipped" in _compaction_terminal_status(outcome).lower()
+
+    def test_codex_public_entry_requires_an_active_thread(self, agent):
+        messages = [{"role": "user", "content": "unchanged"}]
+        agent.api_mode = "codex_app_server"
+        agent.codex_app_server_auto_compaction = "hermes"
+        agent._codex_session = None
+        with patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ):
+            returned, _ = agent._compress_context(messages, "system")
+        assert returned is messages
+        assert agent._last_compression_outcome == "skipped_codex_no_active_thread"
+
+    @pytest.mark.parametrize(
+        ("result", "outcome"),
+        [
+            (SimpleNamespace(interrupted=False, error=None, should_retire=False,
+                             thread_id="thread", turn_id="turn"),
+             "committed_provider_managed"),
+            (SimpleNamespace(interrupted=True, error=None, should_retire=False),
+             "summary_failure"),
+            (SimpleNamespace(interrupted=False, error="provider failed",
+                             should_retire=False), "summary_failure"),
+        ],
+    )
+    def test_codex_public_entry_outcome_matches_provider_result(
+        self, agent, result, outcome
+    ):
+        messages = [{"role": "user", "content": "local mirror"}]
+        original = list(messages)
+        agent.api_mode = "codex_app_server"
+        agent.codex_app_server_auto_compaction = "hermes"
+        agent._codex_session = SimpleNamespace(
+            compact_thread=MagicMock(return_value=result), close=MagicMock()
+        )
+        events = []
+        agent.status_callback = lambda event, message: events.append((event, message))
+        with patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ), patch("agent.codex_runtime._record_codex_app_server_compaction"), patch(
+            "agent.codex_runtime._record_codex_app_server_usage"
+        ):
+            returned, _ = agent._compress_context(messages, "system")
+        assert returned is messages
+        assert messages == original
+        assert agent._last_compression_outcome == outcome
+        assert events[-1] == ("compacted", _compaction_terminal_status(outcome))
+        if outcome == "committed_provider_managed":
+            assert "provider-managed" in events[-1][1]
+        else:
+            assert "complete — changes committed" not in events[-1][1]
+
     def test_compress_context_emits_lifecycle_status_before_work(self, agent):
         """Direct context compression should tell gateway users why the turn paused."""
         # This test calls _compress_context directly and asserts the FIRST
@@ -468,7 +950,7 @@ class TestPreflightCompression:
             patch("run_agent.estimate_request_tokens_rough", return_value=42),
         ):
             compressed, new_system_prompt = agent._compress_context(
-                [{"role": "user", "content": "hello"}],
+                _materially_compressible_history(),
                 "system prompt",
                 approx_tokens=1234,
             )
@@ -486,7 +968,7 @@ class TestPreflightCompression:
         assert events == [
             ("lifecycle", COMPACTION_STATUS),
             ("compress", "started"),
-            ("compacted", COMPACTION_DONE_STATUS),
+            ("compacted", _compaction_terminal_status("committed_in_memory")),
         ]
 
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
@@ -506,7 +988,8 @@ class TestPreflightCompression:
         assert compressed is messages
         assert prompt == "You are helpful."
         assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
-        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        assert "skipped" in events[-1][1].lower()
+        assert "no changes committed" in events[-1][1].lower()
 
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
@@ -531,7 +1014,7 @@ class TestPreflightCompression:
             patch.object(agent, "_build_system_prompt") as build_prompt,
         ):
             _, new_system_prompt = agent._compress_context(
-                [{"role": "user", "content": "hello"}],
+                _materially_compressible_history(),
                 "system prompt",
                 approx_tokens=1234,
             )
@@ -567,13 +1050,39 @@ class TestPreflightCompression:
             patch.object(agent, "_build_system_prompt", return_value="rebuilt without memory") as build_prompt,
         ):
             _, new_system_prompt = agent._compress_context(
-                [{"role": "user", "content": "hello"}],
+                _materially_compressible_history(),
                 "system prompt",
                 approx_tokens=1234,
             )
 
         assert new_system_prompt == "rebuilt without memory"
         build_prompt.assert_called_once_with("system prompt")
+
+        # The same rebuild remains speculative when admission rejects a tiny
+        # transcript: rollback must preserve the previously cached prompt.
+        old_prompt = "system prompt\n\nMEMORY (your personal notes)\nold fact"
+        agent._cached_system_prompt = old_prompt
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                return_value=[{
+                    "role": "user",
+                    "content": f"{SUMMARY_PREFIX}\nPrevious conversation",
+                }],
+            ),
+            patch.object(
+                agent, "_build_system_prompt", return_value="must roll back"
+            ),
+        ):
+            rejected, rejected_prompt = agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+        assert rejected == [{"role": "user", "content": "hello"}]
+        assert rejected_prompt == old_prompt
+        assert agent._cached_system_prompt == old_prompt
 
 
 
@@ -603,15 +1112,20 @@ class TestPreflightCompression:
             # Keep the turn-prologue preflight quiet-by-size so only the
             # in-loop pre-API pressure gate fires.
             patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
                 return_value=144_669,
             ),
             patch.object(
                 agent,
                 "_compress_context",
-                side_effect=lambda msgs, *a, **k: (msgs, agent._cached_system_prompt),
+                side_effect=lambda msgs, *a, **k: _mock_compression_result(
+                    agent,
+                    msgs,
+                    agent._cached_system_prompt,
+                    k["live_request_context"],
+                    admitted=False,
+                ),
             ) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -673,6 +1187,25 @@ class TestPreflightCompression:
         )
         assert result["completed"] is True
         assert result["final_response"] == "After preflight"
+        live = mock_compress.call_args_list[0].kwargs["live_request_context"]
+        assert "admission_handoff" in live
+        assert live["current_turn_identity"] == "hello"
+        assert live["incoming_message"]["role"] == "user"
+        assert live["incoming_message"]["content"] == "hello"
+        assert live["external_prefetch"] == ""
+        assert live["plugin_user_context"] == ""
+        assert live["tools"] == agent.tools
+        assert live["sanitize_model"] == agent.model
+        assert live["current_turn_suffix"] is None
+        assert live["moa_prepared_request"] is None
+        assert live["user_initiated_turn"] is True
+        assert live["middleware_context"]["turn_id"]
+        assert live["middleware_context"]["api_request_id"]
+        assert live["middleware_context"]["api_mode"] == agent.api_mode
+        assert live["frozen_finalized_request"] is not None
+        assert "request_middleware_preview_pre" in live
+        assert "request_middleware_preview_post" in live
+        assert "request_middleware_nontransactional" in live
         assert any(
             ev == "lifecycle" and "Preflight compression" in msg
             for ev, msg in status_messages
@@ -695,24 +1228,28 @@ class TestPreflightCompression:
         status_messages = []
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
-        _rough_calls = {"n": 0}
+        finalized_estimates = iter([114_000, 40_000])
 
-        def _rough_estimate(*_args, **_kwargs):
-            _rough_calls["n"] += 1
-            return 114_000 if _rough_calls["n"] == 1 else 40_000
+        def _compress(msgs, *_args, **kwargs):
+            candidate = [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
+            return _mock_compression_result(
+                agent,
+                candidate,
+                "new system prompt",
+                kwargs["live_request_context"],
+                admitted=True,
+            )
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch.object(agent, "_compress_context") as mock_compress,
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=lambda *_a, **_k: next(finalized_estimates),
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
-                "new system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_called_once()
@@ -730,7 +1267,10 @@ class TestPreflightCompression:
 
         def _custom_status(**kwargs):
             assert kwargs["phase"] == "preflight"
-            assert kwargs["approx_tokens"] == 114_000
+            # The deferred gate measures the complete finalized request, so
+            # this includes the 15-token system/request overhead rather than
+            # the old message-only prologue estimate.
+            assert kwargs["approx_tokens"] == 114_015
             assert kwargs["threshold_tokens"] == 100_000
             return "🔧 LCM context maintenance: preparing compacted context."
 
@@ -746,24 +1286,28 @@ class TestPreflightCompression:
         status_messages = []
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
-        _rough_calls = {"n": 0}
+        finalized_estimates = iter([114_015, 40_000])
 
-        def _rough_estimate(*_args, **_kwargs):
-            _rough_calls["n"] += 1
-            return 114_000 if _rough_calls["n"] == 1 else 40_000
+        def _compress(msgs, *_args, **kwargs):
+            candidate = [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
+            return _mock_compression_result(
+                agent,
+                candidate,
+                "new system prompt",
+                kwargs["live_request_context"],
+                admitted=True,
+            )
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch.object(agent, "_compress_context") as mock_compress,
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=lambda *_a, **_k: next(finalized_estimates),
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
-                "new system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_called_once()
@@ -804,24 +1348,28 @@ class TestPreflightCompression:
         # so we don't have to predict how many times the loop re-estimates —
         # the post-response real-token estimate is an extra call that a
         # 2-element list would exhaust (StopIteration).
-        _rough_calls = {"n": 0}
+        finalized_estimates = iter([125_000, 40_000])
 
-        def _rough_estimate(*_args, **_kwargs):
-            _rough_calls["n"] += 1
-            return 125_000 if _rough_calls["n"] == 1 else 40_000
+        def _compress(msgs, *_args, **kwargs):
+            candidate = [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
+            return _mock_compression_result(
+                agent,
+                candidate,
+                "new system prompt",
+                kwargs["live_request_context"],
+                admitted=True,
+            )
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch.object(agent, "_compress_context") as mock_compress,
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=lambda *_a, **_k: next(finalized_estimates),
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
-                "new system prompt",
-            )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_called_once()
@@ -909,29 +1457,30 @@ class TestPreflightCompression:
 
         compress_calls = 0
 
-        def _compress(messages, *_args, **_kwargs):
+        def _compress(messages, *_args, **kwargs):
             nonlocal compress_calls
             compress_calls += 1
             if compress_calls == 1:
                 kept = messages[:-rows_removed] if rows_removed else messages
-                return kept, agent._cached_system_prompt
-            return (
-                [{"role": "user", "content": "hello"}],
-                "compressed after provider overflow",
-            )
+                return _mock_compression_result(
+                    agent,
+                    kept,
+                    agent._cached_system_prompt,
+                    kwargs["live_request_context"],
+                    admitted=False,
+                )
+            candidate = [{"role": "user", "content": "hello"}]
+            return candidate, "compressed after provider overflow"
+
+        finalized_estimates = iter([144_669, 144_669])
+
+        def _finalized_pressure(*_args, **_kwargs):
+            return next(finalized_estimates, 40_000)
 
         with (
             patch(
-                "agent.turn_context.estimate_request_tokens_rough",
-                return_value=144_669,
-            ),
-            patch(
-                "agent.conversation_loop.estimate_request_tokens_rough",
-                return_value=144_669,
-            ),
-            patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
-                return_value=144_669,
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=_finalized_pressure,
             ),
             patch.object(
                 agent, "_compress_context", side_effect=_compress
@@ -991,7 +1540,7 @@ class TestPreflightCompression:
         speculative display snapshot.
         """
         agent.compression_enabled = True
-        agent._interrupt_requested = True
+        agent._interrupt_requested = False
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
         agent.context_compressor.last_prompt_tokens = 74_400
@@ -1002,16 +1551,26 @@ class TestPreflightCompression:
             big_history.append({"role": "user", "content": f"Message {i} padded text"})
             big_history.append({"role": "assistant", "content": f"Response {i} padded text"})
 
-        def _fake_preflight_compress(msgs, *_args, **_kwargs):
+        def _fake_preflight_compress(msgs, *_args, **kwargs):
             agent.context_compressor.last_prompt_tokens = -1
             agent.context_compressor.awaiting_real_usage_after_compression = True
             agent.context_compressor.compression_count += 1
             agent.context_compressor._ineffective_compression_count = 2
             agent.context_compressor._last_compression_savings_pct = 0.0
-            return msgs, agent._cached_system_prompt
+            agent._interrupt_requested = True
+            return _mock_compression_result(
+                agent,
+                msgs,
+                agent._cached_system_prompt,
+                kwargs["live_request_context"],
+                admitted=False,
+            )
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", return_value=144_669),
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                return_value=144_669,
+            ),
             patch.object(agent.context_compressor, "should_compress", return_value=True),
             patch.object(agent, "_compress_context", side_effect=_fake_preflight_compress),
             patch.object(agent, "_persist_session"),
@@ -1094,23 +1653,29 @@ class TestToolResultPreflightCompression:
         # trims it from 150K to 148K. Raw-message estimation is much smaller,
         # which previously made the no-op pass look successful and allowed two
         # more immediate summaries.
-        assembled_estimates = iter(
+        finalized_estimates = iter(
             [1_000, 150_000, 148_000, 148_000, 148_000]
         )
 
+        def _reject_candidate(msgs, *_args, **kwargs):
+            return _mock_compression_result(
+                agent,
+                msgs,
+                agent._cached_system_prompt,
+                kwargs["live_request_context"],
+                admitted=False,
+            )
+
         with (
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
-                side_effect=lambda *_a, **_k: next(assembled_estimates),
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                side_effect=lambda *_a, **_k: next(finalized_estimates),
             ),
             patch("run_agent.handle_function_call", return_value="x" * 100_000),
             patch.object(
                 agent,
                 "_compress_context",
-                side_effect=lambda msgs, *_a, **_k: (
-                    msgs,
-                    agent._cached_system_prompt,
-                ),
+                side_effect=_reject_candidate,
             ) as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),

@@ -62,6 +62,9 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+_MAX_ROUTING_METADATA_BYTES = 8192
+_MAX_ROUTING_METADATA_KEYS = 32
+_MAX_ROUTING_STRING_BYTES = 2048
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -107,9 +110,121 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT
+            last_error TEXT,
+            reply_to TEXT
         )"""
     )
+    # Additive, idempotent migration for databases created before durable
+    # platform routing was recorded.  Existing rows retain NULL and recover
+    # through the legacy ``thread_id`` path.
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
+    if "routing_metadata" not in columns:
+        try:
+            conn.execute(
+                "ALTER TABLE delivery_obligations ADD COLUMN routing_metadata TEXT"
+            )
+        except sqlite3.OperationalError as exc:
+            # Another gateway process may have completed the same additive
+            # migration after our PRAGMA read.  Accept only that exact race.
+            refreshed = {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info(delivery_obligations)"
+                )
+            }
+            if "routing_metadata" not in refreshed:
+                raise exc
+    if "reply_to" not in columns:
+        try:
+            conn.execute(
+                "ALTER TABLE delivery_obligations ADD COLUMN reply_to TEXT"
+            )
+        except sqlite3.OperationalError as exc:
+            refreshed = {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info(delivery_obligations)"
+                )
+            }
+            if "reply_to" not in refreshed:
+                raise exc
+
+
+def _serialize_reply_to(reply_to: Any) -> Optional[str]:
+    """Encode the exact scalar passed to an adapter's ``reply_to`` argument."""
+    if reply_to is None:
+        return None
+    if isinstance(reply_to, bool) or not isinstance(reply_to, (str, int)):
+        raise TypeError("reply_to must be a string, integer, or None")
+    if isinstance(reply_to, str) and len(
+        reply_to.encode("utf-8", "replace")
+    ) > _MAX_ROUTING_STRING_BYTES:
+        raise ValueError("reply_to exceeds the durable routing size limit")
+    return json.dumps(reply_to, ensure_ascii=False)
+
+
+def _parse_reply_to(raw: Any) -> Any:
+    """Decode a canonical reply anchor; NULL remains the legacy behavior."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    if isinstance(value, str) and len(
+        value.encode("utf-8", "replace")
+    ) > _MAX_ROUTING_STRING_BYTES:
+        return None
+    return value
+
+
+def _serialize_routing_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return bounded JSON for simple outbound routing values.
+
+    The ledger is not an authority boundary.  It stores only a small flat
+    object of scalar values; adapters must validate identities and reapply
+    authorization when the values are used after recovery.
+    """
+    if not isinstance(metadata, dict) or len(metadata) > _MAX_ROUTING_METADATA_KEYS:
+        return None
+    safe: Dict[str, Any] = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str) or not key or len(key) > 128:
+            return None
+        if value is None or isinstance(value, (bool, int, float)):
+            safe[key] = value
+        elif isinstance(value, str):
+            if len(value.encode("utf-8", "replace")) > _MAX_ROUTING_STRING_BYTES:
+                return None
+            safe[key] = value
+        else:
+            return None
+    try:
+        encoded = json.dumps(safe, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    if len(encoded.encode("utf-8")) > _MAX_ROUTING_METADATA_BYTES:
+        return None
+    return encoded
+
+
+def _parse_routing_metadata(raw: Any) -> Optional[Dict[str, Any]]:
+    """Defensively decode persisted routing data, which is untrusted input."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    if len(raw.encode("utf-8", "replace")) > _MAX_ROUTING_METADATA_BYTES:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    # Reuse the writer's shape/type checks, including rejecting nested values.
+    normalized = _serialize_routing_metadata(decoded)
+    if normalized is None:
+        return None
+    return json.loads(normalized)
 
 
 @contextmanager
@@ -209,6 +324,8 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    routing_metadata: Optional[Dict[str, Any]] = None,
+    reply_to: Any = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -218,11 +335,12 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, routing_metadata, reply_to)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, _serialize_routing_metadata(routing_metadata),
+             _serialize_reply_to(reply_to)),
         )
     _prune()
 
@@ -277,12 +395,13 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, routing_metadata, reply_to
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, owner_pid, owner_started_at,
+             routing_metadata, reply_to) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -313,6 +432,8 @@ def sweep_recoverable(
                     "platform": platform,
                     "chat_id": chat_id,
                     "thread_id": thread_id,
+                    "routing_metadata": _parse_routing_metadata(routing_metadata),
+                    "reply_to": _parse_reply_to(reply_to),
                     "content": content,
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.

@@ -5651,6 +5651,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         require_compression_lease: bool = True,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        expected_active_identity: Optional[int] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -5675,6 +5676,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         tail. ``None`` = unbounded (no internal flush happened).
         """
         def _do(conn):
+            if expected_active_identity is not None:
+                identity_row = conn.execute(
+                    "SELECT COALESCE(transcript_generation, 0) AS generation "
+                    "FROM sessions WHERE id = ?",
+                    (parent_session_id,),
+                ).fetchone()
+                actual_identity = (
+                    int(identity_row["generation"]) if identity_row else None
+                )
+                if actual_identity != expected_active_identity:
+                    raise RuntimeError(
+                        "Compression transcript changed before publication: "
+                        f"{parent_session_id}"
+                    )
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
                 (parent_session_id,),
@@ -5691,7 +5706,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
+                          thread_id, display_name, origin_json, profile_name,
+                          hygiene_failure_streak
                    FROM sessions WHERE id = ?""",
                 (parent_session_id,),
             ).fetchone()
@@ -5709,8 +5725,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    system_prompt_hash,
                    parent_session_id, cwd, git_branch, git_repo_root,
                    profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   thread_id, display_name, origin_json,
+                   hygiene_failure_streak, started_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
@@ -5734,6 +5751,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     parent["thread_id"],
                     parent["display_name"],
                     parent["origin_json"],
+                    parent["hygiene_failure_streak"],
                     time.time(),
                 ),
             )
@@ -6056,6 +6074,50 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 session_id, exc,
             )
 
+    def record_hygiene_failure(
+        self, session_id: str, base_cooldown_seconds: float,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Atomically advance the durable hygiene rung and its deadline."""
+        if not session_id:
+            raise ValueError("session_id is required")
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT hygiene_failure_streak FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"unknown session: {session_id}")
+            current = row[0] if not isinstance(row, sqlite3.Row) else row["hygiene_failure_streak"]
+            streak = min(3, max(0, int(current or 0)) + 1)
+            multiplier = (1, 3, 9)[streak - 1]
+            cooldown_until = time.time() + min(
+                max(0.0, float(base_cooldown_seconds)) * multiplier, 3600.0
+            )
+            conn.execute(
+                "UPDATE sessions SET hygiene_failure_streak = ?, "
+                "compression_failure_cooldown_until = ?, "
+                "compression_failure_error = ? WHERE id = ?",
+                (streak, cooldown_until, error, session_id),
+            )
+            return {"streak": streak, "cooldown_until": cooldown_until}
+
+        return dict(self._execute_write(_do))
+
+    def get_hygiene_failure_streak(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT hygiene_failure_streak FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return 0
+        value = row[0] if not isinstance(row, sqlite3.Row) else row["hygiene_failure_streak"]
+        return min(3, max(0, int(value or 0)))
+
     def get_compression_failure_cooldown(
         self,
         session_id: str,
@@ -6260,15 +6322,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
         return result[0]
 
-    def reset_hygiene_failure_streak(self, session_key: str) -> None:
-        """Clear the persisted session-hygiene failure streak for one chat."""
-        if not session_key:
+    def reset_hygiene_failure_streak(self, session_id_or_key: str) -> None:
+        """Clear the persisted session-hygiene failure streak for one identity.
+
+        Two durable views exist and both are cleared by the same call: the
+        rotation-stable ``gateway_hygiene_state`` row keyed by gateway
+        ``session_key`` (mirrored by ``increment_hygiene_failure_streak``) and
+        the per-session ``sessions.hygiene_failure_streak`` rung advanced by
+        :meth:`record_hygiene_failure` and copied onto compression children.
+        Session ids and session keys never collide, so at most one of the two
+        statements matches; callers may pass either identity.
+        """
+        if not session_id_or_key:
             return
 
         def _do(conn):
             conn.execute(
                 "DELETE FROM gateway_hygiene_state WHERE session_key = ?",
-                (session_key,),
+                (session_id_or_key,),
+            )
+            conn.execute(
+                "UPDATE sessions SET hygiene_failure_streak = 0 WHERE id = ?",
+                (session_id_or_key,),
             )
 
         self._execute_write(_do)
@@ -9286,6 +9361,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         api_content: Optional[str] = None,
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
+        autonomous_completion_provenance: bool = False,
+        active_task_contract_provenance: bool = False,
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
@@ -9357,8 +9434,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata,
+                   autonomous_completion_provenance, active_task_contract_provenance)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -9381,6 +9459,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    1 if autonomous_completion_provenance else 0,
+                    1 if active_task_contract_provenance else 0,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -9788,8 +9868,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata,
+                   autonomous_completion_provenance, active_task_contract_provenance)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -9812,6 +9893,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
+                    1 if msg.get("_autonomous_completion_bridge") is True else 0,
+                    1 if msg.get("_active_task_contract_trusted") is True else 0,
                 ),
             )
             if isinstance(msg, dict) and cur.lastrowid is not None:
@@ -9942,6 +10025,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return int(row[0]) if row else 0
 
+    def get_active_transcript_snapshot(
+        self, session_id: str
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Read the active model transcript and CAS generation atomically."""
+        with self._read_ctx() as conn:
+            conn.execute("BEGIN")
+            try:
+                generation_row = conn.execute(
+                    "SELECT COALESCE(transcript_generation, 0) AS generation "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                rows = conn.execute(
+                    f"SELECT {self._CONVERSATION_ROW_COLUMNS} FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            finally:
+                conn.execute("ROLLBACK")
+        generation = int(generation_row["generation"]) if generation_row else 0
+        messages = self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+        )
+        return messages, generation
+
+    def get_active_transcript_identity(self, session_id: str) -> int:
+        """Return the compare-and-swap identity of the active transcript.
+
+        The generation is advanced atomically by database triggers for every
+        provider/model-relevant message append, delete, or update. Display
+        metadata is deliberately outside this identity boundary.
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(transcript_generation, 0) AS generation "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row["generation"]) if row else 0
+
     def archive_and_compact(
         self,
         session_id: str,
@@ -9949,6 +10075,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        expected_active_identity: Optional[int] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -9988,10 +10116,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reclaimed (crash cleanup, TTL expiry, competing writer) fails the
         commit instead of clobbering the winner's transcript.
 
+        Transcript compare-and-swap: when *expected_active_identity* is
+        provided (the generation from :meth:`get_active_transcript_snapshot`
+        captured when the candidate was reconciled against durable truth),
+        the commit verifies INSIDE the transaction that the session's
+        ``transcript_generation`` is still that value and raises otherwise —
+        a candidate built from a transcript that has since changed is never
+        published. Callers holding an identity should pass ``watermark=None``:
+        the candidate already embodies the durable transcript at snapshot
+        time, so there is no concurrent tail left to clone.
+
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
         session's JSON config in the same transaction; a ``None`` value
-        removes that key. Returns the new active count.
+        removes that key. When supplied, ``system_prompt`` is updated in that
+        same transaction too. Returns the new active count.
         """
 
         def _do(conn):
@@ -10010,8 +10149,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         f"Compression lease for {session_id!r} lost before "
                         "commit; refusing to publish a stale compaction"
                     )
+            if expected_active_identity is not None:
+                row = conn.execute(
+                    "SELECT COALESCE(transcript_generation, 0) AS generation "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                actual = int(row["generation"]) if row else None
+                if actual != expected_active_identity:
+                    raise RuntimeError(
+                        f"Compression transcript changed before publication: {session_id}"
+                    )
 
             patched_model_config = None
+            system_prompt_hash = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
                 # against a vanished session row (the compressor's caller
@@ -10019,6 +10170,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # no-op), unlike the flag setters which tolerate missing rows.
                 patched_model_config = self._merge_model_config_json(
                     conn, session_id, model_config_patch, on_missing="raise"
+                )
+            if system_prompt is not None:
+                system_prompt_hash = self._store_system_prompt(
+                    conn, _scrub_surrogates(system_prompt)
                 )
 
             # Concurrent tail: active rows that arrived after the watermark.
@@ -10079,17 +10234,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
-            if model_config_patch is None:
+            if model_config_patch is None and system_prompt is None:
                 conn.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                     (inserted, tool_calls_total, session_id),
                 )
             else:
+                assignments = ["message_count = ?", "tool_call_count = ?"]
+                values: list[Any] = [inserted, tool_calls_total]
+                if model_config_patch is not None:
+                    assignments.append("model_config = ?")
+                    values.append(patched_model_config)
+                if system_prompt is not None:
+                    assignments.extend(
+                        ["system_prompt_hash = ?", "system_prompt = NULL"]
+                    )
+                    values.append(system_prompt_hash)
+                values.append(session_id)
                 conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                    "model_config = ? WHERE id = ?",
-                    (inserted, tool_calls_total, patched_model_config, session_id),
+                    f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
+                    values,
                 )
+                if system_prompt is not None:
+                    self._delete_unreferenced_system_prompts(conn)
             return inserted
 
         return self._execute_write(_do)
@@ -10522,12 +10689,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # Columns every conversation projection decodes. Shared by
     # get_messages_as_conversation and get_resume_conversations so a single
-    # SELECT can feed both the model-fed and display views.
+    # SELECT can feed both the model-fed and display views. Generation policy:
+    # role/content/api_content, tool + reasoning payloads, observed/effect and
+    # finish provenance, active membership, and autonomous-completion
+    # provenance are provider/model/task relevant and are fenced by the schema
+    # triggers. id/session_id affect membership/order and are immutable through
+    # public APIs (legacy moves fence both sessions). platform_message_id,
+    # timestamp, display_kind and display_metadata are presentation-only and
+    # intentionally do not invalidate a model snapshot.
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, autonomous_completion_provenance, "
+        "active_task_contract_provenance"
     )
 
     def _rows_to_conversation(
@@ -10574,6 +10749,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 decoded = self._decode_display_metadata(row["display_metadata"])
                 if decoded is not None:
                     msg["display_metadata"] = decoded
+            if row["autonomous_completion_provenance"]:
+                msg["_autonomous_completion_bridge"] = True
+            if row["active_task_contract_provenance"]:
+                msg["_active_task_contract_trusted"] = True
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:

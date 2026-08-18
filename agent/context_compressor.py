@@ -17,6 +17,7 @@ Improvements over v2:
 """
 
 import hashlib
+import copy
 import json
 import logging
 import sqlite3
@@ -163,6 +164,14 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 # "is_compressed_summary" would reach the wire and trip exactly that.
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
+ACTIVE_TASK_CONTRACT_METADATA_KEY = "_active_task_contract"
+ACTIVE_TASK_CONTRACT_PREFIX = "[ACTIVE_TASK_CONTRACT] "
+ACTIVE_TASK_CONTRACT_TYPE = "active_task_contract"
+ACTIVE_TASK_CONTRACT_VERSION = 1
+ACTIVE_TASK_CONTRACT_INSTRUCTION = (
+    "The exact human task encoded in content remains active until a later real "
+    "human user message overrides it. Continue that task now."
+)
 # Distinguishes rolling micro-compaction markers from batch-compaction
 # markers (both carry COMPRESSED_SUMMARY_METADATA_KEY so resume/handoff
 # treat them alike). Supersede/defrag/rehydration must only ever touch
@@ -192,6 +201,18 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "without calling any more tools."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
+_AUTONOMOUS_COMPLETION_NOTIFICATION_PREFIXES = (
+    _BACKGROUND_PROCESS_NOTIFICATION_PREFIX,
+    "[ASYNC DELEGATION COMPLETE ",
+    "[ASYNC DELEGATION BATCH COMPLETE ",
+)
+
+
+def _is_autonomous_completion_notification(text: Any) -> bool:
+    """Recognize only Hermes-owned completion wrappers at content start."""
+    return isinstance(text, str) and text.startswith(
+        _AUTONOMOUS_COMPLETION_NOTIFICATION_PREFIXES
+    )
 
 
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -1859,6 +1880,114 @@ class ContextCompressor(ContextEngine):
     @property
     def name(self) -> str:
         return "compressor"
+
+    _ATTEMPT_STATE_VALUE_TYPES = (
+        str, bytes, int, float, bool, type(None), dict, list, set, tuple
+    )
+
+    _ATTEMPT_STATE_CONTAINER_TYPES = (dict, list, set, tuple)
+
+    def snapshot_compression_attempt_state(self) -> Dict[str, Any]:
+        """Snapshot compressor-owned value state without copying resources.
+
+        ContextCompressor owns its scalar/container attributes.  Opaque
+        resources such as ``_session_db`` and provider clients fall outside
+        this explicit value-type boundary and retain their identity.  Original
+        mutable objects are retained in the token so rollback can repair them
+        in place rather than invalidating legitimate aliases.
+        """
+        values = vars(self)
+        owned = {
+            name: value
+            for name, value in values.items()
+            if type(value) in self._ATTEMPT_STATE_VALUE_TYPES
+        }
+
+        # This is deliberately a graph description rather than a deepcopy.
+        # Only exact built-in containers are structural nodes.  Everything
+        # else is an opaque leaf held by identity, so a client or lock nested
+        # anywhere in the graph never sees a copy protocol or lifecycle call.
+        nodes: list[Dict[str, Any]] = []
+        node_ids: Dict[int, int] = {}
+
+        def capture(value: Any) -> tuple[str, Any]:
+            if type(value) not in self._ATTEMPT_STATE_CONTAINER_TYPES:
+                return ("leaf", value)
+
+            object_id = id(value)
+            if object_id in node_ids:
+                return ("node", node_ids[object_id])
+
+            node_id = len(nodes)
+            node_ids[object_id] = node_id
+            node: Dict[str, Any] = {
+                "kind": type(value),
+                "original": value,
+                "items": None,
+            }
+            # Install the placeholder before descending to preserve cycles.
+            nodes.append(node)
+            if type(value) is dict:
+                node["items"] = [
+                    (capture(key), capture(item)) for key, item in value.items()
+                ]
+            else:
+                node["items"] = [capture(item) for item in value]
+            return ("node", node_id)
+
+        return {
+            "original_keys": frozenset(values),
+            "roots": {name: capture(value) for name, value in owned.items()},
+            "nodes": nodes,
+        }
+
+    def restore_compression_attempt_state(self, snapshot: Any) -> None:
+        """Exactly restore compressor-owned attempt state and its aliases."""
+        if not isinstance(snapshot, dict):
+            return
+        original_keys = snapshot.get("original_keys", frozenset())
+        roots = snapshot.get("roots", {})
+        nodes = snapshot.get("nodes", [])
+        if not isinstance(roots, dict) or not isinstance(nodes, list):
+            return
+        live = vars(self)
+
+        def materialize(reference: tuple[str, Any]) -> Any:
+            kind, value = reference
+            if kind == "node":
+                return nodes[value]["original"]
+            return value
+
+        # Empty every captured mutable first, then rebuild all of them.  This
+        # repairs nested containers even when an attempt removed their only
+        # path from a root, while retaining every original alias and cycle.
+        for node in nodes:
+            original = node["original"]
+            if node["kind"] is dict or node["kind"] is set:
+                original.clear()
+            elif node["kind"] is list:
+                original[:] = []
+
+        for node in nodes:
+            original = node["original"]
+            if node["kind"] is dict:
+                original.update(
+                    (materialize(key), materialize(value))
+                    for key, value in node["items"]
+                )
+            elif node["kind"] is list:
+                original.extend(materialize(value) for value in node["items"])
+            elif node["kind"] is set:
+                original.update(materialize(value) for value in node["items"])
+
+        for name, reference in roots.items():
+            live[name] = materialize(reference)
+
+        # Only value-state fields are owned by this contract. A newly-created
+        # client/lock/resource is intentionally outside it and remains intact.
+        for name in set(live) - set(original_keys):
+            if type(live[name]) in self._ATTEMPT_STATE_VALUE_TYPES:
+                live.pop(name, None)
 
     def on_session_reset(self) -> None:
         """Reset all per-session state for /new or /reset."""
@@ -5020,8 +5149,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         strict provider transcripts valid. The metadata/content checks prevent
         those synthetic transport rows from becoming evidence of a real user.
         """
-        for message in messages:
+        for index, message in enumerate(messages):
             if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            if cls._bridge_user_has_durable_provenance(messages, index):
+                continue
+            if cls._completion_has_durable_provenance(messages, index):
                 continue
             if cls._is_synthetic_compression_user_turn(message):
                 continue
@@ -5070,8 +5203,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             _LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         } or text.startswith(
-            _BACKGROUND_PROCESS_NOTIFICATION_PREFIX
-        ) or text.startswith(
             TODO_INJECTION_HEADER + "\n"
         ) or text.startswith(
             _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX
@@ -5219,29 +5350,203 @@ This compaction should PRIORITISE preserving all information related to the focu
         compacted turns so the summary can be grounded before it becomes live
         context.
         """
-        # Reuse the runtime's real-user predicate so the deterministic
-        # snapshot can never anchor on user-role scaffolding (todo
-        # snapshots, truncation notices, background-process reports) —
-        # the exact class of turn this grounding exists to bypass.
-        from agent.conversation_compression import _is_real_user_message
+        from agent.conversation_compression import _latest_active_human_task_row
 
-        for msg in reversed(messages):
-            if msg.get("role") != "user":
-                continue
-            if not _is_real_user_message(msg):
-                continue
+        msg = _latest_active_human_task_row(messages)
+        if msg is not None:
             content = msg.get("content")
             text = _redact_compaction_text(_content_text_for_contains(content).strip())
-            if not text:
-                continue
-            text = re.sub(r"\s+", " ", text)
-            if len(text) > _ACTIVE_TASK_MAX_CHARS:
-                text = text[: _ACTIVE_TASK_MAX_CHARS - 15].rstrip() + " ...[truncated]"
-            return (
-                f"User asked (deterministic, from compacted turns): {text!r}\n"
-                "Historical only; newer protected-tail messages after this summary win."
-            )
+            if text:
+                text = re.sub(r"\s+", " ", text)
+                if len(text) > _ACTIVE_TASK_MAX_CHARS:
+                    text = text[: _ACTIVE_TASK_MAX_CHARS - 15].rstrip() + " ...[truncated]"
+                return (
+                    f"User asked (deterministic, from compacted turns): {text!r}\n"
+                    "Historical only; newer protected-tail messages after this summary win."
+                )
         return None
+
+    @classmethod
+    def _active_task_contract(cls, messages: List[Dict[str, Any]]) -> Optional[dict]:
+        """Return the latest real human task, including across compactions."""
+        from agent.conversation_compression import (
+            ACTIVE_TASK_CONTRACT_BRIDGE_AFTER,
+            ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE,
+            ACTIVE_TASK_TRUST_MARKER,
+            _latest_active_human_task_row,
+        )
+
+        active_row = _latest_active_human_task_row(messages)
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            projected = (
+                index > 0
+                and index + 1 < len(messages)
+                and isinstance(messages[index - 1], dict)
+                and isinstance(messages[index + 1], dict)
+                and messages[index - 1].get("role") == "assistant"
+                and messages[index - 1].get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_BEFORE
+                and messages[index - 1].get(ACTIVE_TASK_TRUST_MARKER) is True
+                and message.get(ACTIVE_TASK_TRUST_MARKER) is True
+                and messages[index + 1].get("role") == "assistant"
+                and messages[index + 1].get("content") == ACTIVE_TASK_CONTRACT_BRIDGE_AFTER
+                and messages[index + 1].get(ACTIVE_TASK_TRUST_MARKER) is True
+            )
+            contract = (
+                cls.parse_active_task_contract(message, allow_projected=True)
+                if projected
+                else None
+            )
+            if contract is not None:
+                return contract
+            if message is not active_row:
+                continue
+            raw_content = active_row.get("content")
+            if isinstance(raw_content, list) and any(
+                not isinstance(part, dict) or part.get("type") != "text"
+                for part in raw_content
+            ):
+                return None
+            content = _content_text_for_contains(raw_content)
+            if content:
+                return {
+                    "content": content,
+                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                }
+            return None
+        return None
+
+    @classmethod
+    def _completion_has_durable_provenance(
+        cls, messages: List[Dict[str, Any]], index: int
+    ) -> bool:
+        from agent.conversation_compression import (
+            AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+            AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        )
+        # ``index`` is derived from a tail cut that may legitimately sit at or
+        # past the end of the transcript (empty tail); bound it before
+        # indexing so an out-of-range cut degrades to "no provenance" instead
+        # of raising out of tail selection.
+        if index < 2 or index >= len(messages) or not all(
+            isinstance(messages[i], dict) for i in (index - 2, index - 1, index)
+        ):
+            return False
+        completion = messages[index]
+        exact_sequence = (
+            completion.get("role") == "user"
+            and messages[index - 2].get("role") == "user"
+            and messages[index - 2].get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER
+            and messages[index - 1].get("role") == "assistant"
+            and messages[index - 1].get("content") == AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT
+        )
+        if not exact_sequence:
+            return False
+        # Live runtime provenance is entirely internal: all three rows are
+        # stamped only by the normalized turn builder.  The completion payload
+        # is producer-controlled and may be generic or localized, so neither
+        # its text nor presentation metadata participates in this decision.
+        runtime_markers = all(
+            messages[row_index].get("_autonomous_completion_bridge") is True
+            for row_index in (index - 2, index - 1, index)
+        )
+        # SessionDB projects the dedicated provenance column back to the same
+        # private marker. Presentation kind is deliberately irrelevant: real
+        # process completions have no kind and delegation completions use
+        # ``async_delegation_complete``.
+        return runtime_markers
+
+    @classmethod
+    def _bridge_user_has_durable_provenance(
+        cls, messages: List[Dict[str, Any]], index: int
+    ) -> bool:
+        """Recognize a reserved user bridge only through its full sequence."""
+        return (
+            0 <= index < len(messages)
+            and index + 2 < len(messages)
+            and isinstance(messages[index], dict)
+            and messages[index].get("role") == "user"
+            and cls._completion_has_durable_provenance(messages, index + 2)
+        )
+
+    @classmethod
+    def parse_active_task_contract(
+        cls, message: Any, *, allow_projected: bool = False
+    ) -> Optional[dict]:
+        """Parse the visible, persistence-safe active-task contract."""
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return None
+        text = _content_text_for_contains(message.get("content"))
+        if not text.startswith(ACTIVE_TASK_CONTRACT_PREFIX):
+            return None
+        try:
+            payload = json.loads(text[len(ACTIVE_TASK_CONTRACT_PREFIX):])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") != ACTIVE_TASK_CONTRACT_TYPE:
+            return None
+        if payload.get("version") != ACTIVE_TASK_CONTRACT_VERSION:
+            return None
+        if payload.get("instruction") != ACTIVE_TASK_CONTRACT_INSTRUCTION:
+            return None
+        content = payload.get("content")
+        digest = payload.get("sha256")
+        if not isinstance(content, str) or not isinstance(digest, str):
+            return None
+        actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        contract = {"content": content, "sha256": digest}
+        metadata = message.get(ACTIVE_TASK_CONTRACT_METADATA_KEY)
+        if metadata is None and not allow_projected:
+            return None
+        if metadata is not None and metadata != contract:
+            return None
+        return contract if digest == actual else None
+
+    @classmethod
+    def make_active_task_contract_message(cls, contract: dict) -> dict:
+        """Build one model-visible authoritative synthetic user turn."""
+        payload = json.dumps(
+            {
+                "type": ACTIVE_TASK_CONTRACT_TYPE,
+                "version": ACTIVE_TASK_CONTRACT_VERSION,
+                "content": contract["content"],
+                "sha256": contract["sha256"],
+                "instruction": ACTIVE_TASK_CONTRACT_INSTRUCTION,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        from agent.conversation_compression import ACTIVE_TASK_TRUST_MARKER
+
+        return {
+            "role": "user",
+            "content": ACTIVE_TASK_CONTRACT_PREFIX + payload,
+            ACTIVE_TASK_CONTRACT_METADATA_KEY: contract,
+            ACTIVE_TASK_TRUST_MARKER: True,
+        }
+
+    @classmethod
+    def _has_autonomous_completion_chain(cls, messages: List[Dict[str, Any]]) -> bool:
+        """Return whether process completions continue the current human task."""
+        from agent.conversation_compression import _is_real_user_message
+
+        latest_real = -1
+        for idx, message in enumerate(messages):
+            if message.get("role") != "user":
+                continue
+            if cls._bridge_user_has_durable_provenance(messages, idx):
+                continue
+            if cls._completion_has_durable_provenance(messages, idx):
+                continue
+            if _is_real_user_message(message):
+                latest_real = idx
+        start = latest_real + 1 if latest_real >= 0 else 0
+        return (latest_real >= 0 or cls._active_task_contract(messages) is not None) and any(
+            cls._completion_has_durable_provenance(messages, idx)
+            for idx in range(start, len(messages))
+        )
 
     @classmethod
     def _ground_historical_task_snapshot(
@@ -5866,6 +6171,37 @@ This compaction should PRIORITISE preserving all information related to the focu
             return max(pair_end, head_end + 1)
         return adjusted
 
+    def _protect_completion_provenance_before_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        cut_idx: int,
+        head_end: int,
+    ) -> int:
+        """Keep one complete completion proof when the tail starts after it.
+
+        A completion notification is the causal boundary for the autonomous
+        work that immediately follows it.  If token selection lands directly
+        after that notification, retaining only the following work destroys
+        the sequence-valid durable proof used after SessionDB replay.  Expand
+        by the three provenance rows, plus one preceding assistant row when
+        needed to give the summary an alternation-safe insertion point.  This
+        is deliberately local to the boundary: older completion chains remain
+        in the summarized middle.
+        """
+        completion_idx = cut_idx - 1
+        if not self._completion_has_durable_provenance(messages, completion_idx):
+            return cut_idx
+
+        provenance_start = completion_idx - 2
+        adjusted = provenance_start
+        preceding = provenance_start - 1
+        if (
+            preceding > head_end
+            and messages[preceding].get("role") == "assistant"
+        ):
+            adjusted = preceding
+        return max(adjusted, head_end + 1)
+
     def _ensure_last_n_user_messages_in_tail(
         self,
         messages: List[Dict[str, Any]],
@@ -5975,7 +6311,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         the head so compression still runs.
 
         Never cuts inside a tool_call/result group.  Always ensures the most
-        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
+        recent user message is in the tail when no autonomous completion chain
+        is proven (see ``_ensure_last_user_message_in_tail``).  Proven chains
+        restore the exact task after compression instead of retaining the
+        entire chain behind it.
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
@@ -6057,9 +6396,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
 
-        # Ensure the most recent user message is always in the tail so the
-        # active task is never lost to compression (fixes #10896).
-        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+        # Without a proven autonomous completion chain, keep the historical
+        # latest-user tail anchor (fixes #10896).  Proven chains restore their
+        # exact human task after compression, so anchoring it here would retain
+        # the whole completion transcript.
+        if not self._has_autonomous_completion_chain(messages):
+            cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
 
         # Ensure the most recent assistant message is always in the tail
         # so the previously-visible reply isn't silently rolled into the
@@ -6067,6 +6409,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Each anchor only walks ``cut_idx`` backward, so chaining them is
         # monotonic — the tail can only grow, never shrink.
         cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+
+        # If the selected tail begins with work triggered by an immediately
+        # preceding autonomous completion, retain exactly that completion's
+        # durable proof group.  Without the group, DB replay can no longer
+        # distinguish the legitimate notification from human-authored text.
+        cut_idx = self._protect_completion_provenance_before_tail(
+            messages, cut_idx, head_end
+        )
 
         # Extend to the last N actionable user messages when configured
         # (compression.min_tail_user_messages > 1).  This prevents the
@@ -7061,6 +7411,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         # recovery stubs are already in place if the summary aborts.
         if getattr(self, "tail_mode", "legacy") == "lean":
             messages = self._demote_stale_tail_tools(messages, compress_end)
+        active_task_contract = (
+            self._active_task_contract(messages)
+            if self._has_autonomous_completion_chain(messages)
+            else None
+        )
         # Snapshot the rehydration state so an aborted attempt below can roll
         # it back. The self-heal scan mutates ``_previous_summary`` (populating
         # it from a fossil, or discarding a stale cross-session one); if
@@ -7633,6 +7988,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 msg[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = bool(
                     self._summary_has_user_turn
                 )
+                msg[ACTIVE_TASK_CONTRACT_METADATA_KEY] = active_task_contract
                 # Content rewritten → the api_content sidecar (exact bytes
                 # previously sent) is stale; drop it so replay can't resend
                 # the pre-merge bytes without the summary.

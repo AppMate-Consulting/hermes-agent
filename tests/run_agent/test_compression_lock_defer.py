@@ -293,6 +293,13 @@ class TestPreApiLockDeferDoesNotBurnBudget:
                 "agent.conversation_loop.estimate_messages_tokens_rough",
                 return_value=500_000,
             ),
+            # Admission pressure is measured on the exact finalized provider
+            # payload (request admission ownership); drive that seam too so
+            # the pre-API gate fires exactly as the message estimate implies.
+            patch(
+                "agent.conversation_loop.estimate_finalized_payload_tokens_rough",
+                return_value=500_000,
+            ),
             patch.object(agent, "_compress_context", side_effect=_lock_then_success),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),

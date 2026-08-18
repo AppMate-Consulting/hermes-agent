@@ -24,6 +24,7 @@ from gateway.run import (
     _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS,
     _hygiene_cooldown_for_failure,
     _record_hygiene_cooldown,
+    _record_hygiene_failure,
     _reset_hygiene_failure_streak,
     hygiene_compaction_recovered,
 )
@@ -420,3 +421,175 @@ class TestRecordedCooldownEscalates:
         assert waits[0] < waits[1] < waits[2]
         for wait, mult in zip(waits, _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS):
             assert wait == pytest.approx(BASE * mult, abs=5.0)
+
+
+def test_durable_ladder_survives_restart_caps_and_resets(tmp_path):
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    try:
+        db.create_session("sid", "gateway")
+        first = db.record_hygiene_failure("sid", BASE, "one")
+        assert first["streak"] == 1
+    finally:
+        db.close()
+
+    db = SessionDB(db_path=path)
+    try:
+        assert db.record_hygiene_failure("sid", BASE, "two")["streak"] == 2
+        for _ in range(10):
+            last = db.record_hygiene_failure("sid", BASE, "cap")
+        assert last["streak"] == 3
+        assert last["cooldown_until"] <= __import__("time").time() + 3601
+        db.reset_hygiene_failure_streak("sid")
+        assert db.get_hygiene_failure_streak("sid") == 0
+        with pytest.raises(ValueError):
+            db.record_hygiene_failure("", BASE)
+        with pytest.raises(LookupError):
+            db.record_hygiene_failure("missing", BASE)
+    finally:
+        db.close()
+
+
+def test_durable_success_survives_hot_cache_sync_failure(
+    tmp_path, monkeypatch, caplog
+):
+    """A committed higher rung cannot be rewritten by cache-sync recovery."""
+    from hermes_state import SessionDB
+
+    path = tmp_path / "hot-cache-failure.db"
+    db = SessionDB(db_path=path)
+    db.create_session("sid", "gateway")
+    db.record_hygiene_failure("sid", BASE, "first")
+
+    runner = _Runner()
+    runner._session_db = db
+    durable_calls = []
+    fallback_calls = []
+    real_record = db.record_hygiene_failure
+
+    def record(*args, **kwargs):
+        result = real_record(*args, **kwargs)
+        durable_calls.append(result.copy())
+        return result
+
+    monkeypatch.setattr(db, "record_hygiene_failure", record)
+    monkeypatch.setattr(
+        runner,
+        "_session_state",
+        lambda _key: (_ for _ in ()).throw(RuntimeError("hot cache unavailable")),
+    )
+    monkeypatch.setattr(
+        "gateway.run._record_hygiene_cooldown",
+        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
+    )
+
+    _record_hygiene_failure(runner, KEY, "sid", BASE, "second")
+
+    assert len(durable_calls) == 1
+    assert durable_calls[0]["streak"] == 2
+    authoritative_deadline = durable_calls[0]["cooldown_until"]
+    assert fallback_calls == []
+    assert "durable hygiene failure recorded (streak=2" in caplog.text
+    assert "hot-cache synchronization failed" in caplog.text
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    try:
+        assert reopened.get_hygiene_failure_streak("sid") == 2
+        state = reopened.get_compression_failure_cooldown("sid")
+        assert state["cooldown_until"] == pytest.approx(authoritative_deadline)
+    finally:
+        reopened.close()
+
+
+def test_legacy_rotation_inherits_rung_then_recovery_resets_only_child(tmp_path):
+    """A rotation cannot erase history until the active child proves recovery."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "rotation.db")
+    try:
+        db.create_session("parent", "gateway")
+        db.record_hygiene_failure("parent", BASE, "first")
+        db.record_hygiene_failure("parent", BASE, "second")
+        db.publish_compression_child(
+            parent_session_id="parent",
+            child_session_id="child",
+            source="gateway",
+            messages=[{"role": "user", "content": "summary"}],
+            require_compression_lease=False,
+        )
+        assert db.get_hygiene_failure_streak("parent") == 2
+        assert db.get_hygiene_failure_streak("child") == 2
+
+        runner = _Runner()
+        runner._session_db = db
+        runner._session_state(KEY).persistent.hygiene_failure_streak = 2
+
+        rejected = hygiene_compaction_recovered(
+            aborted=False,
+            rotated=True,
+            in_place=False,
+            msg_count=220,
+            new_count=220,
+            approx_tokens=50_000,
+            new_tokens=49_900,
+        )
+        if rejected:
+            _reset_hygiene_failure_streak(runner, KEY, "child")
+        assert rejected is False
+        assert db.get_hygiene_failure_streak("parent") == 2
+        assert db.get_hygiene_failure_streak("child") == 2
+        assert runner._session_state(KEY).persistent.hygiene_failure_streak == 2
+
+        recovered = hygiene_compaction_recovered(
+            aborted=False,
+            rotated=True,
+            in_place=False,
+            msg_count=220,
+            new_count=100,
+            approx_tokens=50_000,
+            new_tokens=30_000,
+        )
+        if recovered:
+            _reset_hygiene_failure_streak(runner, KEY, "child")
+        assert recovered is True
+        assert db.get_hygiene_failure_streak("parent") == 2
+        assert db.get_hygiene_failure_streak("child") == 0
+        assert runner._session_state(KEY).persistent.hygiene_failure_streak == 0
+    finally:
+        db.close()
+
+
+def test_existing_database_reconciles_hygiene_column(tmp_path):
+    from hermes_state import SessionDB
+
+    path = tmp_path / "old.db"
+    db = SessionDB(db_path=path)
+    try:
+        db._conn.execute("ALTER TABLE sessions DROP COLUMN hygiene_failure_streak")
+        db._conn.commit()
+    finally:
+        db.close()
+    reopened = SessionDB(db_path=path)
+    try:
+        columns = {
+            row[1] for row in reopened._conn.execute("PRAGMA table_info(sessions)")
+        }
+        assert "hygiene_failure_streak" in columns
+    finally:
+        reopened.close()
+
+
+def test_durable_reset_failure_retains_hot_safety_state(caplog):
+    class BrokenDB:
+        def reset_hygiene_failure_streak(self, _sid):
+            raise RuntimeError("disk unavailable")
+
+    runner = _Runner()
+    runner._session_db = BrokenDB()
+    runner._session_state(KEY).persistent.hygiene_failure_streak = 2
+    _reset_hygiene_failure_streak(runner, KEY, "sid")
+    assert runner._session_state(KEY).persistent.hygiene_failure_streak == 2
+    assert "retaining local safety state" in caplog.text

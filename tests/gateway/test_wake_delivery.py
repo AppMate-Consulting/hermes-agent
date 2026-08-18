@@ -55,6 +55,65 @@ def test_adapter_supports_push_default_true():
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
 
 
+@pytest.mark.parametrize("completion_first", [False, True])
+def test_deliver_wake_active_session_preserves_human_completion_fifo(completion_first):
+    """A push wake queued beside human input remains its own durable turn."""
+    from gateway.platforms.base import MessageEvent
+    from gateway.run import GatewayRunner, _event_conversation_forwarding_metadata
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="group",
+        user_id="human-id",
+        user_name="Human",
+    )
+    session_key = "active-session"
+    runner = object.__new__(GatewayRunner)
+
+    class ActiveAdapter:
+        def __init__(self):
+            self._pending_messages = {}
+
+        async def handle_message(self, event):
+            runner._queue_or_replace_pending_event(session_key, event)
+
+    adapter = ActiveAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._session_states = {}
+    human = MessageEvent(
+        text="human stays human",
+        source=source,
+        user_id="human-id",
+        user_name="Human",
+    )
+
+    async def exercise():
+        if completion_first:
+            await deliver_wake(adapter, text="completion", source=source)
+            runner._queue_or_replace_pending_event(session_key, human)
+        else:
+            runner._queue_or_replace_pending_event(session_key, human)
+            await deliver_wake(adapter, text="completion", source=source)
+
+    asyncio.run(exercise())
+    head = adapter._pending_messages[session_key]
+    tail = runner._session_state(session_key).conversation.queued_events
+    events = [head, *tail]
+    assert [event.text for event in events] == (
+        ["completion", "human stays human"]
+        if completion_first else ["human stays human", "completion"]
+    )
+    assert sum(event.autonomous_completion for event in events) == 1
+    human_event = next(event for event in events if event.text.startswith("human"))
+    completion_event = next(event for event in events if event.text == "completion")
+    assert human_event.internal is False
+    assert _event_conversation_forwarding_metadata(human_event)[1] is False
+    assert completion_event.internal is True
+    assert completion_event.allow_gateway_control is True
+    assert _event_conversation_forwarding_metadata(completion_event)[1] is True
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web

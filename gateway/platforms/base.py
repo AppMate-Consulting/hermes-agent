@@ -2709,13 +2709,63 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+_PENDING_SECURITY_METADATA_KEYS = (
+    "hermes_plugin_id",
+    "hermes_plugin_injection",
+    "gateway_session_key",
+    "gateway_session_id",
+    "gateway_session_strict",
+)
+
+
+def pending_events_share_provenance(
+    existing: MessageEvent,
+    incoming: MessageEvent,
+) -> bool:
+    """Whether two pending events may safely coalesce into one turn.
+
+    Coalescing is lossy for every field except text and media.  Require the
+    complete trust/sender provenance to match so a human message can never be
+    relabelled as an autonomous completion (or vice versa), and so merging
+    cannot discard control, plugin-injection, session-fencing, or attribution
+    metadata.
+    """
+    existing_source = getattr(existing, "source", None)
+    incoming_source = getattr(incoming, "source", None)
+
+    def _sender(event: MessageEvent, source: Any) -> tuple[Any, ...]:
+        return (
+            getattr(event, "user_id", None),
+            getattr(event, "user_name", None),
+            getattr(source, "user_id", None),
+            getattr(source, "user_id_alt", None),
+            getattr(source, "user_name", None),
+        )
+
+    existing_metadata = getattr(existing, "metadata", None) or {}
+    incoming_metadata = getattr(incoming, "metadata", None) or {}
+    return (
+        bool(getattr(existing, "internal", False))
+        == bool(getattr(incoming, "internal", False))
+        and bool(getattr(existing, "allow_gateway_control", True))
+        == bool(getattr(incoming, "allow_gateway_control", True))
+        and bool(getattr(existing, "autonomous_completion", False))
+        == bool(getattr(incoming, "autonomous_completion", False))
+        and _sender(existing, existing_source) == _sender(incoming, incoming_source)
+        and all(
+            existing_metadata.get(key) == incoming_metadata.get(key)
+            for key in _PENDING_SECURITY_METADATA_KEYS
+        )
+    )
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
     event: MessageEvent,
     *,
     merge_text: bool = False,
-) -> None:
+) -> bool:
     """Store or merge a pending event for a session.
 
     Photo bursts/albums often arrive as multiple near-simultaneous PHOTO
@@ -2725,10 +2775,13 @@ def merge_pending_message_event(
     When ``merge_text`` is enabled, rapid follow-up TEXT events are appended
     instead of replacing the pending turn. This is used for Telegram bursty
     follow-ups so a multi-part user thought is not silently truncated to only
-    the last queued fragment.
+    the last queued fragment. Events with different provenance never merge;
+    ``False`` tells the caller to retain the incoming event in its FIFO.
     """
     existing = pending_messages.get(session_key)
     if existing:
+        if not pending_events_share_provenance(existing, event):
+            return False
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -2740,7 +2793,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if existing_has_media or incoming_has_media:
             if incoming_has_media:
@@ -2759,7 +2812,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if (
             merge_text
@@ -2768,9 +2821,10 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            return
+            return True
 
     pending_messages[session_key] = event
+    return True
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.
@@ -5574,6 +5628,26 @@ class BasePlatformAdapter(ABC):
             self._text_debounce = store
         return store
 
+    def _merge_pending_or_fifo(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        merge_text: bool = False,
+    ) -> bool:
+        """Merge compatible events or hand a provenance conflict to FIFO."""
+        merged = merge_pending_message_event(
+            self._pending_messages, session_key, event, merge_text=merge_text
+        )
+        if merged:
+            return True
+        runner = getattr(self, "gateway_runner", None)
+        enqueue = getattr(runner, "_enqueue_fifo", None)
+        if enqueue is None:
+            return False
+        enqueue(session_key, event, self)
+        return True
+
     def _is_queue_text_debounce_candidate(self, event: MessageEvent) -> bool:
         """Return True for normal text eligible for queue-mode debounce."""
         result = (
@@ -5635,8 +5709,7 @@ class BasePlatformAdapter(ABC):
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    merge_pending_message_event(
-                        self._pending_messages,
+                    self._merge_pending_or_fifo(
                         session_key,
                         event,
                         merge_text=True,
@@ -5708,12 +5781,13 @@ class BasePlatformAdapter(ABC):
         state = store.pop(session_key, None)
         if state is None:
             return False
-        merge_pending_message_event(
-            self._pending_messages,
+        if not self._merge_pending_or_fifo(
             session_key,
             state.event,
             merge_text=True,
-        )
+        ):
+            store[session_key] = state
+            return False
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -6154,7 +6228,7 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-                merge_pending_message_event(self._pending_messages, session_key, event)
+                self._merge_pending_or_fifo(session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
@@ -6173,8 +6247,7 @@ class BasePlatformAdapter(ABC):
                     self.name,
                     session_key,
                 )
-                merge_pending_message_event(
-                    self._pending_messages,
+                self._merge_pending_or_fifo(
                     session_key,
                     event,
                     merge_text=event.message_type == MessageType.TEXT,

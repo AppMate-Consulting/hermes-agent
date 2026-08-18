@@ -820,12 +820,25 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
         traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        db._conn.set_trace_callback(statements.append)
+
+        # Under WAL the read path runs on pooled read-only connections that
+        # _read_ctx opens lazily through _get_read_conn(); a connection the
+        # test opens itself is never the one the pool hands to
+        # search_messages, so trace every connection the store opens instead.
+        # Under DELETE journal mode (the WAL-reset-bug fallback) no read
+        # connection is ever opened and reads run on the traced writer.
+        original_get_read_conn = db._get_read_conn
+
+        def traced_get_read_conn():
+            conn = original_get_read_conn()
+            if conn is not None:
+                conn.set_trace_callback(statements.append)
+                traced_connections.append(conn)
+            return conn
+
+        db._get_read_conn = traced_get_read_conn
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -850,6 +863,7 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
+            db._get_read_conn = original_get_read_conn
             for conn in traced_connections:
                 conn.set_trace_callback(None)
 

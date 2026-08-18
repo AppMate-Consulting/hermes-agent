@@ -141,7 +141,10 @@ def _run(
 
     def dispatch(**kwargs):
         boundary_events.append(("dispatch", copy.deepcopy(kwargs)))
-        return next(response_iter)
+        response = next(response_iter)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     agent.client.chat.completions.create.side_effect = dispatch
 
@@ -655,6 +658,50 @@ def test_generic_overflow_post_provider_compression_dispatches_admitted_candidat
     assert json.dumps(retry, sort_keys=True, separators=(",", ":")) == json.dumps(
         snapshots[0]["payload"], sort_keys=True, separators=(",", ":")
     )
+
+
+def test_413_post_provider_compression_dispatches_admitted_candidate_once():
+    """A real HTTP 413 retries the exact admitted replacement request."""
+    agent, compressor = _agent()
+    compressor.should_compress.side_effect = lambda _tokens: False
+    transitions = []
+    selector_state = _install_stateful_selector(compressor, transitions)
+    middleware_state = {"serial": 0}
+    request_callback = _StatefulRequestPreview(middleware_state)
+
+    def stateful_middleware(payload):
+        middleware_state["serial"] += 1
+        serial = middleware_state["serial"]
+        payload["provider_options"] = {"middleware_serial": serial}
+        transitions.append(("middleware", serial))
+        return payload
+
+    admitted, snapshots, middleware_calls, ownership = [], [], [], []
+    result = _run(
+        agent,
+        [_provider_error("Request payload too large", status_code=413), _response()],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        middleware_transform=stateful_middleware,
+        ownership_handoffs=ownership,
+        request_callbacks=[request_callback],
+    )
+
+    assert result["completed"] is True
+    assert compressor.compress.call_count == 1
+    assert transitions == [
+        ("selector", 1), ("middleware", 1),
+        ("selector", 1), ("middleware", 1),
+    ]
+    assert selector_state == {"cursor": 1}
+    assert middleware_state == {"serial": 1}
+    assert ownership == [{"request": admitted[0], "admitted": True}]
+    calls = agent.client.chat.completions.create.call_args_list
+    assert len(calls) == 2
+    retry = calls[1].kwargs
+    _assert_dispatch_uses_admission(retry, admitted[0], snapshots[0])
+    assert retry == snapshots[0]["payload"]
 
 
 def test_admitted_execution_replacement_fails_closed_before_dispatch():

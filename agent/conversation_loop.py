@@ -5672,12 +5672,20 @@ def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
+                    _retry_admission_handoff = {
+                        "request": _finalized_request,
+                        "admitted": False,
+                    }
                     # Option A (LCM issue 441): overhead-aware request size so recovery arms on the
                     # true request (msgs + tools + system), not the tool-blind message count.
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        force=True,
+                        live_request_context=_live_retry_compression_context(
+                            _retry_admission_handoff
+                        ),
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -5694,6 +5702,11 @@ def run_conversation(
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
+                    if _retry_admission_handoff.get("admitted") is True:
+                        _admitted_retry_request = _retry_admission_handoff.get(
+                            "request"
+                        )
+                        _admitted_retry_semantics = _request_semantics
 
                     # Re-estimate tokens after compression.  Same-message-count
                     # compression (tool-result pruning, in-place summarization)
@@ -5708,6 +5721,11 @@ def run_conversation(
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
                         time.sleep(2)  # Brief pause between compression retries
+                        if _admitted_retry_request is not None:
+                            # The admission transaction already finalized the
+                            # replacement request.  Retry those exact bytes in
+                            # this loop without replaying selection/middleware.
+                            continue
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -5829,6 +5847,7 @@ def run_conversation(
                                 messages, system_message,
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
+                                force=True,
                                 live_request_context=_live_retry_compression_context(
                                     _retry_admission_handoff
                                 ),
@@ -6000,6 +6019,7 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        force=True,
                         live_request_context=_live_retry_compression_context(
                             _retry_admission_handoff
                         ),

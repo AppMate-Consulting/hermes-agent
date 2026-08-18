@@ -37,6 +37,24 @@ _MEMORY_CONTEXT_TAIL_CHARS = 1_500
 _MEMORY_CONTEXT_TRUNCATION_MARKER = "\n...[memory provider context truncated]...\n"
 
 
+def context_selection_is_preview_safe(engine: Any) -> bool:
+    """Return whether speculative context selection can be rolled back or is pure.
+
+    Legacy engines inherit callable snapshot/restore no-ops, so callability is
+    not evidence of transactional support.  An engine opts in by overriding
+    both hooks, or by explicitly declaring selection pure/preview-safe.
+    """
+    if getattr(engine, "context_selection_preview_safe", False) is True:
+        return True
+    engine_type = type(engine)
+    return isinstance(engine, ContextEngine) and (
+        getattr(engine_type, "snapshot_compression_attempt_state", None)
+        is not ContextEngine.snapshot_compression_attempt_state
+        and getattr(engine_type, "restore_compression_attempt_state", None)
+        is not ContextEngine.restore_compression_attempt_state
+    )
+
+
 def sanitize_memory_context(memory_context: str) -> str:
     """Prepare provider context for a context-engine/LLM egress boundary."""
     sanitized = redact_sensitive_text(
@@ -88,6 +106,10 @@ def automatic_compaction_status_message(
 
 class ContextEngine(ABC):
     """Base class all context engines must implement."""
+
+    # Explicit opt-in for selectors that do not mutate state.  Stateful
+    # engines should leave this false and override both transaction hooks.
+    context_selection_preview_safe = False
 
     # -- Identity ----------------------------------------------------------
 

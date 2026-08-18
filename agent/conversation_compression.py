@@ -2920,6 +2920,28 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    _live_request = live_request_context or {}
+    if (
+        _live_request.get("frozen_finalized_request") is not None
+        and _live_request.get("selector_projection_safe") is False
+    ):
+        # Fail before invoking any compression or preview machinery.  A
+        # legacy stateful engine cannot roll back either selector or
+        # compression-attempt mutations, so the sole safe authority is the
+        # ordinary request already finalized by the live loop.
+        _handoff = _live_request.get("admission_handoff")
+        if isinstance(_handoff, dict):
+            _handoff["request"] = _live_request["frozen_finalized_request"]
+            _handoff["admitted"] = False
+        logger.warning(
+            "Automatic compression skipped: context selector is not "
+            "transactional or explicitly preview-safe"
+        )
+        return (
+            messages,
+            getattr(agent, "_cached_system_prompt", None) or system_message,
+        )
+
     # This snapshot is the transaction's immutable input.  Take it before any
     # feasibility probe, hook, prompt build, or engine can mutate caller-owned
     # state.  In particular, legacy engines are explicitly allowed to mutate
@@ -2994,7 +3016,12 @@ def compress_context(
     _selector_preview_post = (live_request_context or {}).get(
         "selector_preview_post", _missing_cache_field
     )
+    _selector_projection_safe = bool(
+        (live_request_context or {}).get("selector_projection_safe", True)
+    )
     if (
+        _selector_projection_safe
+        and
         (live_request_context or {}).get("frozen_projection") is not None
         and _selector_preview_pre is not _missing_cache_field
         and _selector_preview_post is not _missing_cache_field
@@ -4545,7 +4572,11 @@ def compress_context(
             restore_llm_request_middleware_preview_state(
                 _request_middleware_pre
             )
-        elif _frozen_finalized is not None and _middleware_transaction_error is None:
+        elif (
+            _frozen_finalized is not None
+            and _middleware_transaction_error is None
+            and _selector_projection_safe
+        ):
             # Replace the already-consumed old transition with exactly one
             # candidate transition.  Abort paths restore post-old instead.
             restore_llm_request_middleware_preview_state(
@@ -4573,7 +4604,13 @@ def compress_context(
             and 0 <= _candidate_turn_idx < len(compressed)
             else None
         )
-        if _middleware_transaction_error is None:
+        if not _selector_projection_safe and _frozen_finalized is not None:
+            # The already-finalized old request owns the legacy selector's
+            # sole authoritative transition.  Without rollback (or an
+            # explicit purity declaration), candidate projection would either
+            # advance it twice on commit or leak speculative state on abort.
+            _finalized_out = _finalized_in
+        elif _middleware_transaction_error is None:
             _finalized_out = finalize_provider_request(
                 agent,
                 compressed,
@@ -4601,6 +4638,8 @@ def compress_context(
         _rejection = None
         if not _protected_seam_valid:
             _rejection = "invalid_protected_tail_seam"
+        elif not _selector_projection_safe and _frozen_finalized is not None:
+            _rejection = "nontransactional_selector"
         elif _middleware_transaction_error is not None:
             _rejection = "nontransactional_middleware"
         elif any(

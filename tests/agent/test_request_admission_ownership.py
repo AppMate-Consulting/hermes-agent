@@ -12,6 +12,7 @@ from agent.conversation_compression import (
     estimate_finalized_payload_tokens_rough as _real_finalized_estimate,
 )
 from run_agent import AIAgent
+from agent.context_engine import ContextEngine, context_selection_is_preview_safe
 
 
 STRUCTURED = [
@@ -80,6 +81,9 @@ def _agent():
     agent.compression_enabled = True
 
     compressor = MagicMock()
+    # This generic test double's selector is pure.  Stateful tests below use
+    # concrete ContextEngine subclasses to exercise capability detection.
+    compressor.context_selection_preview_safe = True
     compressor.threshold_tokens = 10
     compressor.context_length = 100
     compressor.should_defer_preflight_to_real_usage.return_value = False
@@ -121,6 +125,62 @@ def _agent():
     return agent, compressor
 
 
+class _LegacyStatefulEngine(ContextEngine):
+    """Legacy selector with state, but only the inherited transaction no-ops."""
+
+    name = "legacy-stateful"
+
+    def __init__(self, template):
+        for attr in (
+            "threshold_tokens", "context_length", "protect_first_n",
+            "protect_last_n", "compression_count", "last_prompt_tokens",
+            "last_completion_tokens", "_last_summary_error",
+            "_last_compress_aborted", "_last_aux_model_failure_model",
+            "_last_aux_model_failure_error", "compression_checks",
+        ):
+            setattr(self, attr, getattr(template, attr))
+        for method in (
+            "should_compress", "should_compress_info",
+            "should_defer_preflight_to_real_usage",
+            "get_active_compression_failure_cooldown", "compress",
+        ):
+            setattr(self, method, getattr(template, method))
+        self.cursor = 0
+        self.transitions = []
+
+    def update_from_response(self, usage):
+        return None
+
+    def should_compress(self, prompt_tokens=None):
+        return False
+
+    def compress(self, messages, **kwargs):
+        return messages
+
+    def select_context(self, rows, **_kwargs):
+        self.cursor += 1
+        self.transitions.append(self.cursor)
+        selected = copy.deepcopy(rows)
+        selected[0]["selector_cursor"] = self.cursor
+        return selected
+
+
+class _TransactionalStatefulEngine(_LegacyStatefulEngine):
+    name = "transactional-stateful"
+
+    def snapshot_compression_attempt_state(self):
+        return self.cursor
+
+    def restore_compression_attempt_state(self, snapshot):
+        self.cursor = snapshot
+
+
+class _PureLegacyEngine(_LegacyStatefulEngine):
+    # Used only to prove the explicit capability contract.  A real pure
+    # selector would not increment the inherited test cursor.
+    context_selection_preview_safe = True
+
+
 def _run(
     agent,
     responses,
@@ -148,13 +208,17 @@ def _run(
 
     agent.client.chat.completions.create.side_effect = dispatch
 
-    select_context = agent.context_compressor.select_context.side_effect
+    selector = agent.context_compressor.select_context
+    select_context = getattr(selector, "side_effect", None) or selector
 
     def select(rows, **kwargs):
         boundary_events.append(("select", copy.deepcopy(rows)))
         return select_context(rows, **kwargs)
 
-    agent.context_compressor.select_context.side_effect = select
+    if hasattr(selector, "side_effect"):
+        selector.side_effect = select
+    else:
+        agent.context_compressor.select_context = select
 
     real_compress_context = agent._compress_context
 
@@ -489,6 +553,113 @@ def test_rejected_compression_hands_off_old_as_mutable_without_middleware_replay
     assert dispatch["messages"] is observed["replacement"]["messages"]
     assert dispatch["messages"] is not observed["old"]["messages"]
     assert dispatch["provider_options"] == {"rejected": "replacement"}
+
+
+def _run_legacy_selector_admission(finalized_estimator):
+    agent, template = _agent()
+    engine = _LegacyStatefulEngine(template)
+    agent.context_compressor = engine
+    ownership, admitted, snapshots, middleware_calls = [], [], [], []
+
+    result = _run(
+        agent,
+        [_response()],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        finalized_estimator=finalized_estimator,
+        ownership_handoffs=ownership,
+    )
+    return agent, engine, result, ownership, admitted, middleware_calls
+
+
+def test_legacy_stateful_selector_candidate_would_commit_dispatches_old_once():
+    agent, engine, result, ownership, admitted, middleware_calls = (
+        _run_legacy_selector_admission(
+            lambda payload: 1_000
+            if "compact summary" in str(payload) else 100_000
+        )
+    )
+
+    assert result["completed"] is True
+    assert context_selection_is_preview_safe(engine) is False
+    assert engine.transitions == [1]
+    assert engine.cursor == 1
+    assert admitted == []
+    assert len(middleware_calls) == 1
+    assert ownership[0]["admitted"] is False
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatch == ownership[0]["request"]["payload"]
+    assert dispatch["messages"] is ownership[0]["request"]["payload"]["messages"]
+    assert dispatch["messages"][0]["selector_cursor"] == 1
+
+
+def test_legacy_stateful_selector_rejected_candidate_never_leaks_preview():
+    agent, engine, result, ownership, admitted, middleware_calls = (
+        _run_legacy_selector_admission(lambda _payload: 100_000)
+    )
+
+    assert result["completed"] is True
+    assert engine.transitions == [1]
+    assert engine.cursor == 1
+    assert admitted == []
+    assert len(middleware_calls) == 1
+    assert ownership[0]["admitted"] is False
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatch == ownership[0]["request"]["payload"]
+    assert dispatch["messages"] is ownership[0]["request"]["payload"]["messages"]
+
+
+def test_transactional_selector_projects_and_restores_candidate_on_commit():
+    agent, template = _agent()
+    engine = _TransactionalStatefulEngine(template)
+    agent.context_compressor = engine
+    admitted, snapshots, middleware_calls, ownership = [], [], [], []
+
+    result = _run(
+        agent, [_response()], admitted=admitted,
+        admitted_snapshots=snapshots, middleware_calls=middleware_calls,
+        ownership_handoffs=ownership,
+    )
+
+    assert result["completed"] is True
+    assert context_selection_is_preview_safe(engine) is True
+    assert engine.transitions == [1, 1]
+    assert engine.cursor == 1
+    assert ownership == [{"request": admitted[0], "admitted": True}]
+    _assert_dispatch_uses_admission(
+        agent.client.chat.completions.create.call_args.kwargs,
+        admitted[0], snapshots[0],
+    )
+
+
+def test_transactional_selector_restores_old_transition_on_abort():
+    agent, template = _agent()
+    engine = _TransactionalStatefulEngine(template)
+    agent.context_compressor = engine
+    admitted, snapshots, middleware_calls, ownership = [], [], [], []
+
+    result = _run(
+        agent, [_response()], admitted=admitted,
+        admitted_snapshots=snapshots, middleware_calls=middleware_calls,
+        ownership_handoffs=ownership,
+        finalized_estimator=lambda _payload: 100_000,
+    )
+
+    assert result["completed"] is True
+    assert engine.transitions == [1, 1]
+    assert engine.cursor == 1
+    assert admitted == []
+    assert ownership[0]["admitted"] is False
+    dispatch = agent.client.chat.completions.create.call_args.kwargs
+    assert dispatch == ownership[0]["request"]["payload"]
+    assert dispatch["messages"] is ownership[0]["request"]["payload"]["messages"]
+
+
+def test_selector_preview_capability_is_default_false_and_explicitly_opted_in():
+    _, template = _agent()
+    assert context_selection_is_preview_safe(_LegacyStatefulEngine(template)) is False
+    assert context_selection_is_preview_safe(_PureLegacyEngine(template)) is True
 
 
 def test_same_provider_retry_reuses_admitted_bytes_verbatim():

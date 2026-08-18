@@ -2449,8 +2449,19 @@ def run_conversation(
         # opaque tokens on both sides of this first (old-request) projection so
         # compression can replace it transactionally with exactly one candidate
         # transition, or retain it when the old request remains authoritative.
-        _selector_preview_snapshotter = getattr(
-            agent.context_compressor, "snapshot_compression_attempt_state", None
+        from agent.context_engine import context_selection_is_preview_safe
+
+        _selector_projection_safe = context_selection_is_preview_safe(
+            agent.context_compressor
+        )
+        _selector_preview_snapshotter = (
+            getattr(
+                agent.context_compressor,
+                "snapshot_compression_attempt_state",
+                None,
+            )
+            if _selector_projection_safe
+            else None
         )
         _selector_preview_pre = (
             _selector_preview_snapshotter()
@@ -2741,6 +2752,7 @@ def run_conversation(
                         "frozen_finalized_request": _old_finalized_request,
                         "selector_preview_pre": _selector_preview_pre,
                         "selector_preview_post": _selector_preview_post,
+                        "selector_projection_safe": _selector_projection_safe,
                         "request_middleware_preview_pre": _request_middleware_preview_pre,
                         "request_middleware_preview_post": _request_middleware_preview_post,
                         "request_middleware_nontransactional": (
@@ -2941,6 +2953,7 @@ def run_conversation(
                 "frozen_finalized_request": _finalized_request,
                 "selector_preview_pre": _selector_preview_pre,
                 "selector_preview_post": _selector_preview_post,
+                "selector_projection_safe": _selector_projection_safe,
                 "request_middleware_preview_pre": _request_middleware_preview_pre,
                 "request_middleware_preview_post": _request_middleware_preview_post,
                 "request_middleware_nontransactional": (

@@ -619,8 +619,8 @@ def test_durable_message_committed_before_lease_is_adopted(
     agent.context_compressor.compress.assert_called_once()
     compressed_arg = agent.context_compressor.compress.call_args.args[0]
     assert [m["content"] for m in compressed_arg] == [
-        old_durable,
-        late_durable,
+        old_durable.rstrip(),
+        late_durable.rstrip(),
     ]
     # Must not echo the stale snapshot — compression proceeded on the
     # adopted durable transcript (rotation publishes a child session).

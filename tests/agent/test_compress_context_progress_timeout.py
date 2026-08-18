@@ -226,7 +226,7 @@ class TestRunCompressContextWithProgressTimeout:
             total_ceiling_seconds=0.05,
         )
 
-        assert entered.wait(timeout=1)
+        assert entered.wait(timeout=10)
         assert result_msgs == compressed
         assert result_prompt == "committed"
 

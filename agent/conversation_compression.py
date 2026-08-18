@@ -3815,10 +3815,10 @@ def compress_context(
                         )
                         messages = durable_parent
                         _pre_msg_count = len(messages)
-                        # Token estimate was for the stale snapshot; clear it so
-                        # the compressor re-derives from the adopted transcript
-                        # instead of under-counting the newly visible rows.
-                        approx_tokens = 0
+                        # Keep the caller's approximate token count.  Strict
+                        # context-engine signatures cannot re-derive provider
+                        # usage, and zero would incorrectly report an empty
+                        # prompt after adopting the durable transcript.
                         # The whole adopted list is durable (DB re-read plus
                         # the just-flushed tail). Re-anchor the persist index
                         # at the end so the rotation-boundary flush that runs
@@ -4030,6 +4030,18 @@ def compress_context(
         # engine hook must be the final in-memory restore so its original
         # aliased containers are not replaced by a second deepcopy.
         _restore_uncommitted_input()
+        # The engine hook restores the pre-attempt selector token, which can
+        # predate the authoritative durable cooldown captured under the lease.
+        # Reapply only that captured in-memory cooldown state; the exact DB row
+        # was already restored transactionally above.
+        if _durable_cooldown_authoritative is True:
+            for _name in _COMPRESSOR_COOLDOWN_STATE_FIELDS:
+                if _name in _compressor_attempt_snapshot:
+                    setattr(
+                        agent.context_compressor,
+                        _name,
+                        copy.deepcopy(_compressor_attempt_snapshot[_name]),
+                    )
         _set_compression_outcome("cancelled_explicit_interrupt")
         _existing_sp = _rollback_prompt()
         return messages, _existing_sp

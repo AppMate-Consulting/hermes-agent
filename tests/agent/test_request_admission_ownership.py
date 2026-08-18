@@ -41,6 +41,13 @@ def _response(*, tool=False, invalid=False):
     )
 
 
+def _provider_error(message, *, status_code=400):
+    error = Exception(message)
+    error.status_code = status_code
+    error.code = status_code
+    return error
+
+
 def _agent():
     tool = {
         "type": "function",
@@ -127,6 +134,7 @@ def _run(
     finalized_estimator=None,
     conversation_history=None,
     ownership_handoffs=None,
+    request_callbacks=None,
 ):
     boundary_events = boundary_events if boundary_events is not None else []
     response_iter = iter(responses)
@@ -202,8 +210,13 @@ def _run(
         patch("hermes_cli.middleware.apply_llm_request_middleware", side_effect=middleware),
         patch(
             "hermes_cli.middleware._get_middleware_callbacks",
-            side_effect=lambda kind: list(execution_callbacks or [])
-            if kind == "llm_execution" else [],
+            side_effect=lambda kind: (
+                list(execution_callbacks or [])
+                if kind == "llm_execution"
+                else list(request_callbacks or [])
+                if kind == "llm_request"
+                else []
+            ),
         ),
         patch("agent.conversation_loop.jittered_backoff", return_value=0),
         patch.object(agent, "_compress_context", side_effect=capture_admission),
@@ -498,6 +511,150 @@ def test_same_provider_retry_reuses_admitted_bytes_verbatim():
     assert calls[0].kwargs == calls[1].kwargs
     assert calls[0].kwargs["messages"] is calls[1].kwargs["messages"]
     assert calls[0].kwargs["tools"] is calls[1].kwargs["tools"]
+
+
+def _install_stateful_selector(compressor, transitions):
+    state = {"cursor": 0}
+
+    def snapshot():
+        return state["cursor"]
+
+    def restore(token):
+        state["cursor"] = token
+
+    def select(rows, **_kwargs):
+        state["cursor"] += 1
+        transitions.append(("selector", state["cursor"]))
+        selected = copy.deepcopy(rows)
+        selected[0]["selector_cursor"] = state["cursor"]
+        return selected
+
+    compressor.snapshot_compression_attempt_state.side_effect = snapshot
+    compressor.restore_compression_attempt_state.side_effect = restore
+    compressor.select_context.side_effect = select
+    return state
+
+
+class _StatefulRequestPreview:
+    def __init__(self, state):
+        self.state = state
+
+    def __call__(self, **_kwargs):
+        raise AssertionError("the test's real request shaping owns invocation")
+
+    def snapshot_preview_state(self):
+        return self.state["serial"]
+
+    def restore_preview_state(self, token):
+        self.state["serial"] = token
+
+
+def test_output_cap_post_provider_compression_dispatches_admitted_candidate_once():
+    """The failed request's live transaction owns output-cap compression."""
+    agent, compressor = _agent()
+    compressor.should_compress.side_effect = lambda _tokens: False
+    transitions = []
+    selector_state = _install_stateful_selector(compressor, transitions)
+    middleware_state = {"serial": 0}
+    request_callback = _StatefulRequestPreview(middleware_state)
+
+    def stateful_middleware(payload):
+        middleware_state["serial"] += 1
+        serial = middleware_state["serial"]
+        payload["provider_options"] = {"middleware_serial": serial}
+        transitions.append(("middleware", serial))
+        return payload
+
+    admitted, snapshots, middleware_calls, ownership = [], [], [], []
+    result = _run(
+        agent,
+        [
+            _provider_error(
+                "max_tokens: 65536 > context_window: 200000 - "
+                "input_tokens: 199000 = available_tokens: 1000"
+            ),
+            _response(),
+        ],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        middleware_transform=stateful_middleware,
+        ownership_handoffs=ownership,
+        request_callbacks=[request_callback],
+    )
+
+    assert result["completed"] is True
+    assert compressor.compress.call_count == 1
+    assert transitions == [
+        ("selector", 1), ("middleware", 1),
+        ("selector", 1), ("middleware", 1),
+    ]
+    assert selector_state == {"cursor": 1}
+    assert middleware_state == {"serial": 1}
+    assert ownership == [{"request": admitted[0], "admitted": True}]
+    calls = agent.client.chat.completions.create.call_args_list
+    assert len(calls) == 2
+    retry = calls[1].kwargs
+    _assert_dispatch_uses_admission(retry, admitted[0], snapshots[0])
+    assert retry == snapshots[0]["payload"]
+    assert json.dumps(retry, sort_keys=True, separators=(",", ":")) == json.dumps(
+        snapshots[0]["payload"], sort_keys=True, separators=(",", ":")
+    )
+    assert retry["max_tokens"] == 936
+    assert agent._ephemeral_max_output_tokens is None
+
+
+def test_generic_overflow_post_provider_compression_dispatches_admitted_candidate_once():
+    """Generic input overflow retries without an outer-loop request rebuild."""
+    agent, compressor = _agent()
+    compressor.should_compress.side_effect = lambda _tokens: False
+    transitions = []
+    selector_state = _install_stateful_selector(compressor, transitions)
+    middleware_state = {"serial": 0}
+    request_callback = _StatefulRequestPreview(middleware_state)
+
+    def stateful_middleware(payload):
+        middleware_state["serial"] += 1
+        serial = middleware_state["serial"]
+        payload["provider_options"] = {"middleware_serial": serial}
+        transitions.append(("middleware", serial))
+        return payload
+
+    admitted, snapshots, middleware_calls, ownership = [], [], [], []
+    result = _run(
+        agent,
+        [
+            _provider_error(
+                "This model's maximum context length is 100 tokens. However, "
+                "your messages resulted in 200 tokens."
+            ),
+            _response(),
+        ],
+        admitted=admitted,
+        admitted_snapshots=snapshots,
+        middleware_calls=middleware_calls,
+        middleware_transform=stateful_middleware,
+        ownership_handoffs=ownership,
+        request_callbacks=[request_callback],
+    )
+
+    assert result["completed"] is True
+    assert compressor.compress.call_count == 1
+    assert transitions == [
+        ("selector", 1), ("middleware", 1),
+        ("selector", 1), ("middleware", 1),
+    ]
+    assert selector_state == {"cursor": 1}
+    assert middleware_state == {"serial": 1}
+    assert ownership == [{"request": admitted[0], "admitted": True}]
+    calls = agent.client.chat.completions.create.call_args_list
+    assert len(calls) == 2
+    retry = calls[1].kwargs
+    _assert_dispatch_uses_admission(retry, admitted[0], snapshots[0])
+    assert retry == snapshots[0]["payload"]
+    assert json.dumps(retry, sort_keys=True, separators=(",", ":")) == json.dumps(
+        snapshots[0]["payload"], sort_keys=True, separators=(",", ":")
+    )
 
 
 def test_admitted_execution_replacement_fails_closed_before_dispatch():

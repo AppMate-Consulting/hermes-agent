@@ -2925,6 +2925,48 @@ def run_conversation(
         _admitted_retry_request = None
         _admitted_retry_semantics = None
 
+        def _live_retry_compression_context(admission_handoff):
+            """Carry this dispatched request into post-provider admission.
+
+            Provider overflow recovery happens after selection and request
+            middleware have already advanced their state for the failed
+            request.  Compression must replace that transition with exactly
+            one candidate transition and return the finalized candidate to
+            this retry loop; rebuilding it in the outer loop would replay both
+            stateful stages and could consume a one-shot output cap early.
+            """
+            return {
+                "admission_handoff": admission_handoff,
+                "frozen_projection": _provider_request,
+                "frozen_finalized_request": _finalized_request,
+                "selector_preview_pre": _selector_preview_pre,
+                "selector_preview_post": _selector_preview_post,
+                "request_middleware_preview_pre": _request_middleware_preview_pre,
+                "request_middleware_preview_post": _request_middleware_preview_post,
+                "request_middleware_nontransactional": (
+                    _request_middleware_nontransactional
+                ),
+                "current_turn_user_idx": current_turn_user_idx,
+                "current_turn_identity": copy.deepcopy(
+                    messages[current_turn_user_idx].get("content")
+                    if 0 <= current_turn_user_idx < len(messages) else None
+                ),
+                "incoming_message": copy.deepcopy(_incoming),
+                "external_prefetch": copy.deepcopy(_ext_prefetch_cache),
+                "plugin_user_context": copy.deepcopy(_plugin_user_context),
+                "prefill_messages": copy.deepcopy(
+                    getattr(agent, "prefill_messages", None)
+                ),
+                "sanitize_model": _sanitize_model,
+                "current_turn_suffix": _moa_context,
+                "moa_prepared_request": _moa_prepared_request,
+                "tools": copy.deepcopy(agent.tools or []),
+                "user_initiated_turn": bool(
+                    getattr(agent, "_is_user_initiated_turn", False)
+                ),
+                "middleware_context": _live_middleware_context,
+            }
+
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
@@ -5779,10 +5821,17 @@ def run_conversation(
                             original_len = len(messages)
                             original_tokens = estimate_messages_tokens_rough(messages)
                             _overflow_input = messages
+                            _retry_admission_handoff = {
+                                "request": _finalized_request,
+                                "admitted": False,
+                            }
                             messages, active_system_prompt = agent._compress_context(
                                 messages, system_message,
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
+                                live_request_context=_live_retry_compression_context(
+                                    _retry_admission_handoff
+                                ),
                             )
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                                 compression_attempts -= 1
@@ -5798,6 +5847,11 @@ def run_conversation(
                                 agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                             elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                                 agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                            if _retry_admission_handoff.get("admitted") is True:
+                                _admitted_retry_request = (
+                                    _retry_admission_handoff.get("request")
+                                )
+                                _admitted_retry_semantics = _request_semantics
                         except Exception:
                             # Compression must never turn an output-cap error
                             # fatal — fall through and retry on max_tokens alone.
@@ -5805,6 +5859,11 @@ def run_conversation(
                                 "%sOutput-cap compression hit an error; retrying on max_tokens only.",
                                 agent.log_prefix,
                             )
+                        if _admitted_retry_request is not None:
+                            # Stay inside this provider transaction: the next
+                            # attempt consumes the exact finalized candidate,
+                            # including the one-shot reduced output cap.
+                            continue
                         _retry.restart_with_compressed_messages = True
                         break
 
@@ -5929,6 +5988,10 @@ def run_conversation(
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
                     _overflow_input = messages
+                    _retry_admission_handoff = {
+                        "request": _finalized_request,
+                        "admitted": False,
+                    }
                     # Option A (LCM issue 441): pass the OVERHEAD-AWARE request size (msgs + tool
                     # schemas + system), not the tool-blind message count, so LCM forced-overflow
                     # recovery arms on the TRUE request that overflowed. See hermes-lcm engine
@@ -5937,6 +6000,9 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        live_request_context=_live_retry_compression_context(
+                            _retry_admission_handoff
+                        ),
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -5953,6 +6019,11 @@ def run_conversation(
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
+                    if _retry_admission_handoff.get("admitted") is True:
+                        _admitted_retry_request = _retry_admission_handoff.get(
+                            "request"
+                        )
+                        _admitted_retry_semantics = _request_semantics
 
                     # Re-estimate tokens after compression.  Same-message-count
                     # compression (tool-result pruning, in-place summarization)
@@ -5966,6 +6037,11 @@ def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        if _admitted_retry_request is not None:
+                            # Admission already finalized the only request this
+                            # retry may send.  Do not rebuild it in the outer
+                            # loop or advance selector/middleware a second time.
+                            continue
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break

@@ -2916,6 +2916,12 @@ def compress_context(
         name: vars(agent).get(name, _missing_cache_field)
         for name in ("_cached_system_prompt", "_cached_system_prompt_static")
     }
+    # Finalizing an admission candidate consumes this one-shot override.  That
+    # consumption is transactional too: only a published candidate owns it;
+    # every abort must leave the cap available for the caller's ordinary retry.
+    _ephemeral_output_cap_snapshot = vars(agent).get(
+        "_ephemeral_max_output_tokens", _missing_cache_field
+    )
     _persistence_snapshot = {
         name: copy.deepcopy(vars(agent).get(name, _missing_cache_field))
         for name in (
@@ -3020,6 +3026,10 @@ def compress_context(
                 vars(agent).pop(name, None)
             else:
                 setattr(agent, name, value)
+        if _ephemeral_output_cap_snapshot is _missing_cache_field:
+            vars(agent).pop("_ephemeral_max_output_tokens", None)
+        else:
+            agent._ephemeral_max_output_tokens = _ephemeral_output_cap_snapshot
         for name, value in _persistence_snapshot.items():
             if value is _missing_cache_field:
                 vars(agent).pop(name, None)

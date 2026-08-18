@@ -98,7 +98,11 @@ class TestF1CommitOverrunWhileHung:
             t = threading.Thread(target=run, name="f1-hung-commit-host")
             t.start()
             try:
-                assert entered.wait(timeout=2)
+                # Under the parallel verifier this process may be CPU-starved
+                # while the bounded executor starts.  Admission is the subject
+                # here, not a two-second startup deadline; the worker's own
+                # event gate still proves the overrun while commit is blocked.
+                assert entered.wait(timeout=10)
                 # ── Assert WHILE the commit worker is still blocked ──────
                 assert overrun_fired.wait(timeout=5), (
                     "on_commit_overrun must fire while the commit is hung"

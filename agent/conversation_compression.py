@@ -655,8 +655,27 @@ def _capture_authoritative_cooldown_under_lease(
         return authoritative, None
 
     values = vars(compressor)
+    # Derive the rollback snapshot from the same raw row that will be restored.
+    # A second, filtered read above refreshes normal runtime state, but it must
+    # not be the authority for cancellation compensation: the deadline can
+    # cross between those reads, and test doubles may implement the active and
+    # raw APIs with different filtering.  Keeping both durable and in-memory
+    # rollback state tied to one captured row also preserves a newer cooldown
+    # observed only after this compressor was originally bound.
+    raw_deadline = durable_state.get("cooldown_until")
+    remaining = (
+        max(0.0, float(raw_deadline) - time.time())
+        if raw_deadline is not None
+        else 0.0
+    )
+    if remaining > 0:
+        attempt_snapshot["_summary_failure_cooldown_until"] = (
+            time.monotonic() + remaining
+        )
+        attempt_snapshot["_last_summary_error"] = durable_state.get("error")
+        attempt_snapshot["_cooldown_persist_failed"] = False
     for name in _COMPRESSOR_COOLDOWN_STATE_FIELDS:
-        if name in values:
+        if name in values and name not in attempt_snapshot:
             attempt_snapshot[name] = copy.deepcopy(values[name])
     return True, copy.deepcopy(durable_state)
 

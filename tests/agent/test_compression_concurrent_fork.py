@@ -112,6 +112,19 @@ def _count_children(db: SessionDB, parent_sid: str) -> int:
     return len(rows)
 
 
+def _material_text(label: str, *, words: int = 512) -> str:
+    """Build input large enough to exercise post-summary commit admission."""
+    return f"{label} " + ("payload " * words)
+
+
+def _material_messages(count: int = 20) -> list[dict[str, str]]:
+    """Return a transcript whose compacted form clears minimum-reclaim policy."""
+    return [
+        {"role": "user", "content": _material_text(f"m{i}")}
+        for i in range(count)
+    ]
+
+
 def _live_child_id(db: SessionDB, parent_sid: str) -> str | None:
     """The single child id of ``parent_sid``, or None when there is none.
 
@@ -201,7 +214,7 @@ def test_compression_activity_heartbeat_ignores_touch_errors(tmp_path: Path) -> 
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
     agent._touch_activity = lambda _desc, **_kw: (_ for _ in ()).throw(RuntimeError("touch boom"))
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
 
@@ -226,7 +239,7 @@ def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
     agent._compression_activity_heartbeat_interval = "not-a-number"
     touch_calls: list[str] = []
     agent._touch_activity = lambda desc, **_kw: touch_calls.append(desc)
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
 
     strict_calls: list[int | None] = []
 
@@ -589,12 +602,14 @@ def test_durable_message_committed_before_lease_is_adopted(
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "PRE_LEASE_DURABLE_RACE"
     db.create_session(parent_sid, source="webui")
-    db.append_message(parent_sid, "user", "old durable")
+    old_durable = _material_text("old durable", words=5_000)
+    late_durable = _material_text("late committed before lease", words=5_000)
+    db.append_message(parent_sid, "user", old_durable)
 
     # Frontend takes its snapshot, then another producer commits before this
     # compressor acquires the lease.
-    stale_snapshot = [{"role": "user", "content": "old durable"}]
-    db.append_message(parent_sid, "assistant", "late committed before lease")
+    stale_snapshot = [{"role": "user", "content": old_durable}]
+    db.append_message(parent_sid, "assistant", late_durable)
     agent = _build_agent_with_db(db, parent_sid)
 
     returned, _system_prompt = agent._compress_context(
@@ -604,8 +619,8 @@ def test_durable_message_committed_before_lease_is_adopted(
     agent.context_compressor.compress.assert_called_once()
     compressed_arg = agent.context_compressor.compress.call_args.args[0]
     assert [m["content"] for m in compressed_arg] == [
-        "old durable",
-        "late committed before lease",
+        old_durable,
+        late_durable,
     ]
     # Must not echo the stale snapshot — compression proceeded on the
     # adopted durable transcript (rotation publishes a child session).
@@ -653,7 +668,7 @@ def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) ->
 
     agent.context_compressor.compress.side_effect = _slow_summary
     agent.context_compressor._proactive_prune_rearm_tokens = 120_000
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     fence = CompressionCommitFence()
     result = {}
 
@@ -829,7 +844,7 @@ def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:
     db.create_session(parent_sid, source="cli")
 
     agent = _build_agent_with_db(db, parent_sid)
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
     child_sid = agent.session_id
@@ -899,7 +914,7 @@ def test_full_in_place_compression_atomically_clears_durable_prune_runway(
         source="cli",
         model_config={"keep": "value", "_proactive_prune_rearm_tokens": 120_000},
     )
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     db.append_messages_batch(session_id, messages)
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
@@ -924,7 +939,7 @@ def test_rotation_child_starts_without_durable_prune_runway(tmp_path: Path) -> N
         source="cli",
         model_config={"keep": "parent", "_proactive_prune_rearm_tokens": 120_000},
     )
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     db.append_messages_batch(parent_sid, messages)
     agent = _build_agent_with_db(db, parent_sid)
 
@@ -1370,7 +1385,7 @@ def test_late_hard_interrupt_restores_full_compressor_attempt_state_and_retry(
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
     agent._cached_system_prompt = "sys"
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     provider_returned = threading.Event()
     allow_compress_return = threading.Event()
     shared_telemetry = {"shared": [1, 2, 3]}
@@ -1651,7 +1666,7 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
     agent._cached_system_prompt = "sys"
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = _material_messages()
     commit_started = threading.Event()
     allow_commit = threading.Event()
     stop_returned = threading.Event()

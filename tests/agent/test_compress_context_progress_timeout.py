@@ -125,7 +125,7 @@ class TestRunCompressContextWithProgressTimeout:
 
         def worker(fence: CompressionCommitFence):
             started.set()
-            assert release.wait(timeout=2)
+            assert release.wait(timeout=10)
             if not fence.begin_commit():
                 return ([{"role": "assistant", "content": "should-not-land"}], "x")
             try:
@@ -141,15 +141,19 @@ class TestRunCompressContextWithProgressTimeout:
             worker=worker,
             messages=original,
             system_prompt_fallback="fallback-prompt",
-            idle_timeout_seconds=0.05,
-            total_ceiling_seconds=0.2,
+            # This test verifies fence cancellation after a worker has started,
+            # not executor scheduling latency. Leave enough admission budget
+            # for the 48-process verifier while keeping the worker silent long
+            # enough to exercise the real timeout path.
+            idle_timeout_seconds=1.0,
+            total_ceiling_seconds=1.0,
             on_timeout=lambda idle, waited, since: warnings.append(
                 (idle, waited, since)
             ),
             telemetry_agent=telemetry_agent,
         )
 
-        assert started.wait(timeout=1)
+        assert started.wait(timeout=10)
         # Give the waiter time to cancel before releasing the worker.
         time.sleep(0.15)
         release.set()

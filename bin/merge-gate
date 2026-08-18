@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-python_bin=python
-if [[ -x /opt/venv/bin/python ]]; then
-  python_bin=/opt/venv/bin/python
-fi
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
 
-"$python_bin" -m pytest \
+exec "$repo_root/scripts/run_tests.sh" \
   tests/agent/test_compaction_anti_thrash.py \
   tests/agent/test_completion_chain_compaction.py \
   tests/agent/test_compress_context_progress_timeout.py \

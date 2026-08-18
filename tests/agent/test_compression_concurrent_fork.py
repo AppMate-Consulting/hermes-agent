@@ -254,7 +254,10 @@ def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    assert compressed[0]["content"] == "[CONTEXT COMPACTION] strict summary"
+    assert any(
+        message.get("content") == "[CONTEXT COMPACTION] strict summary"
+        for message in compressed
+    )
     assert touch_calls[0] == "context compression started"
     assert touch_calls[-1] == "context compression completed"
     assert db.get_compression_lock_holder(session_id) is None

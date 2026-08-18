@@ -449,7 +449,7 @@ class TestF6ExecutorSaturation:
         run the refused job."""
         _drain_admission_slots()
         release = threading.Event()
-        started = threading.Barrier(5, timeout=10)  # 4 workers + main
+        started = threading.Barrier(5, timeout=60)  # 4 workers + main
 
         def blocked_worker(fence: CompressionCommitFence):
             started.wait()

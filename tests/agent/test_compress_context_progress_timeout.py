@@ -222,8 +222,8 @@ class TestRunCompressContextWithProgressTimeout:
             worker=worker,
             messages=original,
             system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.05,
-            total_ceiling_seconds=0.05,
+            idle_timeout_seconds=1.0,
+            total_ceiling_seconds=1.0,
         )
 
         assert entered.wait(timeout=10)

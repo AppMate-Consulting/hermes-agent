@@ -4981,9 +4981,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         completion = messages[index]
         exact_sequence = (
             completion.get("role") == "user"
-            and _is_autonomous_completion_notification(
-                _content_text_for_contains(completion.get("content")).strip()
-            )
             and messages[index - 2].get("role") == "user"
             and messages[index - 2].get("content") == AUTONOMOUS_COMPLETION_BRIDGE_USER
             and messages[index - 1].get("role") == "assistant"
@@ -4992,8 +4989,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not exact_sequence:
             return False
         # Live runtime provenance is entirely internal: all three rows are
-        # stamped only by the normalized turn builder.  Presentation metadata
-        # is optional in memory and must not participate in that decision.
+        # stamped only by the normalized turn builder.  The completion payload
+        # is producer-controlled and may be generic or localized, so neither
+        # its text nor presentation metadata participates in this decision.
         runtime_markers = all(
             messages[row_index].get("_autonomous_completion_bridge") is True
             for row_index in (index - 2, index - 1, index)

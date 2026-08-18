@@ -476,8 +476,17 @@ def test_autonomous_only_suffix_restores_task_contract_across_restart(
 
 
 @pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "rotation"])
+@pytest.mark.parametrize(
+    "notification",
+    [
+        "[ASYNC DELEGATION COMPLETE child=push-proof]",
+        "Kanban task finished; inspect the worker handoff.",
+        "Tâche Kanban terminée ; examinez le résultat du worker.",
+    ],
+    ids=["delegation", "generic_kanban", "localized_kanban"],
+)
 def test_push_wake_provenance_survives_restart_and_partial_compaction(
-    tmp_path: Path, in_place: bool
+    tmp_path: Path, in_place: bool, notification: str
 ):
     """The real push wake is trusted, durable, and never becomes task authority."""
     from agent.context_compressor import ContextCompressor
@@ -496,7 +505,6 @@ def test_push_wake_provenance_survives_restart_and_partial_compaction(
 
     path = tmp_path / "push-wake-provenance.db"
     sid = "PUSH_WAKE_PROVENANCE"
-    notification = "[ASYNC DELEGATION COMPLETE child=push-proof]"
     genuine_task = "PUSH PATH GENUINE HUMAN TASK"
     db = SessionDB(db_path=path)
     db.create_session(sid, source="telegram", model="test/model")

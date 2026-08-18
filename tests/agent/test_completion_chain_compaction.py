@@ -246,6 +246,45 @@ def test_completion_notification_forms_are_exact_and_human_near_match_stays_real
     assert _is_real_user_message(human)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "Kanban task finished; inspect the worker handoff.",
+        "Tâche Kanban terminée ; examinez le résultat du worker.",
+        "identical completion text",
+    ],
+)
+def test_trusted_completion_sequence_is_authoritative_independent_of_payload(payload):
+    """Producer provenance, not localized/generic presentation text, types a wake."""
+    messages = [
+        {"role": "user", "content": TASK},
+        {"role": "assistant", "content": "working"},
+    ]
+    append_autonomous_completion_provenance(messages)
+    messages.append({
+        "role": "user",
+        "content": payload,
+        "_autonomous_completion_bridge": True,
+    })
+
+    assert ContextCompressor._completion_has_durable_provenance(
+        messages, len(messages) - 1,
+    )
+    assert ContextCompressor._has_autonomous_completion_chain(messages)
+    assert ContextCompressor._active_task_contract(messages)["content"] == TASK
+
+    # Identical public text without the exact trusted bridge/provenance
+    # sequence remains a genuine human turn and supersedes prior authority.
+    human = [
+        {"role": "user", "content": TASK},
+        {"role": "assistant", "content": "working"},
+        {"role": "user", "content": payload},
+    ]
+    assert not ContextCompressor._has_autonomous_completion_chain(human)
+    assert _latest_active_human_task_row(human) is human[-1]
+    assert ContextCompressor._active_task_contract(human)["content"] == payload
+
+
 @pytest.mark.parametrize("display_kind", [None, "async_delegation_complete"])
 def test_durable_completion_provenance_is_independent_of_presentation_kind(
     tmp_path, display_kind

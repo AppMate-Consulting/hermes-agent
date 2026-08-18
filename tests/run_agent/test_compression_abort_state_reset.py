@@ -49,10 +49,18 @@ class _InPlaceSuccessCompressor:
     last_completion_tokens = 0
     awaiting_real_usage_after_compression = False
 
-    def compress(self, _messages, **_kwargs):
+    def compress(self, messages, **_kwargs):
+        # Carry the latest genuine human turn through verbatim: request
+        # admission preserves human intent, and a candidate that dropped it
+        # would have it re-inserted (growing the payload back).
+        latest_human = next(
+            (m for m in reversed(messages) if m.get("role") == "user"),
+            {"role": "user", "content": "old question"},
+        )
         return [
             {"role": "user", "content": "[summary] earlier state"},
             {"role": "assistant", "content": "retained tail"},
+            {"role": "user", "content": latest_human["content"]},
         ]
 
 
@@ -103,9 +111,13 @@ class TestAbortPathsResetPerAttemptState:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = _make_agent(db)
             agent.compression_in_place = True
+            # Bulky enough that summarizing the head reclaims more than the
+            # request-admission minimum; the small final human turn is
+            # carried through by the stub compressor.
             original = [
+                {"role": "user", "content": "context " + ("x" * 30_000)},
+                {"role": "assistant", "content": "old answer " + ("x" * 30_000)},
                 {"role": "user", "content": "old question"},
-                {"role": "assistant", "content": "old answer"},
             ]
             agent._flush_messages_to_session_db(original, [])
             compacted, history = self._in_place_success(agent, original)

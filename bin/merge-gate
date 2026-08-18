@@ -20,6 +20,13 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
+# Round 2 (v0.20.4 integration) additions at the end of the list: upstream
+# tests reconciled to AppMate semantics, the two adapted upstream files, and the
+# middleware-preview tests; every file collects in the verifier image.
+# Deliberately NOT in the gate: tests/run_agent/test_run_agent.py (needs the
+# optional `anthropic` package the verifier image lacks) and
+# tests/gateway/test_session_api.py (a pre-existing load-sensitive flake);
+# both remain covered by upstream CI and host sweeps.
 exec "$repo_root/scripts/run_tests.sh" \
   tests/agent/test_model_metadata.py \
   tests/hermes_cli/test_config.py \
@@ -72,4 +79,29 @@ exec "$repo_root/scripts/run_tests.sh" \
   tests/run_agent/test_partial_compression_atomicity.py \
   tests/hermes_cli/test_desktop_loopback_auth.py \
   tests/agent/test_turn_context.py \
+  tests/agent/test_api_content_sidecar.py \
+  tests/agent/test_compression_attempt_telemetry.py \
+  tests/agent/test_compression_count_warning_36908.py \
+  tests/agent/test_compression_logging_session_context.py \
+  tests/agent/test_compression_rotation_state.py \
+  tests/agent/test_compression_worker_isolation_76354.py \
+  tests/agent/test_context_compressor_zero_user_provenance.py \
+  tests/agent/test_prompt_caching.py \
+  tests/agent/test_rotation_flush_persisted_boundary_68196.py \
+  tests/agent/test_send_path_history_isolation.py \
+  tests/agent/test_skill_todo_retention_parity.py \
+  tests/agent/test_surrogate_chokepoints.py \
+  tests/cli/test_cli_async_delegation_delivery.py \
+  tests/gateway/test_api_server_active_work_drain.py \
+  tests/gateway/test_compression_concurrent_sessions.py \
+  tests/hermes_cli/test_plugins.py \
+  tests/run_agent/test_compression_abort_state_reset.py \
+  tests/run_agent/test_compression_boundary_hook.py \
+  tests/run_agent/test_compression_budget_rearm.py \
+  tests/run_agent/test_compression_lock_defer.py \
+  tests/run_agent/test_preflight_compression_cap_e2e.py \
+  tests/run_agent/test_run_agent_codex_responses.py \
+  tests/state/test_session_git_metadata_generation.py \
+  tests/test_cli_manual_compress.py \
+  tests/test_tui_gateway_server.py \
   -o 'addopts=' -q

@@ -181,17 +181,20 @@ class TestSendPathBuildIsWiredToTheClone:
             if isinstance(node, ast.Call):
                 fn = node.func
                 if isinstance(fn, ast.Name) and fn.id == "_clone_message_for_send":
+                    # The prefill loop variable is ``pfm`` in the inline
+                    # builder and ``prefill`` in the request-projection
+                    # builder; either spelling must be structurally cloned.
                     if (
                         node.args
                         and isinstance(node.args[0], ast.Name)
-                        and node.args[0].id in ("msg", "pfm")
+                        and node.args[0].id in ("msg", "pfm", "prefill")
                     ):
                         clone_calls.append(node.args[0].id)
                 if (
                     isinstance(fn, ast.Attribute)
                     and fn.attr == "copy"
                     and isinstance(fn.value, ast.Name)
-                    and fn.value.id in ("msg", "pfm")
+                    and fn.value.id in ("msg", "pfm", "prefill")
                 ):
                     shallow_copies.append(fn.value.id)
 
@@ -199,9 +202,9 @@ class TestSendPathBuildIsWiredToTheClone:
             "the api_messages history build no longer clones via "
             "_clone_message_for_send(msg) — shallow aliasing (#80498) is back"
         )
-        assert "pfm" in clone_calls, (
+        assert "pfm" in clone_calls or "prefill" in clone_calls, (
             "the prefill insert no longer clones via "
-            "_clone_message_for_send(pfm)"
+            "_clone_message_for_send(pfm|prefill)"
         )
         assert not shallow_copies, (
             f"shallow .copy() reappeared on send-path message variables: "

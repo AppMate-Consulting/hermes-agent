@@ -71,12 +71,13 @@ def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "cli"):
 
 def _msgs(n=20):
     # Large enough that the fake compressor's output is a genuine shrink —
-    # the no-growth commit guard refuses compressions that grow the
-    # transcript (see test_compression_rotation_state.py for the same shape).
+    # request admission refuses a candidate that reclaims less than the
+    # minimum (max(4096, 5% of the threshold) tokens on the finalized payload)
+    # (see test_compression_rotation_state.py for the same shape).
     return [
         {
             "role": "user" if i % 2 == 0 else "assistant",
-            "content": f"m{i} " + "x" * 400,
+            "content": f"m{i} " + "x" * 1600,
         }
         for i in range(n)
     ]
@@ -215,9 +216,15 @@ class TestSkillGuidanceSurvivesWithTodos:
         assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER not in tail_text
 
     def test_synthetic_row_classification_unbroken(self, tmp_path):
-        """A snapshot+notice appended as its own row must still classify as
-        compression scaffolding, never as a real user turn."""
-        from agent.context_compressor import ContextCompressor
+        """A snapshot+notice appended as its own row stays one row.
+
+        With an assistant tail the snapshot cannot merge into an existing user
+        turn, so it is appended as scaffolding. The human-intent guard then
+        folds the latest genuine human turn into that scaffolding row (the
+        human text leads, the snapshot and notice follow) rather than adding
+        a second user row, so the boundary artifact is exactly one user row
+        that carries real human intent, the todo snapshot, and the notice.
+        """
         from agent.conversation_compression import _is_real_user_message
 
         summary = (
@@ -236,8 +243,10 @@ class TestSkillGuidanceSurvivesWithTodos:
         agent._todo_store._items = [
             {"id": "t1", "content": "task A", "status": "pending"}
         ]
+        messages = _msgs()
+        latest_human = messages[-2]["content"]  # m18: the last user turn
         compressed, _ = agent._compress_context(
-            _msgs(), "sys", approx_tokens=120_000
+            messages, "sys", approx_tokens=120_000
         )
         db.close()
         snapshot_rows = [
@@ -248,10 +257,20 @@ class TestSkillGuidanceSurvivesWithTodos:
         ]
         assert len(snapshot_rows) == 1
         row = snapshot_rows[0]
-        assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(row["content"])
-        assert row.get("_todo_snapshot_synthetic") is True
-        assert not _is_real_user_message(row)
-        assert ContextCompressor._is_synthetic_compression_user_turn(row)
+        text = str(row["content"])
+        assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER in text
+        assert row["role"] == "user"
+        # Human intent leads; the snapshot and its notice ride behind it.
+        assert text.startswith(latest_human)
+        assert text.index(TODO_INJECTION_HEADER) < text.index(
+            _PRUNED_SKILL_RELOAD_NOTICE_HEADER
+        )
+        assert _is_real_user_message(row)
+        # No second user row was created for the anchor.
+        assert not any(
+            previous.get("role") == current.get("role") == "user"
+            for previous, current in zip(compressed, compressed[1:])
+        )
 
 
 class TestNoticeStripLifecycle:

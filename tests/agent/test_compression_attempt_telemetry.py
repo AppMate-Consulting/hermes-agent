@@ -26,6 +26,44 @@ class _Agent:
         self._session_db = None
         self._todo_store = _TodoStore()
         self._cached_system_prompt = None
+        # Request admission measures the exact finalized provider payload, so
+        # the double must be able to project one (chat-completions shape).
+        self.api_mode = "chat_completions"
+        self.base_url = ""
+        self._force_ascii_payload = False
+        self._is_user_initiated_turn = False
+        self._cache_ttl = None
+        self._cached_system_prompt_static = None
+        self._use_prompt_caching = False
+        self._use_native_cache_layout = False
+
+    def _copy_reasoning_content_for_api(self, _msg, _api_msg):
+        pass
+
+    def _should_sanitize_tool_calls(self):
+        return False
+
+    def _sanitize_api_messages(self, api_messages):
+        return api_messages
+
+    def _drop_thinking_only_and_merge_users(self, api_messages, **_kwargs):
+        return api_messages
+
+    def _reapply_reasoning_echo_for_provider(self, api_messages, *_a, **_k):
+        return api_messages
+
+    def _is_codex_backend(self):
+        return False
+
+    def _build_api_kwargs(self, api_messages, tools_for_api=None):
+        return {
+            "model": self.model,
+            "messages": api_messages,
+            "tools": tools_for_api if tools_for_api is not None else self.tools,
+        }
+
+    def _is_copilot_url(self):
+        return False
 
     def _emit_status(self, _message):
         pass
@@ -44,10 +82,14 @@ class _Agent:
 
 
 def _messages(secret_text="TOPSECRET_TRANSCRIPT_TEXT"):
+    # Bulk each turn out so that summarizing the middle reclaims more than the
+    # request-admission minimum (max(4096, 5% of threshold) tokens); one-line
+    # rows would be refused as ``below_minimum_reclaim`` and never commit.
+    filler = " " + ("transcript filler text " * 200)
     msgs = [{"role": "system", "content": "system prompt"}]
     for idx in range(10):
-        msgs.append({"role": "user", "content": f"user message {idx} {secret_text}"})
-        msgs.append({"role": "assistant", "content": f"assistant reply {idx} {secret_text}"})
+        msgs.append({"role": "user", "content": f"user message {idx} {secret_text}{filler}"})
+        msgs.append({"role": "assistant", "content": f"assistant reply {idx} {secret_text}{filler}"})
     return msgs
 
 

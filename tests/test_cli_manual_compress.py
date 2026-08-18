@@ -14,6 +14,7 @@ class DummyAgent:
         self.calls = []
         self.flush_calls = []
         self.flush_error = None
+        self.compress_error = None
         self.host_events = []
         self.boundary_calls = []
         self.context_compressor = type("ContextEngineStub", (), {})()
@@ -38,6 +39,7 @@ class DummyAgent:
         focus_topic=None,
         force=False,
         defer_context_engine_notification=False,
+        protected_tail=None,
     ):
         self.calls.append(
             {
@@ -57,6 +59,10 @@ class DummyAgent:
                 new_session_id=self.session_id,
                 old_session_id="old-session",
             )
+        if self.compress_error is not None:
+            # Publication failed inside the compression transaction; the
+            # queued boundary notification must be discarded by the host.
+            raise self.compress_error
         return ([{"role": "user", "content": "[CONTEXT SUMMARY]: compacted"}], "new system prompt")
 
 
@@ -93,12 +99,16 @@ def test_manual_compress_does_not_pass_cached_system_prompt(monkeypatch):
     assert call["focus_topic"] == "database schema"
     assert cli.session_id == "new-session"
     assert cli._pending_title is None
-    assert len(cli.agent.flush_calls) == 1
-    assert cli.agent.host_events == ["persist", "notify"]
+    # The compression transaction publishes the compacted transcript itself
+    # (under the durable transcript CAS); the host must not re-flush it. The
+    # deferred boundary notification is released once the commit is known.
+    assert cli.agent.flush_calls == []
+    assert cli.agent.host_events == ["notify"]
     assert len(cli.agent.boundary_calls) == 1
 
 
-def test_manual_compress_flush_failure_discards_notification(monkeypatch):
+def test_manual_compress_publication_failure_discards_notification(monkeypatch):
+    """A boundary that never committed must not notify the context engine."""
     cli = HermesCLI.__new__(HermesCLI)
     cli.conversation_history = [
         {"role": "user", "content": "one"},
@@ -107,13 +117,14 @@ def test_manual_compress_flush_failure_discards_notification(monkeypatch):
         {"role": "assistant", "content": "four"},
     ]
     cli.agent = DummyAgent()
-    cli.agent.flush_error = RuntimeError("synthetic child flush failure")
+    cli.agent.compress_error = RuntimeError("synthetic publication failure")
     cli.session_id = "old-session"
     cli._pending_title = "old title"
     cli._busy_command = lambda _message, **_kwargs: nullcontext()
 
     cli._manual_compress("/compress")
 
-    assert len(cli.agent.flush_calls) == 1
-    assert cli.agent.host_events == ["persist"]
+    assert cli.agent.flush_calls == []
+    assert cli.agent.host_events == []
     assert cli.agent.boundary_calls == []
+    assert cli.session_id == "old-session"

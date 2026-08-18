@@ -54,11 +54,17 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
 
     compressor = MagicMock()
 
-    def _compress(*_a, **_kw):
+    def _compress(messages, *_a, **_kw):
         time.sleep(0.01)
+        # Carry the latest genuine human turn through verbatim (request
+        # admission preserves human intent and would re-insert it otherwise).
+        latest_human = next(
+            (m for m in reversed(messages) if m.get("role") == "user"),
+            {"role": "user", "content": "tail"},
+        )
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
-            {"role": "user", "content": "tail"},
+            {"role": "user", "content": latest_human["content"]},
         ]
 
     compressor.compress.side_effect = _compress
@@ -79,21 +85,30 @@ def _contents(rows):
 
 
 def test_rotation_flush_does_not_duplicate_persisted_prefix(tmp_path: Path) -> None:
-    """Cold-resume + rotating preflight compression keeps the parent transcript
-    at (persisted prefix + one new turn) — no second copy of the durable rows."""
+    """Cold-resume + rotating preflight compression never duplicates the
+    durable prefix.
+
+    Under the durable transcript fence the un-persisted live turn is carried
+    into the child exactly once rather than flushed to the parent first, so
+    the parent stays at exactly its persisted rows and the child carries the
+    live turn once.
+    """
     db = SessionDB(db_path=tmp_path / "state.db")
 
     parent_sid = "COLD_RESUME_PARENT"
     db.create_session(parent_sid, source="desktop")
 
-    # Two durable rows already in the parent.
-    db.append_message(parent_sid, "user", "persisted question")
-    db.append_message(parent_sid, "assistant", "persisted answer")
+    # Two durable rows already in the parent — bulky enough that compaction
+    # materially shrinks the request (request-admission minimum reclaim).
+    persisted_question = "persisted question " + ("x" * 30_000)
+    persisted_answer = "persisted answer " + ("x" * 30_000)
+    db.append_message(parent_sid, "user", persisted_question)
+    db.append_message(parent_sid, "assistant", persisted_answer)
 
     # Cold resume: the stored rows come back as plain dicts, unstamped, and the
     # live turn appends one new user message on top.
     loaded = db.get_messages_as_conversation(parent_sid)
-    assert _contents(loaded) == ["persisted question", "persisted answer"]
+    assert _contents(loaded) == [persisted_question, persisted_answer]
     messages = [*loaded, {"role": "user", "content": "new turn"}]
 
     agent = _build_agent_with_db(db, parent_sid)
@@ -109,10 +124,14 @@ def test_rotation_flush_does_not_duplicate_persisted_prefix(tmp_path: Path) -> N
     parent_rows = db.get_messages_as_conversation(parent_sid, include_inactive=True)
     contents = _contents(parent_rows)
 
-    assert contents.count("persisted question") == 1, (
-        "Rotation flush re-appended the already-persisted prefix to the parent "
-        f"(#68196). Parent transcript is {contents!r}; expected the two durable "
-        "rows plus only the new turn."
+    assert contents.count(persisted_question) == 1, (
+        "Rotation re-appended the already-persisted prefix to the parent "
+        f"(#68196). Parent transcript is {contents!r}; expected exactly the "
+        "two durable rows."
     )
-    assert contents.count("persisted answer") == 1
-    assert contents == ["persisted question", "persisted answer", "new turn"]
+    assert contents.count(persisted_answer) == 1
+    assert contents == [persisted_question, persisted_answer]
+    # The live turn survives once, in the child.
+    assert agent.session_id != parent_sid
+    child_contents = _contents(db.get_messages_as_conversation(agent.session_id))
+    assert child_contents.count("new turn") == 1

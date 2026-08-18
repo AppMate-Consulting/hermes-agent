@@ -22,6 +22,25 @@ from agent.conversation_compression import (
     finalize_context_engine_compression_notification,
 )
 
+
+def _bulky_transcript(final_user_text: str, rows: int = 8) -> list:
+    """Transcript whose compaction materially shrinks the provider request.
+
+    Request admission refuses a candidate that reclaims less than
+    max(4096, 5% of the threshold) tokens (``below_minimum_reclaim``), and the
+    human-intent guard keeps the latest genuine human turn verbatim — so the
+    head must be bulky and the final human turn must be the small row that the
+    stubbed candidate carries through.
+    """
+    body = "x" * 3200
+    transcript = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i} {body}"}
+        for i in range(rows)
+    ]
+    transcript.append({"role": "user", "content": final_user_text})
+    return transcript
+
+
 class TestCompressionBoundaryHook:
     def _make_agent(self, session_db):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -38,6 +57,11 @@ class TestCompressionBoundaryHook:
             )
             # ROTATION fallback — pin in_place=False regardless of default (#38763).
             agent.compression_in_place = False
+            # The parent row must exist before compaction: the durable
+            # transcript identity is snapshotted under the compression lease
+            # and a row created mid-flight fails the publication CAS.
+            if session_db is not None and session_db.get_session("original-session") is None:
+                session_db.create_session("original-session", source="cli")
             return agent
 
     def test_on_session_start_called_with_compression_boundary(self):
@@ -66,9 +90,7 @@ class TestCompressionBoundaryHook:
             agent.context_compressor = compressor
 
             original_sid = agent.session_id
-            messages = [
-                {"role": "user", "content": f"m{i}"} for i in range(10)
-            ]
+            messages = _bulky_transcript("tail question")
 
             agent._compress_context(messages, "sys", approx_tokens=10_000)
 
@@ -107,7 +129,9 @@ class TestCompressionBoundaryHook:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.return_value = [
-                {"role": "user", "content": "summary"}
+                {"role": "user", "content": "summary"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "request"},
             ]
             compressor.compression_count = 1
             compressor.last_prompt_tokens = 0
@@ -131,7 +155,7 @@ class TestCompressionBoundaryHook:
                 db, "publish_compression_child", side_effect=_record_publish
             ):
                 agent._compress_context(
-                    [{"role": "user", "content": "request"}],
+                    _bulky_transcript("request"),
                     "sys",
                     approx_tokens=100,
                 )
@@ -226,7 +250,11 @@ class TestCompressionBoundaryHook:
             agent = self._make_agent(db)
 
             compressor = MagicMock()
-            compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+            compressor.compress.return_value = [
+                {"role": "user", "content": "summary"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "final ask"},
+            ]
             compressor.compression_count = 1
             compressor.last_prompt_tokens = 0
             compressor.last_completion_tokens = 0
@@ -244,10 +272,10 @@ class TestCompressionBoundaryHook:
             original_sid = agent.session_id
 
             # Must not raise. Input must be large enough that the fake
-            # compressor's one-message summary is a genuine shrink — the
-            # no-growth commit guard refuses to rotate on transcript growth.
+            # compressor's summary is a genuine shrink — request admission
+            # refuses a candidate that does not reclaim the minimum.
             compressed, _prompt = agent._compress_context(
-                [{"role": "user", "content": "m" * 400}], "sys", approx_tokens=100
+                _bulky_transcript("final ask"), "sys", approx_tokens=100
             )
             assert compressed
             assert agent.session_id != original_sid
@@ -272,6 +300,11 @@ class TestSessionCompressEvent:
             )
             # ROTATION fallback — pin in_place=False regardless of default (#38763).
             agent.compression_in_place = False
+            # The parent row must exist before compaction: the durable
+            # transcript identity is snapshotted under the compression lease
+            # and a row created mid-flight fails the publication CAS.
+            if session_db is not None and session_db.get_session("original-session") is None:
+                session_db.create_session("original-session", source="cli")
             return agent
 
     def _stub_compressor(self):
@@ -300,7 +333,7 @@ class TestSessionCompressEvent:
             agent.context_compressor = self._stub_compressor()
 
             agent._compress_context(
-                [{"role": "user", "content": f"m{i}"} for i in range(10)],
+                _bulky_transcript("tail"),
                 "sys",
                 approx_tokens=10_000,
             )

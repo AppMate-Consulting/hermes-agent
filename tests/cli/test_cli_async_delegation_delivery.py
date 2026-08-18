@@ -42,7 +42,15 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     cli._drain_process_notifications("cli-idle")
 
     assert calls == [("visible-session", True)]
-    assert cli._pending_input.get_nowait() == "completion payload"
+    # Runtime completions are queued behind a private provenance sentinel so
+    # a typed lookalike can never be mistaken for one; unwrap it here.
+    from cli import _unwrap_completion_input
+
+    queued_text, is_runtime_completion = _unwrap_completion_input(
+        cli._pending_input.get_nowait()
+    )
+    assert queued_text == "completion payload"
+    assert is_runtime_completion is True
     assert claimed == [(event, "cli-idle")]
     assert completed == [(event, "claim-token")]
 

@@ -67,7 +67,7 @@ def test_logging_session_context_follows_compression_rotation(tmp_path: Path) ->
     # conversation_loop.py pins the logging tag to the ORIGINAL id at turn start.
     hermes_logging.set_session_context(parent_sid)
     try:
-        messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+        messages = [{"role": "user", "content": f"m{i} " + ("x" * 3200)} for i in range(20)]
         agent._compress_context(messages, "sys", approx_tokens=120_000)
 
         # The id actually rotated (sanity — otherwise the assertion is vacuous).

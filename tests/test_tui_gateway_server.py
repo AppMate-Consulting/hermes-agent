@@ -5888,7 +5888,9 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **_kwargs):
+        # The poller also forwards completion provenance
+        # (``is_autonomous_completion``); the double only records delivery.
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
 
@@ -5997,7 +5999,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -6038,7 +6040,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -6104,7 +6106,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -12517,7 +12519,14 @@ _PARTIAL_COMPRESSED_HEAD = [
 
 
 def _partial_compress_agent(compress_context_calls):
-    """Agent stub whose _compress_context records (history, focus_topic)."""
+    """Agent stub whose _compress_context records (history, focus_topic, tail).
+
+    Mirrors the atomic compression transaction's contract: the host hands over
+    the FULL authoritative snapshot plus the exact ``protected_tail`` suffix
+    (never a pre-sliced head), and receives back the already-published full
+    candidate — compressed head followed by the verbatim protected tail —
+    which it adopts without re-appending anything.
+    """
     agent = types.SimpleNamespace(
         _cached_system_prompt=None,
         tools=None,
@@ -12525,9 +12534,13 @@ def _partial_compress_agent(compress_context_calls):
         context_compressor=None,  # keep _get_usage on the simple path
     )
 
-    def _fake_compress_context(history, sys, approx_tokens=0, focus_topic=None, **kw):
-        compress_context_calls.append((list(history), focus_topic))
-        return list(_PARTIAL_COMPRESSED_HEAD), {}
+    def _fake_compress_context(
+        history, sys, approx_tokens=0, focus_topic=None, protected_tail=None, **kw
+    ):
+        compress_context_calls.append(
+            (list(history), focus_topic, list(protected_tail) if protected_tail else None)
+        )
+        return list(_PARTIAL_COMPRESSED_HEAD) + list(protected_tail or []), {}
 
     agent._compress_context = _fake_compress_context
     return agent
@@ -12552,10 +12565,12 @@ def test_compress_session_history_here_triggers_partial_compress():
 
     removed, _usage = server._compress_session_history(session, "here 1")
 
-    # agent._compress_context must have been called with the HEAD only
+    # agent._compress_context receives the full snapshot plus the exact
+    # protected suffix; the transaction summarizes only the head.
     assert len(compress_context_calls) == 1
-    head_passed, focus_passed = compress_context_calls[0]
-    assert head_passed == _PARTIAL_FAKE_HISTORY[:-2]
+    history_passed, focus_passed, tail_passed = compress_context_calls[0]
+    assert history_passed == _PARTIAL_FAKE_HISTORY
+    assert tail_passed == _PARTIAL_FAKE_HISTORY[-2:]
     assert focus_passed is None  # partial compress has no focus topic
     # Session history must now contain the rejoined transcript: compressed
     # head + the last exchange verbatim.
@@ -12579,8 +12594,9 @@ def test_compress_session_history_here_falls_back_on_degenerate_split():
 
     # Degenerate split → full compress of the whole history, focus_topic=None
     assert len(compress_context_calls) == 1
-    head_passed, focus_passed = compress_context_calls[0]
-    assert head_passed == short_history
+    history_passed, focus_passed, tail_passed = compress_context_calls[0]
+    assert history_passed == short_history
+    assert tail_passed is None
     assert focus_passed is None
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD
 
@@ -12596,8 +12612,9 @@ def test_compress_session_history_plain_focus_topic_not_parsed_as_partial():
     server._compress_session_history(session, "my topic")
 
     assert len(compress_context_calls) == 1
-    head_passed, focus_passed = compress_context_calls[0]
-    assert head_passed == _PARTIAL_FAKE_HISTORY  # full history, no split
+    history_passed, focus_passed, tail_passed = compress_context_calls[0]
+    assert history_passed == _PARTIAL_FAKE_HISTORY  # full history, no split
+    assert tail_passed is None
     assert focus_passed == "my topic"
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD
 
@@ -12627,8 +12644,9 @@ def test_session_compress_rpc_honors_here_argument(monkeypatch):
 
     assert resp["result"]["status"] == "compressed"
     assert len(compress_context_calls) == 1
-    head_passed, focus_passed = compress_context_calls[0]
-    assert head_passed == _PARTIAL_FAKE_HISTORY[:-2]
+    history_passed, focus_passed, tail_passed = compress_context_calls[0]
+    assert history_passed == _PARTIAL_FAKE_HISTORY
+    assert tail_passed == _PARTIAL_FAKE_HISTORY[-2:]
     assert focus_passed is None
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD + _PARTIAL_FAKE_HISTORY[-2:]
 
@@ -12659,8 +12677,9 @@ def test_command_dispatch_compress_honors_here_argument(monkeypatch):
 
     assert resp["result"]["type"] == "exec"
     assert len(compress_context_calls) == 1
-    head_passed, focus_passed = compress_context_calls[0]
-    assert head_passed == _PARTIAL_FAKE_HISTORY[:-2]
+    history_passed, focus_passed, tail_passed = compress_context_calls[0]
+    assert history_passed == _PARTIAL_FAKE_HISTORY
+    assert tail_passed == _PARTIAL_FAKE_HISTORY[-2:]
     assert focus_passed is None
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD + _PARTIAL_FAKE_HISTORY[-2:]
 
@@ -12680,8 +12699,9 @@ def test_mirror_slash_compress_honors_here_argument(monkeypatch):
 
     assert "Compressed:" in warning
     assert len(compress_context_calls) == 1
-    head_passed, focus_passed = compress_context_calls[0]
-    assert head_passed == _PARTIAL_FAKE_HISTORY[:-2]
+    history_passed, focus_passed, tail_passed = compress_context_calls[0]
+    assert history_passed == _PARTIAL_FAKE_HISTORY
+    assert tail_passed == _PARTIAL_FAKE_HISTORY[-2:]
     assert focus_passed is None
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD + _PARTIAL_FAKE_HISTORY[-2:]
 
@@ -16199,7 +16219,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **_kwargs):
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False

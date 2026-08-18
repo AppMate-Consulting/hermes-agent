@@ -65,7 +65,12 @@ def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegr
 
 
 def _msgs(n=20):
-    return [{"role": "user", "content": f"m{i}"} for i in range(n)]
+    # Each row carries a realistic body so that compacting the transcript down
+    # to the two-row stub returned by the mocked compressor reclaims more than
+    # the request-admission minimum (max(4096, 5% of the threshold) tokens on
+    # the finalized provider payload); one-word rows would be refused as
+    # ``below_minimum_reclaim`` and never rotate.
+    return [{"role": "user", "content": f"m{i} " + ("x" * 3200)} for i in range(n)]
 
 
 def _bound_context_compressor(db: SessionDB, session_id: str) -> ContextCompressor:
@@ -387,15 +392,23 @@ class TestAutomaticCompressionStateRefreshAfterLock:
         agent.compression_in_place = True
         agent._compression_feasibility_checked = True
         messages = _msgs()
+        # The compaction must make real progress: request admission records a
+        # fresh anti-thrash cooldown for a no-progress result, which would
+        # mask the property under test (the stale LOCAL timer must not block
+        # the gate once another agent cleared the durable row).
+        compacted = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": messages[-1]["content"]},
+        ]
 
-        with patch.object(compressor, "compress", return_value=messages) as compress:
+        with patch.object(compressor, "compress", return_value=compacted) as compress:
             returned, _ = agent._compress_context(
                 messages,
                 "sys",
                 approx_tokens=120_000,
             )
 
-        assert returned is messages
+        assert returned is not messages
         assert compressor.get_active_compression_failure_cooldown() is None
         compress.assert_called_once()
         assert db.get_compression_lock_holder(session_id) is None
@@ -573,41 +586,57 @@ class TestTodoSnapshotMergedNotDuplicated:
         )
 
         # Input transcript must be large enough that the fake compressor's
-        # output is a genuine shrink — the no-growth commit guard refuses
-        # to persist a compression that grows the transcript.
+        # output is a genuine shrink — request admission refuses a compaction
+        # that does not reclaim at least the minimum on the finalized payload.
+        # The multimodal user turn must be the transcript's real live tail:
+        # the compaction candidate is reconciled against durable truth, so a
+        # fabricated tail that matches no persisted row would be replaced by
+        # the actual last user message.
         input_msgs = [
             {
                 "role": "user" if i % 2 == 0 else "assistant",
-                "content": f"m{i} " + "x" * 400,
+                "content": f"m{i} " + "x" * 1600,
             }
-            for i in range(20)
-        ]
+            for i in range(19)
+        ] + [{"role": "user", "content": list(original_parts)}]
         compressed, _ = agent._compress_context(
             input_msgs, "sys", approx_tokens=120_000
         )
 
-        assert len(compressed) == 3
-        tail = compressed[-1]
-        assert tail["role"] == "user"
-        assert isinstance(tail["content"], list)
-        assert tail["content"][: len(original_parts)] == original_parts
-        assert any(
-            isinstance(part, dict) and "inspect image" in (part.get("text") or "")
-            for part in tail["content"]
-        )
+        def _todo_row(rows):
+            matches = [
+                row for row in rows
+                if row.get("role") == "user"
+                and isinstance(row.get("content"), list)
+                and any(
+                    isinstance(part, dict)
+                    and "inspect image" in (part.get("text") or "")
+                    for part in row["content"]
+                )
+            ]
+            assert len(matches) == 1, rows
+            return matches[0]
+
+        # The snapshot is merged into the multimodal user turn in place (the
+        # original parts lead, exactly once) and never creates two consecutive
+        # user turns. The compaction candidate additionally preserves the
+        # exact human task verbatim: once the todo snapshot is folded into
+        # the tail, that row no longer equals the human's message, so the
+        # human-intent guard appends the verbatim task after a bridge turn.
+        merged = _todo_row(compressed)
+        assert merged["content"][: len(original_parts)] == original_parts
+        assert compressed[-1]["role"] == "user"
+        assert compressed[-1]["content"] == original_parts
         assert not any(
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(compressed, compressed[1:])
         )
 
         db_msgs = db.get_messages(agent.session_id)
-        persisted_tail = db_msgs[-1]
-        assert persisted_tail["role"] == "user"
-        assert persisted_tail["content"][: len(original_parts)] == original_parts
-        assert any(
-            isinstance(part, dict) and "inspect image" in (part.get("text") or "")
-            for part in persisted_tail["content"]
-        )
+        persisted_merged = _todo_row(db_msgs)
+        assert persisted_merged["content"][: len(original_parts)] == original_parts
+        assert db_msgs[-1]["role"] == "user"
+        assert db_msgs[-1]["content"] == original_parts
         assert not any(
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(db_msgs, db_msgs[1:])
@@ -672,10 +701,14 @@ class TestTodoSnapshotScaffoldingTails:
         session_id = "PARENT_TODO_EMPTY"
         db.create_session(session_id, source="cli")
         agent = _build_agent_with_db(db, session_id, platform="cli")
+        messages = _msgs()
+        # The candidate's trailing user turn is the transcript's real latest
+        # human message: the human-intent guard re-inserts the exact latest
+        # human task when a candidate carries only a fabricated tail.
         expected = [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "assistant", "content": "acknowledged"},
-            {"role": "user", "content": "tail"},
+            {"role": "user", "content": messages[-1]["content"]},
         ]
         agent.context_compressor.compress.return_value = [
             dict(message) for message in expected
@@ -685,10 +718,15 @@ class TestTodoSnapshotScaffoldingTails:
         )
 
         compressed, _ = agent._compress_context(
-            _msgs(), "sys", approx_tokens=120_000
+            messages, "sys", approx_tokens=120_000
         )
 
-        assert [{k: v for k, v in m.items() if k != "_row_id"} for m in compressed] == expected
+        # The adopted transcript is the durable read-back, which carries row
+        # bookkeeping (``_row_id``, ``timestamp``) alongside the content.
+        assert [
+            {k: v for k, v in m.items() if k not in ("_row_id", "timestamp")}
+            for m in compressed
+        ] == expected
         assert not any(
             TODO_INJECTION_HEADER in str(message.get("content") or "")
             for message in compressed
@@ -793,17 +831,34 @@ class TestAbortedRotationDoesNotGrowParent:
         assert db.find_live_compression_child(parent) is None
 
     def test_live_parent_still_gets_the_prepublish_flush(self, tmp_path: Path):
-        """The guard must not cost a real rotation its #47202 tail."""
+        """The guard must not cost a real rotation its live current-turn tail.
+
+        Under the durable transcript fence the un-persisted current-turn tail
+        is reconciled into the compaction candidate and published with the
+        child exactly once; it is NOT flushed to the parent first (that flush
+        would invalidate the publication compare-and-swap), so the parent is
+        left exactly as the rotation found it.
+        """
         db = SessionDB(db_path=tmp_path / "state.db")
         parent = "PARENT_LIVE_FLUSH"
         db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
+        messages = _msgs()
+        live_task = messages[-1]["content"]
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": live_task},
+        ]
+        parent_before = self._durable_len(db, parent)
 
-        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        agent._compress_context(messages, "sys", approx_tokens=120_000)
         assert agent.session_id != parent  # rotation happened
 
-        # The current-turn messages survive in the preserved parent transcript.
-        assert self._durable_len(db, parent) >= len(_msgs())
+        # The live tail survives durably in the child, exactly once, and the
+        # parent was not grown by a pre-publish flush.
+        child_rows = db.get_messages_as_conversation(agent.session_id)
+        assert [row["content"] for row in child_rows].count(live_task) == 1
+        assert self._durable_len(db, parent) == parent_before
 
     def test_unreadable_parent_row_fails_open(self, tmp_path: Path):
         """A guard that cannot read the row must not become a way to lose

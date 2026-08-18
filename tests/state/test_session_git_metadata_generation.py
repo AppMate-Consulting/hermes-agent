@@ -235,9 +235,12 @@ def test_legacy_sessions_table_reconciles_generation_column(tmp_path):
         finally:
             verify.close()
         assert "git_metadata_generation" in columns
+        # The reconciled store lands on the current schema version (27 on
+        # this fork: 26 + the transcript_generation CAS column), not on a
+        # literal that would pin the fork to upstream's number.
         assert reopened._conn.execute(
             "SELECT version FROM schema_version"
-        ).fetchone()[0] == SCHEMA_VERSION == 26
+        ).fetchone()[0] == SCHEMA_VERSION >= 26
         reopened.create_session("session", "desktop", cwd="/repo")
         assert reopened.update_session_cwd("session", "/repo") == 1
     finally:

@@ -401,12 +401,13 @@ class TestNormalizationOrdering:
 
         from agent import conversation_loop
 
-        src = inspect.getsource(conversation_loop)
-        # Anchor on the call-block request plan, not the retry helper.
-        anchor = src.index("Build the request-local cache sections")
-        mark = src.index("build_prompt_cache_plan(\n", anchor)
+        # The request-local projection (normalization + cache sections) is
+        # built once in _project_provider_request; anchor there rather than on
+        # the retry helper.
+        src = inspect.getsource(conversation_loop._project_provider_request)
+        mark = src.index("build_prompt_cache_plan(")
         for earlier in (
-            'am["content"].strip()',              # whitespace normalization
+            'api_msg["content"].strip()',                 # whitespace normalization
             "_sanitize_api_messages(api_messages)",       # orphan sweep
             "_drop_thinking_only_and_merge_users(",       # drop / merge
             "_sanitize_messages_surrogates(api_messages)",

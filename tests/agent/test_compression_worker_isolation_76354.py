@@ -100,7 +100,7 @@ def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
 
     agent.context_compressor.compress.side_effect = _mutating_engine
 
-    live = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    live = [{"role": "user", "content": f"m{i} " + ("x" * 3200)} for i in range(20)]
     baseline = copy.deepcopy(live)
 
     try:
@@ -173,7 +173,7 @@ def test_f4_five_step_stale_holder_regression(tmp_path: Path) -> None:
         lambda: cooldown_cleared.append(True)
     )
 
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = [{"role": "user", "content": f"m{i} " + ("x" * 3200)} for i in range(20)]
 
     def _worker(fence):
         return agent._compress_context(
@@ -269,7 +269,7 @@ def test_f5_session_contextvar_rebound_after_rotation(
     try:
         assert get_session_env("HERMES_SESSION_ID") == parent_sid
 
-        messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+        messages = [{"role": "user", "content": f"m{i} " + ("x" * 3200)} for i in range(20)]
         agent._compress_context(messages, "sys", approx_tokens=120_000)
 
         assert agent.session_id != parent_sid  # rotation happened

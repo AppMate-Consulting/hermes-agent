@@ -60,7 +60,7 @@ def test_repeated_compression_warning_routed_through_emit_status(tmp_path: Path)
     emitted: list[str] = []
     agent._emit_status = lambda message: emitted.append(message)
 
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = [{"role": "user", "content": f"m{i} " + ("x" * 3200)} for i in range(20)]
     agent._compress_context(messages, "sys", approx_tokens=120_000)
 
     # The warning reached the gateway-aware channel...
@@ -81,7 +81,7 @@ def test_no_warning_below_threshold(tmp_path: Path) -> None:
     emitted: list[str] = []
     agent._emit_status = lambda message: emitted.append(message)
 
-    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    messages = [{"role": "user", "content": f"m{i} " + ("x" * 3200)} for i in range(20)]
     agent._compress_context(messages, "sys", approx_tokens=120_000)
 
     assert not any("compressed" in m.lower() and "times" in m.lower() for m in emitted)

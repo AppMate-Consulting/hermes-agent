@@ -4823,18 +4823,22 @@ def compress_context(
                     _set_compression_outcome("committed_materially_shrunk")
                 else:
                     # ── Rotation (legacy): end this session, fork a continuation ─
-                    # Caller-only current-turn rows are already included in the
-                    # reconciled candidate. Do not append them to the parent
-                    # after candidate generation: doing so would invalidate the
-                    # publication compare-and-swap fence.
+                    # With the durable transcript fence active (an
+                    # ``_expected_active_identity`` was captured), caller-only
+                    # current-turn rows are already included in the reconciled
+                    # candidate and are published with the child exactly once.
+                    # They are NOT appended to the parent first: doing so would
+                    # invalidate the publication compare-and-swap fence.
                     #
-                    # Pass the already-durable prefix as conversation_history so
-                    # the flush skips it by identity (#68196). Preflight
-                    # compression runs BEFORE the normal turn flush has stamped
-                    # the cold-resumed history dicts with _DB_PERSISTED_MARKER, so
-                    # without a boundary _flush_messages_to_session_db treats every
-                    # restored row as new and re-appends the whole transcript to
-                    # the parent. turn_context anchors _persist_user_message_idx at
+                    # Only when no fence is available does the pre-publish flush
+                    # (#47202) run below, passing the already-durable prefix as
+                    # conversation_history so the flush skips it by identity
+                    # (#68196): preflight compression runs BEFORE the normal
+                    # turn flush has stamped the cold-resumed history dicts with
+                    # _DB_PERSISTED_MARKER, so without a boundary
+                    # _flush_messages_to_session_db would treat every restored
+                    # row as new and re-append the whole transcript to the
+                    # parent. turn_context anchors _persist_user_message_idx at
                     # the current-turn user message before preflight runs, so
                     # messages[:idx] is exactly the persisted prefix; only the
                     # current turn's new messages get written.

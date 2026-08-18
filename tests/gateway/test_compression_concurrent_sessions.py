@@ -78,7 +78,9 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     return agent
 
 
-_MESSAGES = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+# Bulky rows: request admission refuses a compaction that reclaims less than
+# max(4096, 5% of the threshold) tokens on the finalized payload.
+_MESSAGES = [{"role": "user", "content": f"m{i} " + ("x" * 3200)} for i in range(20)]
 
 
 # ---------------------------------------------------------------------------

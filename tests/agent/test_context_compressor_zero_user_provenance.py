@@ -78,10 +78,12 @@ def _assistant_tool_turns(start: int, count: int) -> list[dict]:
 
 
 def _assistant_turns(start: int, count: int) -> list[dict]:
+    # Bulky enough that summarizing the head reclaims more than the
+    # request-admission minimum (max(4096, 5% of the threshold) tokens).
     return [
         {
             "role": "assistant",
-            "content": f"Scheduled step {idx} completed. " + ("x" * 500),
+            "content": f"Scheduled step {idx} completed. " + ("x" * 4000),
         }
         for idx in range(start, start + count)
     ]
@@ -266,22 +268,62 @@ def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
 def test_background_process_notifications_do_not_become_compaction_anchors(
     compressor, event
 ):
+    """Completion notifications are excluded from anchors by PROVENANCE.
+
+    Reserved completion text is not provenance on its own: a genuine user can
+    type the same prefix, and SessionDB projection cannot distinguish that row
+    from runtime scaffolding without the surrounding Hermes-authored bridge
+    sequence. A bare lookalike therefore fails closed as a real user turn,
+    while the runtime-stamped bridge sequence is never an anchor or focus.
+    """
+    from agent.conversation_compression import (
+        AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        AUTONOMOUS_COMPLETION_BRIDGE_USER,
+    )
+
     notification = format_process_notification(event)
     assert notification is not None
-    process_turn = {"role": "user", "content": notification}
     human = {"role": "user", "content": "Refactor the auth module and add tests."}
+
+    # Bare lookalike text: not trusted as scaffolding.
+    lookalike = {"role": "user", "content": notification}
+    assert ContextCompressor._is_synthetic_compression_user_turn(lookalike) is False
+    assert ContextCompressor._transcript_has_real_user_turn([lookalike]) is True
+
+    # Hermes-authored completion sequence carrying runtime provenance.
+    bridge_user = {
+        "role": "user",
+        "content": AUTONOMOUS_COMPLETION_BRIDGE_USER,
+        "_autonomous_completion_bridge": True,
+    }
+    bridge_assistant = {
+        "role": "assistant",
+        "content": AUTONOMOUS_COMPLETION_BRIDGE_ASSISTANT,
+        "_autonomous_completion_bridge": True,
+    }
+    completion = {
+        "role": "user",
+        "content": notification,
+        "_autonomous_completion_bridge": True,
+    }
+    sequence = [bridge_user, bridge_assistant, completion]
+    assert ContextCompressor._completion_has_durable_provenance(sequence, 2) is True
+    assert ContextCompressor._transcript_has_real_user_turn(sequence) is False
+
     messages = [
         human,
         {"role": "assistant", "content": "Working on it."},
-        process_turn,
+        *sequence,
     ]
-
-    assert ContextCompressor._is_synthetic_compression_user_turn(process_turn) is True
-    assert ContextCompressor._transcript_has_real_user_turn([process_turn]) is False
-    assert compressor._derive_auto_focus_topic(messages) == (
-        "Recent user focus:\n- Refactor the auth module and add tests."
-    )
-    assert compressor._find_last_user_message_idx(messages, head_end=0) == 0
+    # The human task stays in the auto-focus hint, and the trusted completion
+    # (not the human row) is the actionable tail anchor: the runtime delivered
+    # it precisely so that the agent acts on it after the boundary.
+    focus = compressor._derive_auto_focus_topic(messages)
+    assert focus is not None
+    assert "- Refactor the auth module and add tests." in focus
+    assert compressor._find_last_user_message_idx(messages, head_end=0) == len(
+        messages
+    ) - 1
 
 
 @pytest.mark.parametrize(
@@ -403,13 +445,18 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
             force=True,
         )
 
+    # compress_context returns the durable read-back of the published
+    # transcript, which carries no underscore metadata; the handoff is
+    # recognized by its content marker and zero-user provenance is checked
+    # on the projected rows themselves.
     first_handoff = next(
         message
         for message in first
-        if message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        if ContextCompressor._is_context_summary_message(message)
     )
-    assert first_handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
     assert "First boundary" in first_handoff["content"]
+    assert "User asked:" not in first_handoff["content"]
+    assert ContextCompressor._transcript_has_real_user_turn(first) is False
     assert any(
         message.get("role") == "user"
         and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
@@ -439,11 +486,11 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     handoff = next(
         message
         for message in second
-        if message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        if ContextCompressor._is_context_summary_message(message)
     )
-    assert handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] is False
     assert "Second boundary" in handoff["content"]
     assert "User asked:" not in handoff["content"]
+    assert ContextCompressor._transcript_has_real_user_turn(second) is False
     db.close()
 
 

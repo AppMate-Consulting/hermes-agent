@@ -1,5 +1,9 @@
 {
   "image": "argus-hermes-buzz-verifier:py3.11-v3",
   "command": "bin/merge-gate",
-  "allowed_env": ["HERMES_PYTHON", "HERMES_TEST_FILE_RETRIES"]
+  "allowed_env": [
+    "HERMES_PYTHON",
+    "HERMES_TEST_FILE_RETRIES",
+    "HERMES_TEST_WORKERS"
+  ]
 }

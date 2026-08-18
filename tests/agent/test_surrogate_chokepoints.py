@@ -176,11 +176,19 @@ def test_conversation_loop_sanitizes_api_kwargs_after_build():
 
     import agent.conversation_loop as cl
 
-    src = inspect.getsource(cl.run_conversation)
-    build_idx = src.index("api_kwargs = agent._build_api_kwargs(api_messages)")
-    sanitize_idx = src.index("_sanitize_structure_surrogates(api_kwargs)")
-    perform_idx = src.index("def _perform_api_call")
-    assert build_idx < sanitize_idx < perform_idx
+    # The provider payload is projected once, in finalize_provider_request:
+    # build -> structure sanitize -> transport preflight; the loop only ever
+    # dispatches a payload that came out of that finalizer.
+    src = inspect.getsource(cl.finalize_provider_request)
+    build_idx = src.index("payload = agent._build_api_kwargs(api_messages)")
+    sanitize_idx = src.index("_sanitize_structure_surrogates(payload)")
+    preflight_idx = src.index("preflight_kwargs(")
+    assert build_idx < sanitize_idx < preflight_idx
+    loop_src = inspect.getsource(cl.run_conversation)
+    assert "finalize_provider_request(" in loop_src
+    assert loop_src.index("finalize_provider_request(") < loop_src.index(
+        "def _perform_api_call"
+    )
 
 
 # ---------------------------------------------------------------------------

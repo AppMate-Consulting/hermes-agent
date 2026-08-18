@@ -3719,7 +3719,6 @@ def compress_context(
                             break
                     messages = copy.deepcopy(durable_parent) + live_tail
                     _pre_msg_count = len(messages)
-                    approx_tokens = 0
                     agent._persist_user_message_idx = len(durable_parent)
 
         # The caller's history snapshot predates lease acquisition. Reload the
